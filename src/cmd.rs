@@ -59,6 +59,15 @@ impl Cmd {
             .unwrap_or_default()
     }
 
+    /// The command's key (second argument, by Redis convention) as a UTF-8
+    /// string, for logging. Empty if the command has no key argument.
+    pub fn key(&self) -> String {
+        self.args
+            .get(1)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .unwrap_or_default()
+    }
+
     /// Encode this command into a RESP multibulk frame.
     pub fn encoded(&self) -> Vec<u8> {
         let mut out = Vec::new();
