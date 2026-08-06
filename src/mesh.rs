@@ -1,16 +1,24 @@
 //! Mesh endpoint discovery.
 //!
-//! The breeze mesh agent publishes one endpoint per resource namespace. In the
-//! PaaS deployment model the mesh (not the SDK) creates the sock file, so the
-//! client's job is to *discover* the already-published endpoint and wait until
-//! it is connectable:
+//! The breeze mesh agent publishes one sock **config file** per resource in the
+//! socket directory (default `/tmp/breeze/socks`). The SDK discovers the
+//! already-published endpoint by parsing those files directly — there is no
+//! fetch/pull step, and we never write sock files or register backends.
 //!
-//! - **Unix**: `<socket_dir>/U_<namespace>.sock`.
-//! - **TCP**: a `127.0.0.1:<port>` port parsed from the sock-file name
-//!   `<domain>+3+config+cloud+<type>+<group>+<namespace>@<sockType>:<port>@<proto>`.
+//! A config file name has exactly three `@`-separated fields, mirroring the
+//! mesh's own `Quadruple::parse`:
 //!
-//! We do not write sock files, register backends, or resolve DNS — there is a
-//! single local mesh server.
+//! ```text
+//! <service>@<protocol>:<slot>@<backend>
+//! e.g. static.config.api.example.com+3+config+cloud+redis+feed+auto_translate_llm@redis:9470@rs
+//! ```
+//!
+//! - `<service>` is the registry-prefixed path with `/` replaced by `+`; its
+//!   tail is `...+<group>+<namespace>`.
+//! - `<protocol>:<slot>` — if `<slot>` is a port number the endpoint is TCP on
+//!   `127.0.0.1:<slot>`; otherwise it is a unix socket at `<dir>/<slot>.sock`.
+//! - Files ending in `.sock` are live listener sockets, not config files, and
+//!   are skipped.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
@@ -37,48 +45,39 @@ impl std::fmt::Display for Endpoint {
     }
 }
 
+/// The transport slot parsed out of a sock config file's middle field.
+enum SockKind {
+    Tcp(u16),
+    Unix(String),
+}
+
 /// Discover the mesh endpoint for `cfg` and wait until it accepts connections.
 ///
-/// Polls up to `cfg.connect_wait` (100 ms cadence). For TCP it re-scans the
-/// sock directory each round, tolerating the mesh publishing the file slightly
-/// later than the client starts.
+/// Re-scans the sock directory on a 100 ms cadence up to `cfg.connect_wait`,
+/// tolerating the mesh publishing the file slightly after the client starts.
 pub async fn discover(cfg: &MeshConfig) -> RedisResult<Endpoint> {
     let deadline = Instant::now() + cfg.connect_wait;
+    let prefer_unix = matches!(cfg.transport, Transport::Unix);
     loop {
-        let attempt = match cfg.transport {
-            Transport::Unix => discover_unix(cfg).await,
-            Transport::Tcp => discover_tcp(cfg).await,
-        };
-        match attempt {
-            Ok(endpoint) => return Ok(endpoint),
-            Err(err) => {
-                if Instant::now() >= deadline {
-                    return Err(err);
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+        if let Some(endpoint) =
+            scan_endpoint(&cfg.socket_dir, &cfg.group, &cfg.namespace, prefer_unix)
+            && connectable(&endpoint).await
+        {
+            return Ok(endpoint);
         }
+        if Instant::now() >= deadline {
+            return Err(not_ready(
+                "mesh endpoint not published or not listening yet",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-async fn discover_unix(cfg: &MeshConfig) -> RedisResult<Endpoint> {
-    let path = cfg.socket_dir.join(format!("U_{}.sock", cfg.namespace));
-    if !path.exists() {
-        return Err(not_ready("unix sock file not published yet"));
-    }
-    match tokio::net::UnixStream::connect(&path).await {
-        Ok(_) => Ok(Endpoint::Unix(path)),
-        Err(_) => Err(not_ready("unix endpoint not listening yet")),
-    }
-}
-
-async fn discover_tcp(cfg: &MeshConfig) -> RedisResult<Endpoint> {
-    let port = scan_tcp_port(&cfg.socket_dir, &cfg.group, &cfg.namespace)
-        .ok_or_else(|| not_ready("no sock file for namespace yet"))?;
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-    match tokio::net::TcpStream::connect(addr).await {
-        Ok(_) => Ok(Endpoint::Tcp(addr)),
-        Err(_) => Err(not_ready("tcp endpoint not listening yet")),
+async fn connectable(endpoint: &Endpoint) -> bool {
+    match endpoint {
+        Endpoint::Tcp(addr) => tokio::net::TcpStream::connect(addr).await.is_ok(),
+        Endpoint::Unix(path) => tokio::net::UnixStream::connect(path).await.is_ok(),
     }
 }
 
@@ -86,41 +85,74 @@ fn not_ready(what: &'static str) -> RedisError {
     RedisError::from_kind(ErrorKind::NoConnection, what)
 }
 
-/// Scan `dir` for the sock file of `(group, namespace)` and return its port.
+/// Scan `dir` for the sock config file matching `(group, namespace)` and build
+/// its [`Endpoint`].
 ///
-/// Sock-file names look like
-/// `domain+3+config+cloud+redis+group+namespace@redis:PORT@rs`; the port sits
-/// between the two `@` markers. Prefers a `+group+namespace` match but falls
-/// back to matching the namespace alone.
-pub fn scan_tcp_port(dir: &Path, group: &str, namespace: &str) -> Option<u16> {
+/// When several files match, the best is chosen by a score preferring the
+/// requested transport family and then a specific `+group+namespace` match over
+/// a namespace-only match (so an unrelated resource sharing the namespace tail
+/// never wins over the exact one).
+pub fn scan_endpoint(
+    dir: &Path,
+    group: &str,
+    namespace: &str,
+    prefer_unix: bool,
+) -> Option<Endpoint> {
     let entries = std::fs::read_dir(dir).ok()?;
     let group_marker = format!("+{group}+{namespace}");
     let ns_marker = format!("+{namespace}");
-    let mut fallback: Option<u16> = None;
+    let mut best: Option<(u8, Endpoint)> = None;
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some(port) = parse_port(&name) else {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        let Some((service, kind)) = parse_sock(&name) else {
             continue;
         };
-        let prefix = name.split('@').next().unwrap_or("");
-        if prefix.ends_with(&group_marker) {
-            return Some(port);
+        let is_group = service.ends_with(&group_marker);
+        if !is_group && !service.ends_with(&ns_marker) {
+            continue;
         }
-        if prefix.ends_with(&ns_marker) {
-            fallback = Some(port);
+        let endpoint = match kind {
+            SockKind::Tcp(port) => {
+                Endpoint::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)))
+            }
+            SockKind::Unix(slot) => Endpoint::Unix(dir.join(format!("{slot}.sock"))),
+        };
+        let family_match = matches!(endpoint, Endpoint::Unix(_)) == prefer_unix;
+        let score = (family_match as u8) * 2 + (is_group as u8);
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((score, endpoint));
         }
     }
-    fallback
+    best.map(|(_, endpoint)| endpoint)
 }
 
-/// Extract the port from `...@<sockType>:<port>@<proto>`.
-fn parse_port(name: &str) -> Option<u16> {
-    let mut parts = name.split('@');
-    let _prefix = parts.next()?;
-    let middle = parts.next()?; // "<sockType>:<port>"
-    let port_str = middle.rsplit(':').next()?;
-    port_str.parse::<u16>().ok()
+/// Parse a sock config file name into `(service, transport)`, mirroring the
+/// mesh's `Quadruple::parse`. Returns `None` for `.sock` files and names that
+/// are not exactly three `@`-separated fields.
+fn parse_sock(name: &str) -> Option<(&str, SockKind)> {
+    if name.ends_with(".sock") {
+        return None;
+    }
+    let fields: Vec<&str> = name.split('@').collect();
+    if fields.len() != 3 {
+        return None;
+    }
+    let service = fields[0];
+    let mut protocol_fields = fields[1].split(':');
+    let _protocol = protocol_fields.next()?;
+    let kind = match protocol_fields.next() {
+        Some(slot) => match slot.parse::<u16>() {
+            Ok(port) => SockKind::Tcp(port),
+            Err(_) => SockKind::Unix(slot.to_string()),
+        },
+        // No slot: unix socket named after the service.
+        None => SockKind::Unix(service.to_string()),
+    };
+    Some((service, kind))
 }
 
 #[cfg(test)]
@@ -129,26 +161,64 @@ mod tests {
     use std::fs::File;
 
     #[test]
-    fn parses_port_from_sockname() {
-        assert_eq!(
-            parse_port("static.config.api.example.com+3+config+cloud+redis+g1+ns1@redis:9300@rs"),
-            Some(9300)
-        );
-        assert_eq!(parse_port("no-at-marker"), None);
+    fn parses_tcp_sockname() {
+        let name = "static.config.api.example.com+3+config+cloud+redis+feed+auto_translate_llm@redis:9470@rs";
+        let (service, kind) = parse_sock(name).unwrap();
+        assert!(service.ends_with("+feed+auto_translate_llm"));
+        assert!(matches!(kind, SockKind::Tcp(9470)));
     }
 
     #[test]
-    fn scans_by_group_namespace() {
+    fn parses_unix_sockname() {
+        // A non-numeric slot denotes a unix socket at <dir>/<slot>.sock.
+        let name = "dom+3+config+cloud+redis+feed+auto_translate_llm@redis:U_auto_translate_llm@rs";
+        let (_, kind) = parse_sock(name).unwrap();
+        match kind {
+            SockKind::Unix(slot) => assert_eq!(slot, "U_auto_translate_llm"),
+            _ => panic!("expected unix"),
+        }
+    }
+
+    #[test]
+    fn rejects_dot_sock_and_malformed() {
+        assert!(parse_sock("something.sock").is_none());
+        assert!(parse_sock("no-at-markers").is_none());
+        assert!(parse_sock("only@two").is_none());
+    }
+
+    #[test]
+    fn scans_tcp_and_unix_by_preference() {
         let dir = std::env::temp_dir().join(format!("mesh_scan_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        File::create(dir.join("dom+3+config+cloud+redis+g1+nsA@redis:9310@rs")).unwrap();
-        File::create(dir.join("dom+3+config+cloud+redis+g2+nsB@redis:9320@rs")).unwrap();
+        File::create(dir.join(
+            "static.config.api.example.com+3+config+cloud+redis+feed+auto_translate_llm@redis:9470@rs",
+        ))
+        .unwrap();
+        File::create(dir.join(
+            "dom+3+config+cloud+redis+feed+auto_translate_llm@redis:U_auto_translate_llm@rs",
+        ))
+        .unwrap();
+        File::create(dir.join("dom+3+config+cloud+redis+g2+other@redis:9320@rs")).unwrap();
 
-        assert_eq!(scan_tcp_port(&dir, "g1", "nsA"), Some(9310));
-        assert_eq!(scan_tcp_port(&dir, "g2", "nsB"), Some(9320));
-        // Namespace-only fallback when the group does not match.
-        assert_eq!(scan_tcp_port(&dir, "other", "nsA"), Some(9310));
-        assert_eq!(scan_tcp_port(&dir, "g1", "missing"), None);
+        // Prefer TCP.
+        let tcp = scan_endpoint(&dir, "feed", "auto_translate_llm", false).unwrap();
+        assert_eq!(
+            tcp,
+            Endpoint::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9470)))
+        );
+
+        // Prefer unix.
+        let unix = scan_endpoint(&dir, "feed", "auto_translate_llm", true).unwrap();
+        assert_eq!(unix, Endpoint::Unix(dir.join("U_auto_translate_llm.sock")));
+
+        // Namespace-only fallback still resolves when the group differs.
+        let other = scan_endpoint(&dir, "wrong", "other", false).unwrap();
+        assert_eq!(
+            other,
+            Endpoint::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9320)))
+        );
+
+        assert!(scan_endpoint(&dir, "feed", "missing", false).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }

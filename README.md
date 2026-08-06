@@ -20,7 +20,7 @@ reimplemented in Rust.
 - **High availability.** A circuit breaker plus a background maintenance task
   replace dead connections and probe the mesh back to health after an outage.
 - **PaaS-mode discovery.** The mesh publishes its endpoint as a sock file under
-  `/data1/breeze/socks/`; the client discovers it (unix path `U_<namespace>.sock`
+  `/tmp/breeze/socks/`; the client discovers it (unix path `U_<namespace>.sock`
   or the TCP port parsed from the sock-file name) and waits until it is
   connectable. The client does not write sock files or register backends.
 - **No handshake.** Identity/routing is conveyed out-of-band by the sock file,

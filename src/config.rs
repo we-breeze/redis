@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Default sock-file directory the mesh agent publishes endpoints into.
-pub const DEFAULT_SOCKET_DIR: &str = "/data1/breeze/socks";
+pub const DEFAULT_SOCKET_DIR: &str = "/tmp/breeze/socks";
 /// Default registry domain segment used in sock-file names.
 pub const DEFAULT_DOMAIN: &str = "static.config.api.example.com";
 /// Default resource type code (see the Java `ResourceTypeEnum`).
