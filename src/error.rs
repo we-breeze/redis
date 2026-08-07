@@ -75,6 +75,9 @@ pub enum ErrorKind {
     ClientError,
     /// The pool has no healthy endpoint available.
     NoConnection,
+    /// The connection's in-flight budget is exhausted; the request failed fast
+    /// instead of queueing (backpressure).
+    Overloaded,
     /// An operation exceeded its timeout budget.
     Timeout,
     /// An extension/module error not otherwise classified.
@@ -94,6 +97,7 @@ impl ErrorKind {
             ErrorKind::Io => "I/O error",
             ErrorKind::ClientError => "client error",
             ErrorKind::NoConnection => "no connection available",
+            ErrorKind::Overloaded => "too many in-flight requests",
             ErrorKind::Timeout => "operation timed out",
             ErrorKind::ExtensionError => "extension error",
         }
@@ -151,7 +155,7 @@ impl RedisError {
     pub fn is_retriable(&self) -> bool {
         matches!(
             self.kind(),
-            ErrorKind::Io | ErrorKind::NoConnection | ErrorKind::Timeout
+            ErrorKind::Io | ErrorKind::NoConnection | ErrorKind::Overloaded | ErrorKind::Timeout
         )
     }
 
@@ -163,7 +167,10 @@ impl RedisError {
     pub fn connection_still_valid(&self) -> bool {
         matches!(
             self.kind(),
-            ErrorKind::ResponseError | ErrorKind::TypeError | ErrorKind::NoScript
+            ErrorKind::ResponseError
+                | ErrorKind::TypeError
+                | ErrorKind::NoScript
+                | ErrorKind::Overloaded
         )
     }
 }

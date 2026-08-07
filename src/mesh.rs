@@ -57,12 +57,8 @@ enum SockKind {
 /// tolerating the mesh publishing the file slightly after the client starts.
 pub async fn discover(cfg: &MeshConfig) -> RedisResult<Endpoint> {
     let deadline = Instant::now() + cfg.connect_wait;
-    let prefer_unix = matches!(cfg.transport, Transport::Unix);
     loop {
-        if let Some(endpoint) =
-            scan_endpoint(&cfg.socket_dir, &cfg.group, &cfg.namespace, prefer_unix)
-            && connectable(&endpoint).await
-        {
+        if let Some(endpoint) = scan_current(cfg).await {
             return Ok(endpoint);
         }
         if Instant::now() >= deadline {
@@ -71,6 +67,22 @@ pub async fn discover(cfg: &MeshConfig) -> RedisResult<Endpoint> {
             ));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A single discovery pass: scan the sock directory and return the best
+/// endpoint if it currently accepts connections.
+///
+/// Unlike [`discover`] this does not wait or loop; used by the pool's
+/// maintenance task to notice when the mesh has re-published the resource on
+/// a new port (e.g. after a mesh restart).
+pub async fn scan_current(cfg: &MeshConfig) -> Option<Endpoint> {
+    let prefer_unix = matches!(cfg.transport, Transport::Unix);
+    let endpoint = scan_endpoint(&cfg.socket_dir, &cfg.group, &cfg.namespace, prefer_unix)?;
+    if connectable(&endpoint).await {
+        Some(endpoint)
+    } else {
+        None
     }
 }
 

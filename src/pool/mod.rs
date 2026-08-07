@@ -24,7 +24,7 @@ use health::HealthState;
 
 /// A pool of multiplexed connections to one mesh endpoint.
 pub struct Pool {
-    endpoint: Endpoint,
+    endpoint: RwLock<Endpoint>,
     config: MeshConfig,
     health: HealthState,
     conns: RwLock<Vec<MultiplexedConnection>>,
@@ -38,7 +38,7 @@ impl Pool {
         let min = config.pool_size.max(1) as u32;
         let max = (config.pool_size as u32 * 4).max(4);
         let pool = Arc::new(Pool {
-            endpoint,
+            endpoint: RwLock::new(endpoint),
             config,
             health: HealthState::new(min, max),
             conns: RwLock::new(Vec::new()),
@@ -49,9 +49,10 @@ impl Pool {
         Ok(pool)
     }
 
-    /// The resolved endpoint, for logging/labels.
-    pub fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+    /// The currently resolved endpoint, for logging/labels. May change over
+    /// the pool's lifetime when the mesh re-publishes the resource.
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.read().unwrap().clone()
     }
 
     /// Whether the breaker/kill-switch currently allows serving.
@@ -79,14 +80,16 @@ impl Pool {
 
     /// Record a failed command; may trip the breaker per configured thresholds.
     pub fn note_failure(&self) {
+        // Evict eagerly: poisoned/timed-out connections must leave the pool
+        // immediately, not only when the breaker trips.
+        self.evict_dead();
         let outcome = self.health.on_failure();
         if outcome.tripped {
             tracing::warn!(
                 target: "breeze_redis::pool",
-                endpoint = %self.endpoint,
+                endpoint = %self.endpoint(),
                 "circuit breaker tripped; mesh marked unhealthy"
             );
-            self.evict_dead();
         }
     }
 
@@ -118,9 +121,10 @@ impl Pool {
     }
 
     async fn create_conn(&self) -> RedisResult<MultiplexedConnection> {
+        let endpoint = self.endpoint();
         tokio::time::timeout(
             self.config.op_timeout,
-            MultiplexedConnection::connect(&self.endpoint),
+            MultiplexedConnection::connect(&endpoint, self.config.max_inflight),
         )
         .await
         .map_err(|_| RedisError::from_kind(ErrorKind::Timeout, "connection timed out"))?
@@ -148,7 +152,7 @@ impl Pool {
                 Ok(conn) => self.conns.write().unwrap().push(conn),
                 Err(err) => tracing::warn!(
                     target: "breeze_redis::pool",
-                    endpoint = %self.endpoint,
+                    endpoint = %self.endpoint(),
                     error = %err,
                     "warm-up connection failed"
                 ),
@@ -160,17 +164,48 @@ impl Pool {
         Ok(())
     }
 
-    /// The recovery probe: open one fresh connection and PING it.
+    /// The recovery probe: re-scan the sock directory (the mesh may have
+    /// restarted on a new port while the breaker was open), then open one
+    /// fresh connection and PING it with a timeout.
     async fn probe(&self) {
+        self.refresh_endpoint().await;
         if let Ok(conn) = self.create_conn().await
-            && cmd("PING").exec_async(&conn).await.is_ok()
+            && tokio::time::timeout(self.config.op_timeout, cmd("PING").exec_async(&conn))
+                .await
+                .is_ok_and(|r| r.is_ok())
         {
             self.conns.write().unwrap().push(conn);
             self.health.recover();
             tracing::info!(
                 target: "breeze_redis::pool",
-                endpoint = %self.endpoint,
+                endpoint = %self.endpoint(),
                 "recovery probe succeeded; mesh healthy again"
+            );
+        }
+    }
+
+    /// Re-resolve the mesh endpoint from the sock directory. If the mesh has
+    /// re-published the resource on a different endpoint, switch to it and
+    /// drop the connections bound to the stale one.
+    async fn refresh_endpoint(&self) {
+        let Some(new) = mesh::scan_current(&self.config).await else {
+            return;
+        };
+        let changed = {
+            let mut current = self.endpoint.write().unwrap();
+            if *current == new {
+                false
+            } else {
+                *current = new.clone();
+                true
+            }
+        };
+        if changed {
+            self.conns.write().unwrap().clear();
+            tracing::info!(
+                target: "breeze_redis::pool",
+                endpoint = %new,
+                "mesh endpoint re-published; switched to new endpoint"
             );
         }
     }

@@ -43,26 +43,33 @@ struct Pending {
 
 /// A handle to a multiplexed mesh connection. Clone freely; all clones share
 /// one socket and one driver task.
+///
+/// The request channel is bounded to `max_inflight`: once that many requests
+/// are waiting on the driver, new requests fail fast with
+/// [`ErrorKind::Overloaded`] instead of queueing without bound.
 #[derive(Clone)]
 pub struct MultiplexedConnection {
-    tx: mpsc::UnboundedSender<Request>,
+    tx: mpsc::Sender<Request>,
     alive: Arc<AtomicBool>,
 }
 
 impl MultiplexedConnection {
     /// Open a connection to the given mesh endpoint and spawn its driver.
-    pub async fn connect(endpoint: &Endpoint) -> RedisResult<Self> {
-        let (tx, rx) = mpsc::unbounded_channel::<Request>();
+    ///
+    /// `max_inflight` bounds the request channel; see the struct docs.
+    pub async fn connect(endpoint: &Endpoint, max_inflight: usize) -> RedisResult<Self> {
+        let (tx, rx) = mpsc::channel::<Request>(max_inflight.max(1));
         let alive = Arc::new(AtomicBool::new(true));
+        let max_inflight = max_inflight.max(1);
         match endpoint {
             Endpoint::Tcp(addr) => {
                 let stream = tokio::net::TcpStream::connect(addr).await?;
                 stream.set_nodelay(true).ok();
-                tokio::spawn(drive(stream, rx, alive.clone()));
+                tokio::spawn(drive(stream, rx, alive.clone(), max_inflight));
             }
             Endpoint::Unix(path) => {
                 let stream = tokio::net::UnixStream::connect(path).await?;
-                tokio::spawn(drive(stream, rx, alive.clone()));
+                tokio::spawn(drive(stream, rx, alive.clone(), max_inflight));
             }
         }
         Ok(MultiplexedConnection { tx, alive })
@@ -73,15 +80,30 @@ impl MultiplexedConnection {
         self.alive.load(Ordering::Acquire)
     }
 
+    /// Mark the connection dead so the pool stops handing it out and evicts
+    /// it. Used when a request times out: the socket may be half-hung (mesh
+    /// alive but not answering), and the only safe recovery is a fresh
+    /// connection. Once every handle is dropped the driver task exits and
+    /// fails any remaining waiters.
+    pub fn poison(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
+
     /// Enqueue a raw payload expecting `reply_count` replies.
     async fn send(&self, payload: Vec<u8>, reply_count: usize) -> RedisResult<Vec<Value>> {
+        if !self.is_alive() {
+            return Err(dead_connection_error());
+        }
         let (responder, rx) = oneshot::channel();
         let request = Request {
             payload,
             reply_count,
             responder,
         };
-        self.tx.send(request).map_err(|_| dead_connection_error())?;
+        self.tx.try_send(request).map_err(|err| match err {
+            mpsc::error::TrySendError::Full(_) => overloaded_error(),
+            mpsc::error::TrySendError::Closed(_) => dead_connection_error(),
+        })?;
         rx.await.map_err(|_| dead_connection_error())?
     }
 }
@@ -112,8 +134,20 @@ fn dead_connection_error() -> RedisError {
     RedisError::from_kind(ErrorKind::Io, "connection closed")
 }
 
+fn overloaded_error() -> RedisError {
+    RedisError::from_kind(
+        ErrorKind::Overloaded,
+        "connection in-flight budget exhausted",
+    )
+}
+
 /// The driver loop: pumps requests to the socket and replies back to waiters.
-async fn drive<S>(stream: S, mut rx: mpsc::UnboundedReceiver<Request>, alive: Arc<AtomicBool>)
+///
+/// `max_inflight` caps the number of requests that have been written to the
+/// socket but not yet answered (`pending`); beyond it requests fail fast with
+/// [`ErrorKind::Overloaded`] so a mesh that reads but never replies cannot
+/// grow memory without bound.
+async fn drive<S>(stream: S, mut rx: mpsc::Receiver<Request>, alive: Arc<AtomicBool>, max_inflight: usize)
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -130,7 +164,9 @@ where
             maybe_req = rx.recv() => {
                 match maybe_req {
                     Some(req) => {
-                        if !write_request(&mut writer, &mut rx, req, &mut pending).await {
+                        if pending.len() >= max_inflight {
+                            let _ = req.responder.send(Err(overloaded_error()));
+                        } else if !write_request(&mut writer, &mut rx, req, &mut pending, max_inflight).await {
                             break;
                         }
                     }
@@ -165,9 +201,10 @@ where
 /// pending waiters. Returns `false` if the socket write failed.
 async fn write_request<W>(
     writer: &mut W,
-    rx: &mut mpsc::UnboundedReceiver<Request>,
+    rx: &mut mpsc::Receiver<Request>,
     first: Request,
     pending: &mut VecDeque<Pending>,
+    max_inflight: usize,
 ) -> bool
 where
     W: AsyncWrite + Unpin,
@@ -175,8 +212,12 @@ where
     let mut batch = first.payload;
     let mut registered = vec![(first.reply_count, first.responder)];
 
-    // Coalesce everything currently queued into a single write syscall.
-    while let Ok(req) = rx.try_recv() {
+    // Coalesce everything currently queued into a single write syscall,
+    // staying within the in-flight budget.
+    while pending.len() + registered.len() < max_inflight {
+        let Ok(req) = rx.try_recv() else {
+            break;
+        };
         batch.extend_from_slice(&req.payload);
         registered.push((req.reply_count, req.responder));
     }
@@ -226,7 +267,73 @@ fn deliver(value: Value, pending: &mut VecDeque<Pending>) {
     };
     front.replies.push(value);
     if front.replies.len() >= front.reply_count {
-        let entry = pending.pop_front().unwrap();
+    let entry = pending.pop_front().unwrap();
         let _ = entry.responder.send(Ok(entry.replies));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::cmd;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    /// Start a fake mesh that accepts connections and drains reads but never
+    /// replies — the "hung mesh" case the in-flight budget guards against.
+    async fn silent_mesh() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                        .await
+                        .unwrap_or(0)
+                        > 0
+                    {}
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    #[tokio::test]
+    async fn fails_fast_when_inflight_budget_exhausted() {
+        let (addr, _mesh) = silent_mesh().await;
+        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr.into()), 2)
+            .await
+            .unwrap();
+
+        // Two requests occupy the whole budget, waiting on replies that never
+        // come.
+        let c1 = conn.clone();
+        let c2 = conn.clone();
+        let pending1 = tokio::spawn(async move { c1.req_command(&cmd("GET")).await });
+        let pending2 = tokio::spawn(async move { c2.req_command(&cmd("GET")).await });
+        // Let the driver write both and park them in `pending`.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let err = conn.req_command(&cmd("GET")).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Overloaded);
+        // Backpressure errors must not be treated as connection failures.
+        assert!(err.connection_still_valid());
+
+        pending1.abort();
+        pending2.abort();
+    }
+
+    #[tokio::test]
+    async fn poisoned_connection_refuses_new_requests() {
+        let (addr, _mesh) = silent_mesh().await;
+        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr.into()), 16)
+            .await
+            .unwrap();
+        assert!(conn.is_alive());
+        conn.poison();
+        assert!(!conn.is_alive());
+        let err = conn.req_command(&cmd("GET")).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Io);
     }
 }

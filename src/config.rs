@@ -51,6 +51,12 @@ pub struct MeshConfig {
     pub max_try_time: u32,
     /// Retry attempts for write commands.
     pub write_retry: u32,
+    /// Maximum number of in-flight requests per connection. When the budget
+    /// is exhausted new requests fail fast with
+    /// [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) instead of
+    /// queueing, so one stalled backend cannot grow memory unboundedly in a
+    /// process serving many namespaces.
+    pub max_inflight: usize,
 }
 
 impl MeshConfig {
@@ -69,6 +75,7 @@ impl MeshConfig {
             slow_time_threshold: Duration::from_millis(50),
             max_try_time: 2,
             write_retry: 1,
+            max_inflight: 4096,
         }
     }
 
@@ -93,6 +100,12 @@ impl MeshConfig {
     /// Override the connection pool size.
     pub fn with_pool_size(mut self, size: usize) -> Self {
         self.pool_size = size.max(1);
+        self
+    }
+
+    /// Override the per-connection in-flight request budget.
+    pub fn with_max_inflight(mut self, max_inflight: usize) -> Self {
+        self.max_inflight = max_inflight.max(1);
         self
     }
 }

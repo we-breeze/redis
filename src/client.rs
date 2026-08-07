@@ -7,13 +7,14 @@
 //! [`Commands`](crate::commands::Commands) surface is available on it directly,
 //! and the mesh routing helpers (see [`crate::routing`]) layer on top.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::cmd::Cmd;
 use crate::config::MeshConfig;
 use crate::connection::{ConnectionLike, RedisFuture};
-use crate::error::RedisResult;
+use crate::error::{RedisError, RedisResult};
 use crate::pipeline::Pipeline;
 use crate::pool::Pool;
 use crate::stats::{Stats, StatsSnapshot};
@@ -28,6 +29,7 @@ struct Inner {
     stats: Stats,
     namespace: String,
     max_try_time: u32,
+    op_timeout: Duration,
     slow_threshold: Duration,
 }
 
@@ -47,6 +49,7 @@ impl Client {
     /// Connect using an explicit [`MeshConfig`].
     pub async fn from_config(config: MeshConfig) -> RedisResult<Self> {
         let max_try_time = config.max_try_time.max(1);
+        let op_timeout = config.op_timeout;
         let slow_threshold = config.slow_time_threshold;
         let namespace = config.namespace.clone();
         let pool = Pool::connect(config).await?;
@@ -56,6 +59,7 @@ impl Client {
                 stats: Stats::new(),
                 namespace,
                 max_try_time,
+                op_timeout,
                 slow_threshold,
             }),
         })
@@ -102,6 +106,10 @@ impl Client {
     }
 
     /// Execute one command with bounded retries and stats/slow-logging.
+    ///
+    /// Each attempt is bounded by `op_timeout`. A timeout poisons the
+    /// connection (the mesh may be alive but not answering) so the pool
+    /// replaces it, and surfaces as a retriable [`ErrorKind::Timeout`].
     async fn execute(&self, command: &Cmd) -> RedisResult<Value> {
         let inner = &self.inner;
         let name = command.name();
@@ -111,7 +119,7 @@ impl Client {
             attempt += 1;
             let start = Instant::now();
             match inner.pool.get().await {
-                Ok(conn) => match conn.req_command(command).await {
+                Ok(conn) => match self.with_timeout(conn.req_command(command)).await {
                     Ok(value) => {
                         // A reply arrived — even an inline server error means the
                         // socket is healthy, so the pool is credited.
@@ -127,6 +135,11 @@ impl Client {
                         return Ok(value);
                     }
                     Err(err) => {
+                        if err.kind() == crate::ErrorKind::Timeout {
+                            // The reply never came; the socket is suspect even
+                            // though the driver task may still be running.
+                            conn.poison();
+                        }
                         inner
                             .stats
                             .record(&name, start.elapsed(), true, inner.slow_threshold);
@@ -174,7 +187,7 @@ impl Client {
                 return Err(err);
             }
         };
-        match conn.req_pipeline(pipeline, offset, count).await {
+        match self.with_timeout(conn.req_pipeline(pipeline, offset, count)).await {
             Ok(values) => {
                 inner.pool.note_success();
                 inner
@@ -183,6 +196,9 @@ impl Client {
                 Ok(values)
             }
             Err(err) => {
+                if err.kind() == crate::ErrorKind::Timeout {
+                    conn.poison();
+                }
                 inner
                     .stats
                     .record("pipeline", start.elapsed(), true, inner.slow_threshold);
@@ -194,6 +210,23 @@ impl Client {
                 }
                 Err(err)
             }
+        }
+    }
+
+    /// Bound an in-flight request by `op_timeout`, converting an elapsed
+    /// deadline into a [`ErrorKind::Timeout`] error. The timed-out waiter is
+    /// dropped; if a late reply eventually arrives the driver simply discards
+    /// it.
+    async fn with_timeout<T>(
+        &self,
+        fut: impl Future<Output = RedisResult<T>>,
+    ) -> RedisResult<T> {
+        match tokio::time::timeout(self.inner.op_timeout, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(RedisError::from_kind(
+                crate::ErrorKind::Timeout,
+                "command timed out waiting for the mesh reply",
+            )),
         }
     }
 }
