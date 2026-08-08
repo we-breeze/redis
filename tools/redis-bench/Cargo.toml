@@ -1,0 +1,26 @@
+[package]
+name = "redis-bench"
+version = "0.1.0"
+edition = "2024"
+description = "Load-test harness for the breeze-redis SDK against the breeze mesh"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "redis-bench"
+path = "src/main.rs"
+
+[features]
+default = ["memory-stats"]
+# Enable brz-mem's heap accounting (per-request allocation tracking). Off
+# removes the bookkeeping overhead from the hot path for pure-throughput runs.
+memory-stats = ["brz-mem/heap-stats"]
+
+[dependencies]
+breeze-redis = { path = "../.." }
+brz-mem.workspace = true
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+hdrhistogram = "7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

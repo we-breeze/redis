@@ -98,6 +98,13 @@ impl ToRedisArgs for str {
 }
 impl ToSingleRedisArg for str {}
 
+impl ToRedisArgs for [u8] {
+    fn write_redis_args<W: ?Sized + RedisWrite>(&self, out: &mut W) {
+        out.write_arg(self);
+    }
+}
+impl ToSingleRedisArg for [u8] {}
+
 /// A binary value that is always sent as exactly one bulk-string argument.
 ///
 /// `Vec<T>` is treated as *variadic* (each element becomes its own argument),

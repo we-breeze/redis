@@ -147,8 +147,12 @@ fn overloaded_error() -> RedisError {
 /// socket but not yet answered (`pending`); beyond it requests fail fast with
 /// [`ErrorKind::Overloaded`] so a mesh that reads but never replies cannot
 /// grow memory without bound.
-async fn drive<S>(stream: S, mut rx: mpsc::Receiver<Request>, alive: Arc<AtomicBool>, max_inflight: usize)
-where
+async fn drive<S>(
+    stream: S,
+    mut rx: mpsc::Receiver<Request>,
+    alive: Arc<AtomicBool>,
+    max_inflight: usize,
+) where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -267,7 +271,7 @@ fn deliver(value: Value, pending: &mut VecDeque<Pending>) {
     };
     front.replies.push(value);
     if front.replies.len() >= front.reply_count {
-    let entry = pending.pop_front().unwrap();
+        let entry = pending.pop_front().unwrap();
         let _ = entry.responder.send(Ok(entry.replies));
     }
 }
@@ -302,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn fails_fast_when_inflight_budget_exhausted() {
         let (addr, _mesh) = silent_mesh().await;
-        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr.into()), 2)
+        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr), 2)
             .await
             .unwrap();
 
@@ -327,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn poisoned_connection_refuses_new_requests() {
         let (addr, _mesh) = silent_mesh().await;
-        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr.into()), 16)
+        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr), 16)
             .await
             .unwrap();
         assert!(conn.is_alive());

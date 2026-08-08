@@ -187,7 +187,10 @@ impl Client {
                 return Err(err);
             }
         };
-        match self.with_timeout(conn.req_pipeline(pipeline, offset, count)).await {
+        match self
+            .with_timeout(conn.req_pipeline(pipeline, offset, count))
+            .await
+        {
             Ok(values) => {
                 inner.pool.note_success();
                 inner
@@ -217,10 +220,7 @@ impl Client {
     /// deadline into a [`ErrorKind::Timeout`] error. The timed-out waiter is
     /// dropped; if a late reply eventually arrives the driver simply discards
     /// it.
-    async fn with_timeout<T>(
-        &self,
-        fut: impl Future<Output = RedisResult<T>>,
-    ) -> RedisResult<T> {
+    async fn with_timeout<T>(&self, fut: impl Future<Output = RedisResult<T>>) -> RedisResult<T> {
         match tokio::time::timeout(self.inner.op_timeout, fut).await {
             Ok(result) => result,
             Err(_) => Err(RedisError::from_kind(
