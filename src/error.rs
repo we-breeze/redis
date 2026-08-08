@@ -125,6 +125,15 @@ impl RedisError {
         }
     }
 
+    /// Build an error from a kind and a runtime message. Intended for code
+    /// outside the crate (e.g. tooling building its own connections) that needs
+    /// to surface a failure through [`RedisResult`] without a private accessor.
+    pub fn new(kind: ErrorKind, msg: impl Into<String>) -> Self {
+        RedisError {
+            repr: ErrorRepr::WithDescription(kind, "client error", Some(msg.into())),
+        }
+    }
+
     /// Build an error from a kind, a static description, and a runtime detail.
     pub(crate) fn with_detail(kind: ErrorKind, desc: &'static str, detail: String) -> Self {
         RedisError {

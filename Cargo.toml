@@ -22,3 +22,16 @@ tokio = { version = "1", features = ["full"] }
 [features]
 # Integration tests that require a live redis-server are gated behind this.
 integration-tests = []
+
+# This crate is itself the SDK (`breeze-redis`) AND the workspace root. The
+# `redis-bench` load-test harness lives under `tools/redis-bench` and is the
+# only other member.
+[workspace]
+members = ["tools/redis-bench"]
+resolver = "2"
+
+[workspace.dependencies]
+# Sibling workspace: the bench harness installs this allocator at its binary
+# composition root to get mimalloc + per-request allocation accounting. The SDK
+# itself stays allocator-agnostic.
+brz-mem = { path = "../memory", version = "0.1.0", default-features = false }
