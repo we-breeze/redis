@@ -3,7 +3,7 @@
 //! Workloads are written against the [`Commands`] trait, which is implemented
 //! for every [`ConnectionLike`]. The harness holds the active connection as a
 //! trait object (`Arc<dyn ConnectionLike>`) so the same workload code drives
-//! both the mesh [`Client`](breeze_redis::Client) and the harness's direct
+//! both the mesh [`Client`](redis::Client) and the harness's direct
 //! client.
 //!
 //! To keep the per-op allocation count honest (so it reflects the *SDK's*
@@ -15,9 +15,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use breeze_redis::Commands;
-use breeze_redis::connection::ConnectionLike;
-use breeze_redis::types::Value;
+use redis::Commands;
+use redis::connection::ConnectionLike;
+use redis::types::Value;
 
 /// A boxed, `Send` future returned by a workload.
 pub type WorkFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;

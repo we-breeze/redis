@@ -1,4 +1,4 @@
-//! redis-bench — a load-test harness for the breeze-redis SDK.
+//! redis-bench — a load-test harness for the redis SDK.
 //!
 //! Runs a fixed number of operations across `--concurrency` async workers and
 //! reports throughput plus latency percentiles (p50/p95/p99). It drives the
@@ -27,11 +27,11 @@ mod stats;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use breeze_redis::connection::ConnectionLike;
-use breeze_redis::{Client, MeshConfig, Transport};
 use clap::Parser;
 use direct::DirectClient;
 use driver::{Workload, WorkloadKind};
+use redis::connection::ConnectionLike;
+use redis::{Client, MeshConfig, Transport};
 use stats::{MemoryWindow, OpBudget, Summary, WorkerStats};
 
 // Install mimalloc (with per-request heap accounting under the `memory-stats`
@@ -39,13 +39,9 @@ use stats::{MemoryWindow, OpBudget, Summary, WorkerStats};
 // allocator-agnostic; only this binary pins one.
 brz_mem::install_global_allocator!();
 
-/// Arguments for the breeze-redis load-test harness.
+/// Arguments for the redis load-test harness.
 #[derive(Parser, Debug)]
-#[command(
-    name = "redis-bench",
-    version,
-    about = "Load-test the breeze-redis SDK"
-)]
+#[command(name = "redis-bench", version, about = "Load-test the redis SDK")]
 struct Args {
     /// Mesh resource namespace to connect through.
     #[arg(long, env = "BREEZE_REDIS_NS")]
@@ -140,7 +136,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "breeze_redis=warn,redis_bench=info".into()),
+                .unwrap_or_else(|_| "redis=warn,redis_bench=info".into()),
         )
         .init();
 
@@ -290,7 +286,7 @@ async fn warmup(
 /// measured phase, so it runs concurrently across the harness pool to keep it
 /// fast for large key counts.
 async fn seed_keys(client: &Arc<dyn ConnectionLike>, pool: &driver::Pool) -> Result<(), String> {
-    use breeze_redis::Commands;
+    use redis::Commands;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Snapshot the keys/values into owned Arcs so spawned tasks are 'static.

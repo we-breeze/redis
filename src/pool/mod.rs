@@ -86,7 +86,7 @@ impl Pool {
         let outcome = self.health.on_failure();
         if outcome.tripped {
             tracing::warn!(
-                target: "breeze_redis::pool",
+                target: "redis::pool",
                 endpoint = %self.endpoint(),
                 "circuit breaker tripped; mesh marked unhealthy"
             );
@@ -151,7 +151,7 @@ impl Pool {
             match self.create_conn().await {
                 Ok(conn) => self.conns.write().unwrap().push(conn),
                 Err(err) => tracing::warn!(
-                    target: "breeze_redis::pool",
+                    target: "redis::pool",
                     endpoint = %self.endpoint(),
                     error = %err,
                     "warm-up connection failed"
@@ -177,7 +177,7 @@ impl Pool {
             self.conns.write().unwrap().push(conn);
             self.health.recover();
             tracing::info!(
-                target: "breeze_redis::pool",
+                target: "redis::pool",
                 endpoint = %self.endpoint(),
                 "recovery probe succeeded; mesh healthy again"
             );
@@ -203,7 +203,7 @@ impl Pool {
         if changed {
             self.conns.write().unwrap().clear();
             tracing::info!(
-                target: "breeze_redis::pool",
+                target: "redis::pool",
                 endpoint = %new,
                 "mesh endpoint re-published; switched to new endpoint"
             );

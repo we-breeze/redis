@@ -1,5 +1,5 @@
 [package]
-name = "breeze-redis"
+name = "redis"
 version = "0.1.0"
 edition = "2024"
 description = "High-performance, high-availability async Redis client for the example breeze platform"
@@ -24,15 +24,16 @@ tokio = { version = "1", features = ["full"] }
 integration-tests = []
 direct-tcp = []
 
-# This crate is itself the SDK (`breeze-redis`) AND the workspace root. The
+# This crate is itself the SDK (`redis`) AND the workspace root. The
 # `redis-bench` load-test harness lives under `tools/redis-bench` and is the
 # only other member.
 [workspace]
 members = ["tools/redis-bench"]
+exclude = ["memory"]
 resolver = "2"
 
 [workspace.dependencies]
-# Sibling workspace: the bench harness installs this allocator at its binary
+# Workspace submodule: the bench harness installs this allocator at its binary
 # composition root to get mimalloc + per-request allocation accounting. The SDK
 # itself stays allocator-agnostic.
-brz-mem = { path = "../memory", version = "0.1.0", default-features = false }
+brz-mem = { path = "memory", version = "0.1.0", default-features = false }

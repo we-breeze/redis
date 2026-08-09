@@ -10,7 +10,7 @@
 
 #![cfg(feature = "integration-tests")]
 
-use breeze_redis::{Client, Commands, MeshConfig, MeshRouting};
+use redis::{Client, Commands, MeshConfig, MeshRouting};
 
 fn namespace() -> Option<String> {
     std::env::var("BREEZE_REDIS_NS")
@@ -62,10 +62,10 @@ async fn pipeline_batches() {
         return;
     };
     let client = connect().await;
-    let mut pipe = breeze_redis::pipe();
+    let mut pipe = redis::pipe();
     pipe.set("breeze_redis:it:p1", "a")
         .set("breeze_redis:it:p2", "b");
-    let _: Vec<breeze_redis::Value> = pipe.query_async(&client).await.unwrap();
+    let _: Vec<redis::Value> = pipe.query_async(&client).await.unwrap();
     let vals: Vec<String> = client
         .mget(vec!["breeze_redis:it:p1", "breeze_redis:it:p2"])
         .await

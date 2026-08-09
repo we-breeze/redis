@@ -1,4 +1,4 @@
-//! # breeze-redis
+//! # redis
 //!
 //! A high-performance, high-availability async Redis client that reaches Redis
 //! **through the breeze mesh**. It connects to the single local mesh agent for
@@ -23,9 +23,9 @@
 //!   [`MeshRouting::broadcast`], and [`MeshRouting::at_master`].
 //!
 //! ```no_run
-//! use breeze_redis::{Client, Commands, MeshRouting};
+//! use redis::{Client, Commands, MeshRouting};
 //!
-//! # async fn demo() -> breeze_redis::RedisResult<()> {
+//! # async fn demo() -> redis::RedisResult<()> {
 //! // Connect to the mesh for a resource namespace.
 //! let client = Client::connect("my_redis_namespace").await?;
 //! client.set::<()>("key", "value").await?;

@@ -6,7 +6,7 @@
 //! mesh conveys identity/routing out-of-band), so it is not used here. Instead
 //! we build a thin pool of the SDK's [`MultiplexedConnection`]s directly against
 //! the resolved TCP/unix endpoint and expose it as a [`ConnectionLike`], so the
-//! same [`Commands`](breeze_redis::Commands) workloads used against the mesh
+//! same [`Commands`](redis::Commands) workloads used against the mesh
 //! client work here too.
 //!
 //! This still exercises the real RESP encoder, parser, multiplexing driver,
@@ -19,11 +19,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use breeze_redis::connection::{ConnectionLike, MultiplexedConnection, RedisFuture};
-use breeze_redis::error::{ErrorKind, RedisError, RedisResult};
-use breeze_redis::mesh::Endpoint;
-use breeze_redis::types::Value;
-use breeze_redis::{Cmd, Pipeline};
+use redis::connection::{ConnectionLike, MultiplexedConnection, RedisFuture};
+use redis::error::{ErrorKind, RedisError, RedisResult};
+use redis::mesh::Endpoint;
+use redis::types::Value;
+use redis::{Cmd, Pipeline};
 
 /// A small round-robin pool of [`MultiplexedConnection`]s to one direct
 /// endpoint. Cheap to clone (shares one pool). Each request is timed out via

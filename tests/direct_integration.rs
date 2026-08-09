@@ -3,7 +3,7 @@
 //
 // Run with:
 //
-//     cargo test -p breeze-redis --features direct-tcp --test direct_integration -- --ignored
+//     cargo test -p redis --features direct-tcp --test direct_integration -- --ignored
 //
 // Requirements:
 //   - Docker daemon running.
@@ -14,7 +14,7 @@
 //     Redis 7 server works regardless of the image name.
 //
 // NOTE ON CURRENT FAILURES (as of this commit):
-// The committed `breeze_redis::direct::hget` and `breeze_redis::direct::hmget`
+// The committed `redis::direct::hget` and `redis::direct::hmget`
 // in `src/direct.rs` emit *malformed* RESP: they declare an array of `3` (resp.
 // `2 + nfields`) elements but omit the command-name bulk string (`HGET` /
 // `HMGET`), sending only `<key>` and `<field>`/`<fields>`. A real Redis 7
@@ -35,7 +35,7 @@
 // These tests are `#[ignore]`-guarded because they require Docker with a Redis 7
 // image available. Run them explicitly with:
 //
-//     cargo test -p breeze-redis --features direct-tcp --test direct_integration -- --ignored
+//     cargo test -p redis --features direct-tcp --test direct_integration -- --ignored
 //
 // Requirements:
 //   - Docker daemon running.
@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use breeze_redis::direct::{ArrayElement, BulkResponse, hget, hmget};
+use redis::direct::{ArrayElement, BulkResponse, hget, hmget};
 
 /// Committed image reference. Tests only connect to host:port, so the image
 /// choice only affects container startup. Override at runtime with the
@@ -201,7 +201,7 @@ impl Drop for RedisContainer {
 /// Send a raw RESP command over a fresh TcpStream and read back the full reply.
 /// Self-contained, *correct* RESP encoder/reader used only to seed data and to
 /// sanity-check the container — it is NOT what the tests assert on (they assert
-/// on the public `breeze_redis::direct::hget` / `breeze_redis::direct::hmget`
+/// on the public `redis::direct::hget` / `redis::direct::hmget`
 /// API).
 async fn resp_command(port: u16, args: &[&[u8]]) -> std::io::Result<Vec<u8>> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await?;
@@ -365,10 +365,10 @@ async fn hset(port: u16, key: &str, field: &str, value: &[u8]) {
 /// Call a direct read function with a short retry loop to absorb transient
 /// connection-reset races against a freshly-started container. The library
 /// opens a new connection per call, so retries are safe for read-only ops.
-async fn call_with_retry<F, T>(mut f: F) -> Result<T, breeze_redis::direct::RedisError>
+async fn call_with_retry<F, T>(mut f: F) -> Result<T, redis::direct::RedisError>
 where
     F: FnMut() -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<T, breeze_redis::direct::RedisError>> + Send>,
+        Box<dyn std::future::Future<Output = Result<T, redis::direct::RedisError>> + Send>,
     >,
 {
     let deadline = Instant::now() + Duration::from_secs(15);

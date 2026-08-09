@@ -40,7 +40,7 @@ impl Stats {
         if elapsed >= slow_threshold {
             self.slow.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                target: "breeze_redis::slowlog",
+                target: "redis::slowlog",
                 command = name,
                 elapsed_ms = elapsed.as_millis() as u64,
                 "slow redis command"

@@ -1,4 +1,4 @@
-# breeze-redis
+# redis
 
 A high-performance, high-availability **async Redis client** (Rust / tokio) that
 reaches Redis **through the breeze mesh**.
@@ -29,9 +29,9 @@ reimplemented in Rust.
 ## Usage
 
 ```rust
-use breeze_redis::{Client, Commands, MeshRouting};
+use redis::{Client, Commands, MeshRouting};
 
-# async fn demo() -> breeze_redis::RedisResult<()> {
+# async fn demo() -> redis::RedisResult<()> {
 // Connect to the mesh for a resource namespace (defaults to TCP transport).
 let client = Client::connect("my_redis_namespace").await?;
 
@@ -50,9 +50,9 @@ let latest: String = client.at_master().get("key").await?;
 Custom configuration (group, transport, pool size, socket dir):
 
 ```rust
-use breeze_redis::{Client, MeshConfig, Transport};
+use redis::{Client, MeshConfig, Transport};
 
-# async fn demo() -> breeze_redis::RedisResult<()> {
+# async fn demo() -> redis::RedisResult<()> {
 let cfg = MeshConfig::new("my_ns")
     .with_group("prod")
     .with_transport(Transport::Unix)

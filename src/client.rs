@@ -93,12 +93,12 @@ impl Client {
         let ns = &self.inner.namespace;
         if no_available {
             tracing::error!(
-                target: "breeze_redis::mesh",
+                target: "redis::mesh",
                 "redis mesh exception namespace:{ns} ,method:{method} ,key:{key} ,e:{detail}"
             );
         } else {
             tracing::error!(
-                target: "breeze_redis::mesh",
+                target: "redis::mesh",
                 error = %detail,
                 "redis mesh exception namespace:{ns} ,method:{method} ,key:{key} ,e:"
             );
