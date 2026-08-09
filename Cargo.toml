@@ -22,6 +22,7 @@ tokio = { version = "1", features = ["full"] }
 [features]
 # Integration tests that require a live redis-server are gated behind this.
 integration-tests = []
+direct-tcp = []
 
 # This crate is itself the SDK (`breeze-redis`) AND the workspace root. The
 # `redis-bench` load-test harness lives under `tools/redis-bench` and is the

@@ -56,6 +56,9 @@ pub mod stats;
 pub mod to_args;
 pub mod types;
 
+#[cfg(feature = "direct-tcp")]
+pub mod direct;
+
 pub use client::Client;
 pub use cmd::{Cmd, cmd, pipe};
 pub use commands::Commands;
