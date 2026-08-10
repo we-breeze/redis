@@ -7,6 +7,7 @@
 # Forward any redis-bench flags; they pass through verbatim, e.g.:
 #   ./bench.sh --concurrency 64 --ops 100000
 #   ./bench.sh -c 128 -d 60
+#   ./bench.sh --replay 127.0.0.1:16379 --ops 100000   # replay client (HGET)
 #
 # Optional env vars:
 #   IMAGE   redis image to run            (default: the example redis:7 image)
