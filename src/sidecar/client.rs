@@ -17,7 +17,7 @@ use crate::connection::{ConnectionLike, RedisFuture};
 use crate::error::{RedisError, RedisResult};
 use crate::pipeline::Pipeline;
 use crate::pool::Pool;
-use crate::stats::{Stats, StatsSnapshot};
+use crate::stats::{LogThrottle, Stats, StatsSnapshot};
 use crate::types::Value;
 
 /// The mesh's "no backend available" server error (see the Java
@@ -32,6 +32,7 @@ struct Inner {
     write_retry: u32,
     op_timeout: Duration,
     slow_threshold: Duration,
+    log_throttle: LogThrottle,
 }
 
 /// A high-availability, pooled mesh Redis client. Cheap to clone (shares one
@@ -85,6 +86,7 @@ impl SidecarClient {
                 write_retry,
                 op_timeout,
                 slow_threshold,
+                log_throttle: LogThrottle::new(),
             }),
         }
     }
@@ -114,16 +116,21 @@ impl SidecarClient {
     /// plain message (no stack trace), every other error is logged together
     /// with the error itself.
     fn log_exception(&self, method: &str, key: &str, detail: &str, no_available: bool) {
+        let Some(suppressed) = self.inner.log_throttle.allow() else {
+            return;
+        };
         let ns = &self.inner.namespace;
         if no_available {
             tracing::error!(
                 target: "redis::sidecar",
+                suppressed,
                 "redis mesh exception namespace:{ns} ,method:{method} ,key:{key} ,e:{detail}"
             );
         } else {
             tracing::error!(
                 target: "redis::sidecar",
                 error = %detail,
+                suppressed,
                 "redis mesh exception namespace:{ns} ,method:{method} ,key:{key} ,e:"
             );
         }

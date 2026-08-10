@@ -68,26 +68,32 @@ impl Cmd {
     }
 
     /// The command verb (first argument) as a UTF-8 string, for logging and
-    /// stats. Empty if the command has no arguments yet.
-    pub fn name(&self) -> String {
+    /// stats. Empty if the command has no arguments yet. Borrows when the
+    /// verb is valid UTF-8 (the common case) — no allocation on the hot path.
+    pub fn name(&self) -> std::borrow::Cow<'_, str> {
         self.args
             .first()
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .unwrap_or_default()
+            .map(|a| String::from_utf8_lossy(a))
+            .unwrap_or(std::borrow::Cow::Borrowed(""))
     }
 
     /// The command's key (second argument, by Redis convention) as a UTF-8
     /// string, for logging. Empty if the command has no key argument.
-    pub fn key(&self) -> String {
+    /// Borrows when possible.
+    pub fn key(&self) -> std::borrow::Cow<'_, str> {
         self.args
             .get(1)
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .unwrap_or_default()
+            .map(|a| String::from_utf8_lossy(a))
+            .unwrap_or(std::borrow::Cow::Borrowed(""))
     }
 
     /// Encode this command into a RESP multibulk frame.
     pub fn encoded(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        // Pre-size to avoid growth reallocs: each arg costs its bytes plus
+        // up to ~19 bytes of framing (`$<len>\r\n` + `\r\n`), plus the array
+        // header.
+        let cap = self.args.iter().map(|a| a.len() + 21).sum::<usize>() + 23;
+        let mut out = Vec::with_capacity(cap);
         encode_command(&self.args, &mut out);
         out
     }

@@ -269,7 +269,16 @@ impl Parser<'_> {
 }
 
 fn find_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\r\n")
+    // SIMD-accelerated scan for '\r', then confirm the '\n'.
+    let mut offset = 0;
+    while let Some(i) = memchr::memchr(b'\r', &buf[offset..]) {
+        let pos = offset + i;
+        if buf.get(pos + 1) == Some(&b'\n') {
+            return Some(pos);
+        }
+        offset = pos + 1;
+    }
+    None
 }
 
 fn parse_i64(line: &[u8]) -> Result<i64, RedisError> {

@@ -660,6 +660,7 @@ dependencies = [
  "futures-util",
  "itoa",
  "md5",
+ "memchr",
  "rand",
  "ryu",
  "sha1_smol",

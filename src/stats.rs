@@ -5,7 +5,52 @@
 //! threshold. No external metrics backend is assumed.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// A 1-second-window log throttle: at most `LOG_LIMIT` lines per window,
+/// beyond that events are counted and the count rides along on the next
+/// allowed line. Prevents a mesh/backend flap from turning into a log storm
+/// when one process serves many namespaces.
+#[derive(Debug, Default)]
+pub(crate) struct LogThrottle {
+    window: AtomicU64,
+    count: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+const LOG_LIMIT: u64 = 5;
+
+impl LogThrottle {
+    pub(crate) fn new() -> Self {
+        LogThrottle {
+            window: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether to emit a log line now; on allowance, returns how many events
+    /// were suppressed since the previous emitted line.
+    pub(crate) fn allow(&self) -> Option<u64> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let window = self.window.load(Ordering::Acquire);
+        if window != now {
+            // Racy reset is fine for a throttle.
+            self.window.store(now, Ordering::Release);
+            self.count.store(1, Ordering::Release);
+            return Some(self.suppressed.swap(0, Ordering::AcqRel));
+        }
+        if self.count.fetch_add(1, Ordering::AcqRel) < LOG_LIMIT {
+            Some(0)
+        } else {
+            self.suppressed.fetch_add(1, Ordering::AcqRel);
+            None
+        }
+    }
+}
 
 /// A set of counters for one logical resource (a `host:port` or an HA group).
 #[derive(Debug, Default)]
@@ -20,6 +65,8 @@ pub struct Stats {
     unavailable: AtomicU64,
     /// Accumulated command latency, in microseconds, for averaging.
     total_micros: AtomicU64,
+    /// Slow-log throttle.
+    slow_throttle: LogThrottle,
 }
 
 impl Stats {
@@ -39,12 +86,15 @@ impl Stats {
         }
         if elapsed >= slow_threshold {
             self.slow.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                target: "redis::slowlog",
-                command = name,
-                elapsed_ms = elapsed.as_millis() as u64,
-                "slow redis command"
-            );
+            if let Some(suppressed) = self.slow_throttle.allow() {
+                tracing::warn!(
+                    target: "redis::slowlog",
+                    command = name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    suppressed,
+                    "slow redis command"
+                );
+            }
         }
     }
 

@@ -39,7 +39,10 @@ pub struct MeshConfig {
     pub transport: Transport,
     /// Directory the mesh publishes sock files / listens in.
     pub socket_dir: PathBuf,
-    /// Number of multiplexed connections held in the pool.
+    /// Maximum live connections in the pool. The pool starts at one
+    /// connection and grows on demand (when every live connection is above
+    /// half its in-flight budget), so this is a cap, not a fixed size —
+    /// important when one process serves ~1000 namespaces.
     pub pool_size: usize,
     /// Per-command operation timeout.
     pub op_timeout: Duration,
@@ -69,7 +72,7 @@ impl MeshConfig {
             resource: DEFAULT_RESOURCE.to_string(),
             transport: Transport::Tcp,
             socket_dir: PathBuf::from(DEFAULT_SOCKET_DIR),
-            pool_size: 8,
+            pool_size: 4,
             op_timeout: Duration::from_millis(1000),
             connect_wait: Duration::from_secs(10),
             slow_time_threshold: Duration::from_millis(50),
@@ -97,7 +100,7 @@ impl MeshConfig {
         self
     }
 
-    /// Override the connection pool size.
+    /// Override the maximum number of live pooled connections.
     pub fn with_pool_size(mut self, size: usize) -> Self {
         self.pool_size = size.max(1);
         self

@@ -12,8 +12,9 @@
 //! RESP.
 
 use std::collections::VecDeque;
+use std::io::IoSlice;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -64,6 +65,9 @@ pub struct MultiplexedConnection {
     /// The remote address this connection is bound to (TCP only). Used by
     /// the pool's per-IP balancing and DNS-change eviction.
     addr: Option<std::net::SocketAddr>,
+    /// Requests handed to the driver but not yet fully answered. The pool
+    /// reads this to grow the pool under load.
+    inflight: Arc<AtomicUsize>,
 }
 
 impl MultiplexedConnection {
@@ -97,7 +101,12 @@ impl MultiplexedConnection {
                 None
             }
         };
-        let conn = MultiplexedConnection { tx, alive, addr };
+        let conn = MultiplexedConnection {
+            tx,
+            alive,
+            addr,
+            inflight: Arc::new(AtomicUsize::new(0)),
+        };
         if let Some(handshake) = handshake {
             conn.run_handshake(handshake).await?;
         }
@@ -107,6 +116,11 @@ impl MultiplexedConnection {
     /// The remote address (TCP connections only).
     pub fn addr(&self) -> Option<std::net::SocketAddr> {
         self.addr
+    }
+
+    /// Requests currently queued or awaiting replies on this connection.
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Acquire)
     }
 
     /// `AUTH`/`SELECT` on a fresh connection; any failure rejects the
@@ -151,11 +165,20 @@ impl MultiplexedConnection {
             reply_count,
             responder,
         };
-        self.tx.try_send(request).map_err(|err| match err {
-            mpsc::error::TrySendError::Full(_) => overloaded_error(),
-            mpsc::error::TrySendError::Closed(_) => dead_connection_error(),
-        })?;
-        rx.await.map_err(|_| dead_connection_error())?
+        // Count before handing to the driver so the counter never transiently
+        // dips below the true in-flight number (the driver may answer
+        // immediately after try_send).
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        if let Err(err) = self.tx.try_send(request) {
+            self.inflight.fetch_sub(1, Ordering::AcqRel);
+            return Err(match err {
+                mpsc::error::TrySendError::Full(_) => overloaded_error(),
+                mpsc::error::TrySendError::Closed(_) => dead_connection_error(),
+            });
+        }
+        let result = rx.await.map_err(|_| dead_connection_error());
+        self.inflight.fetch_sub(1, Ordering::AcqRel);
+        result?
     }
 }
 
@@ -220,39 +243,45 @@ async fn drive<S>(
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut pending: VecDeque<Pending> = VecDeque::new();
-    let mut read_buf = BytesMut::with_capacity(16 * 1024);
+    // Start small and grow on demand (a process can hold thousands of mostly
+    // idle connections); shrunk again after oversized replies.
+    let mut read_buf = BytesMut::with_capacity(4 * 1024);
+    // Alternate which select branch is polled first: under continuous load a
+    // fixed write bias can starve reads (replies pile up), a fixed read bias
+    // hurts pipelining.
+    let mut prefer_write = true;
 
     loop {
-        tokio::select! {
-            // Biased so we always drain queued outgoing requests before reading,
-            // maximizing pipelining under load.
-            biased;
-
-            maybe_req = rx.recv() => {
-                match maybe_req {
-                    Some(req) => {
-                        if pending.len() >= max_inflight {
-                            let _ = req.responder.send(Err(overloaded_error()));
-                        } else if !write_request(&mut writer, &mut rx, req, &mut pending, max_inflight).await {
-                            break;
-                        }
+        if prefer_write {
+            tokio::select! {
+                biased;
+                maybe_req = rx.recv() => {
+                    if !on_request(&mut writer, &mut rx, maybe_req, &mut pending, max_inflight).await {
+                        break;
                     }
-                    None => break, // all senders dropped.
+                }
+                read = reader.read_buf(&mut read_buf) => {
+                    if !on_read(&mut reader, &mut read_buf, &mut pending, read).await {
+                        break;
+                    }
                 }
             }
-
-            read = reader.read_buf(&mut read_buf) => {
-                match read {
-                    Ok(0) => break, // EOF.
-                    Ok(_) => {
-                        if !dispatch_replies(&mut read_buf, &mut pending) {
-                            break;
-                        }
+        } else {
+            tokio::select! {
+                biased;
+                read = reader.read_buf(&mut read_buf) => {
+                    if !on_read(&mut reader, &mut read_buf, &mut pending, read).await {
+                        break;
                     }
-                    Err(_) => break,
+                }
+                maybe_req = rx.recv() => {
+                    if !on_request(&mut writer, &mut rx, maybe_req, &mut pending, max_inflight).await {
+                        break;
+                    }
                 }
             }
         }
+        prefer_write = !prefer_write;
     }
 
     alive.store(false, Ordering::Release);
@@ -261,6 +290,80 @@ async fn drive<S>(
     }
     while let Ok(req) = rx.try_recv() {
         let _ = req.responder.send(Err(dead_connection_error()));
+    }
+}
+
+/// Handle one dequeued request (or channel close). Returns `false` if the
+/// driver should exit.
+async fn on_request<W>(
+    writer: &mut W,
+    rx: &mut mpsc::Receiver<Request>,
+    maybe_req: Option<Request>,
+    pending: &mut VecDeque<Pending>,
+    max_inflight: usize,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    match maybe_req {
+        Some(req) => {
+            if pending.len() >= max_inflight {
+                let _ = req.responder.send(Err(overloaded_error()));
+                true
+            } else {
+                write_request(writer, rx, req, pending, max_inflight).await
+            }
+        }
+        None => false, // all senders dropped.
+    }
+}
+
+/// Handle a socket read: drain whatever else is already buffered by the OS
+/// before parsing (so a large reply arriving in fragments is parsed once per
+/// starvation point instead of once per TCP segment), then dispatch replies.
+/// Returns `false` if the driver should exit.
+async fn on_read<R>(
+    reader: &mut R,
+    read_buf: &mut BytesMut,
+    pending: &mut VecDeque<Pending>,
+    read: std::io::Result<usize>,
+) -> bool
+where
+    R: AsyncRead + Unpin,
+{
+    match read {
+        Ok(0) => false, // EOF.
+        Ok(_) => {
+            drain_available(reader, read_buf).await;
+            dispatch_replies(read_buf, pending)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Opportunistically pull any immediately-available bytes from the socket
+/// without awaiting; stops when the socket would block (or after a bounded
+/// number of chunks, to avoid starving the write path).
+async fn drain_available<R>(reader: &mut R, buf: &mut BytesMut)
+where
+    R: AsyncRead + Unpin,
+{
+    use std::task::Poll;
+    let mut chunk = [0u8; 16 * 1024];
+    for _ in 0..8 {
+        let filled = std::future::poll_fn(|cx| {
+            let mut rb = tokio::io::ReadBuf::new(&mut chunk);
+            match std::pin::Pin::new(&mut *reader).poll_read(cx, &mut rb) {
+                Poll::Ready(Ok(())) => Poll::Ready(rb.filled().len()),
+                // Pending (would-block) or error: stop draining.
+                _ => Poll::Ready(0),
+            }
+        })
+        .await;
+        if filled == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..filled]);
     }
 }
 
@@ -276,7 +379,7 @@ async fn write_request<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut batch = first.payload;
+    let mut payloads = vec![first.payload];
     let mut registered = vec![(first.reply_count, first.responder)];
 
     // Coalesce everything currently queued into a single write syscall,
@@ -285,11 +388,24 @@ where
         let Ok(req) = rx.try_recv() else {
             break;
         };
-        batch.extend_from_slice(&req.payload);
+        payloads.push(req.payload);
         registered.push((req.reply_count, req.responder));
     }
 
-    if writer.write_all(&batch).await.is_err() {
+    let written = if writer.is_write_vectored() && payloads.len() > 1 {
+        // Vectored write: one syscall, no coalescing copy.
+        let mut slices: Vec<IoSlice<'_>> =
+            payloads.iter().map(|p| IoSlice::new(p)).collect();
+        write_all_vectored(writer, &mut slices).await
+    } else {
+        let mut iter = payloads.into_iter();
+        let mut batch = iter.next().unwrap();
+        for payload in iter {
+            batch.extend_from_slice(&payload);
+        }
+        writer.write_all(&batch).await
+    };
+    if written.is_err() {
         for (_, responder) in registered {
             let _ = responder.send(Err(dead_connection_error()));
         }
@@ -306,6 +422,22 @@ where
     true
 }
 
+/// `write_vectored` loop handling partial writes (tokio has no
+/// `write_all_vectored`).
+async fn write_all_vectored<W>(writer: &mut W, mut bufs: &mut [IoSlice<'_>]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    while !bufs.is_empty() {
+        let n = writer.write_vectored(bufs).await?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        IoSlice::advance_slices(&mut bufs, n);
+    }
+    Ok(())
+}
+
 /// Parse as many complete replies as `read_buf` holds and route them to the
 /// front pending entries. Returns `false` on an unrecoverable protocol error.
 fn dispatch_replies(read_buf: &mut BytesMut, pending: &mut VecDeque<Pending>) -> bool {
@@ -315,7 +447,22 @@ fn dispatch_replies(read_buf: &mut BytesMut, pending: &mut VecDeque<Pending>) ->
                 let _ = read_buf.split_to(consumed);
                 deliver(value, pending);
             }
-            Ok(ParseResult::Incomplete) => return true,
+            Ok(ParseResult::Incomplete) => {
+                // Release memory after an oversized reply so a mostly-idle
+                // connection doesn't pin a huge buffer (matters at ~1000
+                // namespaces × pool connections per process).
+                const SHRINK_THRESHOLD: usize = 64 * 1024;
+                if read_buf.capacity() > SHRINK_THRESHOLD
+                    && read_buf.len() < SHRINK_THRESHOLD / 2
+                {
+                    // No shrink API on BytesMut: swap in a fresh small buffer.
+                    let rest = read_buf.split();
+                    let mut fresh = BytesMut::with_capacity(4 * 1024);
+                    fresh.extend_from_slice(&rest);
+                    *read_buf = fresh;
+                }
+                return true;
+            }
             Err(err) => {
                 if let Some(entry) = pending.pop_front() {
                     let _ = entry.responder.send(Err(err));

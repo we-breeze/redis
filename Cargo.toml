@@ -17,6 +17,7 @@ url = "2"
 thiserror = "2"
 md5 = "0.7"
 rand = "0.8"
+memchr = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
