@@ -78,12 +78,26 @@ pub async fn discover(cfg: &MeshConfig) -> RedisResult<Endpoint> {
 /// a new port (e.g. after a mesh restart).
 pub async fn scan_current(cfg: &MeshConfig) -> Option<Endpoint> {
     let prefer_unix = matches!(cfg.transport, Transport::Unix);
-    let endpoint = scan_endpoint(&cfg.socket_dir, &cfg.group, &cfg.namespace, prefer_unix)?;
-    if connectable(&endpoint).await {
-        Some(endpoint)
-    } else {
-        None
+    // Try candidates best-first: a stale sock file (e.g. left over from a
+    // previous mesh publication on a dead port) must not mask a live one.
+    for endpoint in scan_endpoints(&cfg.socket_dir, &cfg.group, &cfg.namespace, prefer_unix) {
+        if connectable(&endpoint).await {
+            return Some(endpoint);
+        }
     }
+    None
+}
+
+/// All matching endpoints, best score first.
+pub fn scan_endpoints(
+    dir: &Path,
+    group: &str,
+    namespace: &str,
+    prefer_unix: bool,
+) -> Vec<Endpoint> {
+    let mut scored = scan_scored(dir, group, namespace, prefer_unix);
+    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    scored.into_iter().map(|(_, endpoint)| endpoint).collect()
 }
 
 async fn connectable(endpoint: &Endpoint) -> bool {
@@ -110,10 +124,20 @@ pub fn scan_endpoint(
     namespace: &str,
     prefer_unix: bool,
 ) -> Option<Endpoint> {
-    let entries = std::fs::read_dir(dir).ok()?;
+    scan_scored(dir, group, namespace, prefer_unix)
+        .into_iter()
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, endpoint)| endpoint)
+}
+
+fn scan_scored(dir: &Path, group: &str, namespace: &str, prefer_unix: bool) -> Vec<(u8, Endpoint)> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
     let group_marker = format!("+{group}+{namespace}");
     let ns_marker = format!("+{namespace}");
-    let mut best: Option<(u8, Endpoint)> = None;
+    let mut scored = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
@@ -132,14 +156,9 @@ pub fn scan_endpoint(
         };
         let family_match = matches!(endpoint, Endpoint::Unix(_)) == prefer_unix;
         let score = (family_match as u8) * 2 + (is_group as u8);
-        if best
-            .as_ref()
-            .is_none_or(|(best_score, _)| score > *best_score)
-        {
-            best = Some((score, endpoint));
-        }
+        scored.push((score, endpoint));
     }
-    best.map(|(_, endpoint)| endpoint)
+    scored
 }
 
 /// Parse a sock config file name into `(service, transport)`, mirroring the
@@ -231,6 +250,31 @@ mod tests {
         );
 
         assert!(scan_endpoint(&dir, "feed", "missing", false).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_endpoints_returns_all_candidates_best_first() {
+        let dir = std::env::temp_dir().join(format!("mesh_scan_all_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two TCP candidates for the same namespace (e.g. a stale file and a
+        // fresh one): both must be returned so the caller can fall back.
+        File::create(dir.join(
+            "static.config.api.example.com+3+config+cloud+redis+feed+auto_translate_llm@redis:9470@rs",
+        ))
+        .unwrap();
+        File::create(dir.join(
+            "dom+3+config+cloud+redis+feed+auto_translate_llm@redis:9471@rs",
+        ))
+        .unwrap();
+
+        let all = scan_endpoints(&dir, "feed", "auto_translate_llm", false);
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter()
+                .all(|e| matches!(e, Endpoint::Tcp(a) if a.port() == 9470 || a.port() == 9471))
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

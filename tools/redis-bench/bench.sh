@@ -19,8 +19,9 @@
 # the container, so the SDK takes the full sidecar path (discovery, pool,
 # breaker). Namespace/group are fixed bench values; NAMESPACE/GROUP overridable.
 #
-# Uses host networking (Linux). First run compiles redis-bench in release mode
-# (a few seconds); later runs reuse the cached build.
+# Uses explicit port mapping (works on both Linux and Docker Desktop for
+# macOS, where --network host is a no-op). First run compiles redis-bench in
+# release mode (a few seconds); later runs reuse the cached build.
 
 set -euo pipefail
 
@@ -40,7 +41,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "starting $IMAGE on port $PORT..."
-docker run -d --rm --name "$NAME" --network host "$IMAGE" \
+docker run -d --rm --name "$NAME" -p "$PORT:$PORT" "$IMAGE" \
   redis-server --save "" --appendonly no --port "$PORT" >/dev/null
 
 echo -n "waiting for redis on 127.0.0.1:$PORT ..."
