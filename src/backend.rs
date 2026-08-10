@@ -7,7 +7,8 @@
 //!   retries (reads `max_try_time`, writes `write_retry`, matching the Java
 //!   `callable`/`callUpdate` split). `read_only` backends reject writes.
 //! - [`HaServer`] (≈ `JedisHAServer`): a `first` (read-write) plus an optional
-//!   `second` read fallback, with optional double-write.
+//!   `second` read fallback, with optional double-write; `set_second` mode
+//!   syncs counters by writing the first's result back with `SET`.
 //! - [`MsServer`] (≈ `JedisMSServer`): writes only to `master`; reads prefer
 //!   `slave` and fall back to `master`; [`MsServer::at_master`] pins reads to
 //!   the master (read-your-writes / CAS sequences).
@@ -15,11 +16,13 @@
 //!   algorithms as the breeze mesh ([`crate::sharding`]).
 //!
 //! Availability comes from the same circuit breaker and maintenance probe as
-//! the mesh path ([`crate::pool`]); the endpoint is static, so recovery
-//! re-connects to the configured address instead of re-scanning the sock
-//! directory. DNS re-resolution on breaker trip (the Java
-//! `HostAddressWatcher` behavior) is not ported yet — configure IPs or make
-//! sure DNS TTLs are handled by the resolver.
+//! the mesh path ([`crate::pool`]). Hostname-configured backends get the
+//! clientBalancer `HostAddressWatcher` behavior: the hostname is re-resolved
+//! on breaker trips and every 30s while healthy, and the pool switches
+//! endpoints (dropping connections to offline IPs) when the answer changes.
+//! Note one simplification vs. Java: when a hostname resolves to multiple
+//! IPs, clientBalancer load-balances across all of them; this client pins
+//! one and fails over on breaker trip.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +32,6 @@ use crate::cmd::Cmd;
 use crate::config::MeshConfig;
 use crate::connection::{ConnectionLike, Handshake, RedisFuture};
 use crate::error::{ErrorKind, RedisError, RedisResult};
-use crate::mesh::Endpoint;
 use crate::pipeline::Pipeline;
 use crate::pool::Pool;
 use crate::sharding::Sharding;
@@ -149,15 +151,16 @@ impl Backend {
     /// on every connection), and start maintenance.
     pub async fn connect(config: BackendConfig) -> RedisResult<Self> {
         let label = config.label();
-        let addr = tokio::net::lookup_host(format!("{}:{}", config.host, config.port))
+        let authority = format!("{}:{}", config.host, config.port);
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&authority)
             .await?
-            .next()
-            .ok_or_else(|| {
-                RedisError::new(
-                    ErrorKind::ClientError,
-                    format!("cannot resolve '{}:{}'", config.host, config.port),
-                )
-            })?;
+            .collect();
+        if addrs.is_empty() {
+            return Err(RedisError::new(
+                ErrorKind::ClientError,
+                format!("cannot resolve '{}:{}'", config.host, config.port),
+            ));
+        }
         let handshake = if config.auth.is_some() || config.db != 0 {
             Some(Handshake {
                 auth: config.auth.clone(),
@@ -174,7 +177,14 @@ impl Backend {
         pool_config.max_try_time = config.max_try_time;
         pool_config.write_retry = config.write_retry;
 
-        let pool = Pool::connect_direct(Endpoint::Tcp(addr), handshake, pool_config).await?;
+        // Hostnames get a DNS watcher (re-resolve on breaker trip + periodic);
+        // IP literals are static.
+        let resolver = if config.host.parse::<std::net::IpAddr>().is_ok() {
+            None
+        } else {
+            Some(authority)
+        };
+        let pool = Pool::connect_direct(addrs, handshake, resolver, pool_config).await?;
         let client = Client::from_pool(
             pool,
             label.clone(),
@@ -282,8 +292,19 @@ pub struct HaServer {
     first: Backend,
     second: Option<Backend>,
     double_write: bool,
+    /// Counter-sync mode (Java `setSecond`): for counter commands
+    /// (INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT), instead of replaying the
+    /// increment on `second`, write the **first's result** back with `SET`,
+    /// keeping `second` calibrated to the authoritative value.
+    set_second: bool,
     /// Optional `[min, max]` hash range for id-based routing (`contains`).
     hash_range: Option<(i64, i64)>,
+}
+
+/// Write commands whose result can be written back to the second backend
+/// with a plain `SET` (the Java `setSecond` command set).
+fn is_setsecond_command(name: &str) -> bool {
+    matches!(name, "INCR" | "INCRBY" | "DECR" | "DECRBY" | "INCRBYFLOAT")
 }
 
 impl HaServer {
@@ -293,6 +314,7 @@ impl HaServer {
             first,
             second,
             double_write: false,
+            set_second: false,
             hash_range: None,
         }
     }
@@ -300,6 +322,15 @@ impl HaServer {
     /// Enable double-write to the second backend.
     pub fn with_double_write(mut self, double_write: bool) -> Self {
         self.double_write = double_write;
+        self
+    }
+
+    /// Enable counter-sync mode (Java `setSecond`); implies double-write.
+    pub fn with_set_second(mut self, set_second: bool) -> Self {
+        self.set_second = set_second;
+        if set_second {
+            self.double_write = true;
+        }
         self
     }
 
@@ -327,25 +358,91 @@ impl HaServer {
         self.second.as_ref()
     }
 
-    /// A write, applying the double-write policy.
+    /// A write, applying the Java `JedisHAServer` policy:
+    ///
+    /// 1. `first` alive → execute on it. With double-write, also sync
+    ///    `second` (set-second: `SET key <first's result>` for counter
+    ///    commands; otherwise replay the command). The first's result wins;
+    ///    second's errors are only logged.
+    /// 2. `first` down → with double-write and a live `second`, execute there
+    ///    and return its result.
+    /// 3. Neither → the first's error (or "no backend available").
     async fn write_command(&self, command: &Cmd) -> RedisResult<Value> {
-        if !self.double_write {
-            return self.first.req_command(command).await;
+        let mut first_result = None;
+        if self.first.is_available() {
+            first_result = Some(self.first.req_command(command).await);
         }
-        let Some(second) = &self.second else {
-            return self.first.req_command(command).await;
+
+        let mut second_result = None;
+        let second_live = self.double_write
+            && self
+                .second
+                .as_ref()
+                .is_some_and(Backend::is_available);
+        if second_live {
+            let second = self.second.as_ref().unwrap();
+            let sync = match (&first_result, self.set_second) {
+                (Some(Ok(value)), true) => self.setsecond_command(command, value),
+                _ => None,
+            };
+            let second_call = match &sync {
+                Some(sync_cmd) => second.req_command(sync_cmd).await,
+                None => second.req_command(command).await,
+            };
+            if let Err(err) = &second_call {
+                tracing::warn!(
+                    target: "breeze_redis::backend",
+                    backend = second.label(),
+                    error = %err,
+                    "double-write to second backend failed"
+                );
+            }
+            second_result = Some(second_call);
+        }
+
+        match first_result {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(err)) => match second_result {
+                // first failed but the second applied the write.
+                Some(Ok(value)) => Ok(value),
+                _ => Err(err),
+            },
+            None => match second_result {
+                Some(result) => result,
+                None => Err(RedisError::new(
+                    ErrorKind::NoConnection,
+                    "redis server all dead",
+                )),
+            },
+        }
+    }
+
+    /// Build the `SET key <value>` sync command for set-second mode. Returns
+    /// `None` for non-counter commands or non-scalar replies (the caller then
+    /// replays the original command instead).
+    fn setsecond_command(&self, command: &Cmd, value: &Value) -> Option<Cmd> {
+        if !is_setsecond_command(&command.name()) {
+            return None;
+        }
+        let key = command.args().get(1)?;
+        let mut sync = crate::cmd::cmd("SET");
+        sync.arg_bytes(key);
+        match value {
+            Value::Int(i) => {
+                sync.arg_bytes(i.to_string().as_bytes());
+            }
+            Value::Double(d) => {
+                sync.arg_bytes(ryu::Buffer::new().format(*d).as_bytes());
+            }
+            Value::BulkString(bytes) => {
+                sync.arg_bytes(bytes);
+            }
+            Value::SimpleString(s) => {
+                sync.arg_bytes(s.as_bytes());
+            }
+            _ => return None,
         };
-        let (first_result, second_result) =
-            tokio::join!(self.first.req_command(command), second.req_command(command));
-        if let Err(err) = second_result {
-            tracing::warn!(
-                target: "breeze_redis::backend",
-                backend = second.label(),
-                error = %err,
-                "double-write to second backend failed"
-            );
-        }
-        first_result
+        Some(sync)
     }
 }
 
@@ -580,13 +677,25 @@ mod tests {
     /// A minimal fake Redis: replies `+OK` to AUTH/SELECT/SET, a bulk string
     /// to GET. Records whether it saw the AUTH/SELECT handshake.
     async fn fake_redis() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        fake_redis_with(|_| "+OK".to_string(), |chunk| chunk.contains("GET"), "$1\r\nv\r\n").await
+    }
+
+    /// A fake Redis whose replies are computed per received chunk:
+    /// `classify` picks the special reply, everything else gets `default`.
+    async fn fake_redis_with(
+        _default: impl Fn(&str) -> String + Send + 'static,
+        classify: impl Fn(&str) -> bool + Send + Sync + 'static,
+        special_reply: &'static str,
+    ) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
+        let classify = Arc::new(classify);
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let seen = seen_clone.clone();
+                let classify = classify.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     let mut pending = String::new();
@@ -599,8 +708,8 @@ mod tests {
                         let chunk = std::mem::take(&mut pending);
                         let upper = chunk.to_uppercase();
                         seen.lock().unwrap().push(upper.clone());
-                        if upper.contains("GET") {
-                            let _ = socket.write_all(b"$1\r\nv\r\n").await;
+                        if classify(&upper) {
+                            let _ = socket.write_all(special_reply.as_bytes()).await;
                         } else {
                             let _ = socket.write_all(b"+OK\r\n").await;
                         }
@@ -633,5 +742,79 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::ClientError);
         let v: String = backend.get("k").await.unwrap();
         assert_eq!(v, "v");
+    }
+
+    /// INCR answers `:7`, everything else `+OK`.
+    async fn counter_redis(
+        value: i64,
+    ) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let reply = format!(":{value}\r\n");
+        // Leak to get 'static; tests are short-lived.
+        let reply: &'static str = Box::leak(reply.into_boxed_str());
+        fake_redis_with(|_| "+OK".to_string(), |c| c.contains("INCR"), reply).await
+    }
+
+    #[tokio::test]
+    async fn ha_setsecond_writes_firsts_result_to_second() {
+        let (first_port, _) = counter_redis(7).await;
+        let (second_port, second_seen) = counter_redis(3).await;
+
+        let first = Backend::connect(BackendConfig::new(&format!("127.0.0.1:{first_port}")).unwrap())
+            .await
+            .unwrap();
+        let second =
+            Backend::connect(BackendConfig::new(&format!("127.0.0.1:{second_port}")).unwrap())
+                .await
+                .unwrap();
+
+        // set-second: second is calibrated with SET key <first's result>.
+        let ha = HaServer::new(first.clone(), Some(second.clone())).with_set_second(true);
+        let n: i64 = ha.incr("counter").await.unwrap();
+        assert_eq!(n, 7);
+        let log = second_seen.lock().unwrap().join("|");
+        assert!(log.contains("SET"), "expected SET sync, got: {log}");
+        assert!(log.contains("7"), "expected first's result in SET: {log}");
+        assert!(!log.contains("INCR"), "counter must not be replayed: {log}");
+
+        // plain double-write: the command itself is replayed on second.
+        let (first2_port, _) = counter_redis(9).await;
+        let (second2_port, second2_seen) = counter_redis(4).await;
+        let first2 =
+            Backend::connect(BackendConfig::new(&format!("127.0.0.1:{first2_port}")).unwrap())
+                .await
+                .unwrap();
+        let second2 =
+            Backend::connect(BackendConfig::new(&format!("127.0.0.1:{second2_port}")).unwrap())
+                .await
+                .unwrap();
+        let ha2 = HaServer::new(first2, Some(second2)).with_double_write(true);
+        let n: i64 = ha2.incr("counter").await.unwrap();
+        assert_eq!(n, 9);
+        let log2 = second2_seen.lock().unwrap().join("|");
+        assert!(log2.contains("INCR"), "expected replay on second: {log2}");
+    }
+
+    #[tokio::test]
+    async fn ha_write_falls_back_to_second_when_first_down() {
+        // first points at a closed port; second serves.
+        let (second_port, _) = counter_redis(5).await;
+        let first = Backend::connect(BackendConfig::new("127.0.0.1:1").unwrap())
+            .await;
+        // Connecting to a dead port must fail fast at warm-up.
+        assert!(first.is_err());
+
+        let first = Backend::connect(
+            BackendConfig::new(&format!("127.0.0.1:{second_port}")).unwrap(),
+        )
+        .await
+        .unwrap();
+        first.client().pause(); // simulate a tripped breaker
+        let second =
+            Backend::connect(BackendConfig::new(&format!("127.0.0.1:{second_port}")).unwrap())
+                .await
+                .unwrap();
+        let ha = HaServer::new(first, Some(second)).with_double_write(true);
+        let n: i64 = ha.incr("counter").await.unwrap();
+        assert_eq!(n, 5);
     }
 }

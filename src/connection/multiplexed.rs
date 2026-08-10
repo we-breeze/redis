@@ -61,6 +61,9 @@ struct Pending {
 pub struct MultiplexedConnection {
     tx: mpsc::Sender<Request>,
     alive: Arc<AtomicBool>,
+    /// The remote address this connection is bound to (TCP only). Used by
+    /// the pool's per-IP balancing and DNS-change eviction.
+    addr: Option<std::net::SocketAddr>,
 }
 
 impl MultiplexedConnection {
@@ -81,22 +84,29 @@ impl MultiplexedConnection {
         let (tx, rx) = mpsc::channel::<Request>(max_inflight.max(1));
         let alive = Arc::new(AtomicBool::new(true));
         let max_inflight = max_inflight.max(1);
-        match endpoint {
+        let addr = match endpoint {
             Endpoint::Tcp(addr) => {
                 let stream = tokio::net::TcpStream::connect(addr).await?;
                 stream.set_nodelay(true).ok();
                 tokio::spawn(drive(stream, rx, alive.clone(), max_inflight));
+                Some(*addr)
             }
             Endpoint::Unix(path) => {
                 let stream = tokio::net::UnixStream::connect(path).await?;
                 tokio::spawn(drive(stream, rx, alive.clone(), max_inflight));
+                None
             }
-        }
-        let conn = MultiplexedConnection { tx, alive };
+        };
+        let conn = MultiplexedConnection { tx, alive, addr };
         if let Some(handshake) = handshake {
             conn.run_handshake(handshake).await?;
         }
         Ok(conn)
+    }
+
+    /// The remote address (TCP connections only).
+    pub fn addr(&self) -> Option<std::net::SocketAddr> {
+        self.addr
     }
 
     /// `AUTH`/`SELECT` on a fresh connection; any failure rejects the

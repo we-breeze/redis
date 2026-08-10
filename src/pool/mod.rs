@@ -1,4 +1,4 @@
-//! The connection [`Pool`] for a single mesh endpoint.
+//! The connection [`Pool`] for a single mesh endpoint or a direct backend.
 //!
 //! There is exactly one local mesh server per namespace, so the pool holds a
 //! fixed set of [`MultiplexedConnection`]s to that one endpoint and dispatches
@@ -7,12 +7,24 @@
 //! breaker plus a background maintenance task provide availability: dead
 //! connections are replaced, and if the mesh becomes unreachable the breaker
 //! trips and a probe restores service once it returns.
+//!
+//! For direct backends configured by hostname, the pool additionally plays
+//! the clientBalancer role: the hostname's DNS answer set is kept as
+//! `direct_ips`, new connections are created round-robin across the set
+//! (like `EndpointFactory.getNextIp`), a periodic sweeper evicts connections
+//! from over-represented IPs until per-IP counts differ by at most one
+//! (like `EndpointManagerImpl.watchPool`), and a DNS answer change evicts
+//! connections to offline IPs immediately while fast-tracking connections
+//! onto newly appeared IPs (like `refreshEndpointPool`).
 
 pub mod health;
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::{Duration, Instant};
+
+use rand::seq::SliceRandom;
 
 use crate::cmd::cmd;
 use crate::config::MeshConfig;
@@ -22,9 +34,18 @@ use crate::mesh::{self, Endpoint};
 
 use health::HealthState;
 
-/// A pool of multiplexed connections to one mesh endpoint.
+/// A pool of multiplexed connections to one mesh endpoint, or to the DNS
+/// answer set of one direct backend hostname.
 pub struct Pool {
+    /// The mesh endpoint (mesh path / static direct path). When
+    /// `direct_ips` is non-empty this is only a label for logging; actual
+    /// connection targets come from `direct_ips`.
     endpoint: RwLock<Endpoint>,
+    /// Direct-backend mode: the current DNS answer set (shuffled). New
+    /// connections round-robin over it via `ip_cursor`.
+    direct_ips: RwLock<Vec<SocketAddr>>,
+    /// Round-robin cursor into `direct_ips` for connection creation.
+    ip_cursor: AtomicUsize,
     config: MeshConfig,
     health: HealthState,
     conns: RwLock<Vec<MultiplexedConnection>>,
@@ -34,41 +55,77 @@ pub struct Pool {
     /// Whether the maintenance probe may re-resolve the endpoint from the
     /// sock directory (mesh path only; direct endpoints are static).
     rediscover: bool,
+    /// `host:port` authority for direct backends configured by hostname.
+    /// Re-resolved on breaker trips (the clientBalancer "immediate re-watch
+    /// on min failures" role) and every [`DNS_REFRESH_INTERVAL`] while
+    /// healthy; `None` for mesh pools and IP literals.
+    resolver: Option<String>,
+    /// Last successful DNS re-resolution (healthy-cadence refresh).
+    last_dns_refresh: Mutex<Instant>,
 }
+
+/// How often a healthy direct pool re-resolves its hostname, so DNS changes
+/// (backend migration/failover) are picked up without waiting for failures.
+const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 impl Pool {
     /// Discover the mesh endpoint, warm up the pool, and start maintenance.
     pub async fn connect(config: MeshConfig) -> RedisResult<Arc<Self>> {
         let endpoint = mesh::discover(&config).await?;
-        Self::start(endpoint, None, true, config).await
+        Self::start(endpoint, Vec::new(), None, true, None, config).await
     }
 
-    /// Connect to a static backend endpoint directly (no mesh), performing
-    /// the optional `AUTH`/`SELECT` handshake on every connection.
+    /// Connect to a direct backend (no mesh), performing the optional
+    /// `AUTH`/`SELECT` handshake on every connection.
+    ///
+    /// `addrs` is the current address set (DNS answer, or a single IP
+    /// literal); connections are created round-robin across it. `resolver`
+    /// is the `host:port` authority when the backend was configured by
+    /// hostname: the pool then re-resolves it on breaker trips and every
+    /// [`DNS_REFRESH_INTERVAL`] while healthy, rebalancing and evicting
+    /// offline IPs when the answer changes. Pass `None` for IP literals.
     pub async fn connect_direct(
-        endpoint: Endpoint,
+        addrs: Vec<SocketAddr>,
         handshake: Option<Handshake>,
+        resolver: Option<String>,
         config: MeshConfig,
     ) -> RedisResult<Arc<Self>> {
-        Self::start(endpoint, handshake, false, config).await
+        let mut addrs = addrs;
+        if addrs.is_empty() {
+            return Err(RedisError::from_kind(
+                ErrorKind::NoConnection,
+                "backend address set is empty",
+            ));
+        }
+        // Shuffle like clientBalancer, so sibling processes don't all pick
+        // the same first IP.
+        addrs.shuffle(&mut rand::thread_rng());
+        let endpoint = Endpoint::Tcp(addrs[0]);
+        Self::start(endpoint, addrs, handshake, false, resolver, config).await
     }
 
     async fn start(
         endpoint: Endpoint,
+        direct_ips: Vec<SocketAddr>,
         handshake: Option<Handshake>,
         rediscover: bool,
+        resolver: Option<String>,
         config: MeshConfig,
     ) -> RedisResult<Arc<Self>> {
         let min = config.pool_size.max(1) as u32;
         let max = (config.pool_size as u32 * 4).max(4);
         let pool = Arc::new(Pool {
             endpoint: RwLock::new(endpoint),
+            direct_ips: RwLock::new(direct_ips),
+            ip_cursor: AtomicUsize::new(0),
             config,
             health: HealthState::new(min, max),
             conns: RwLock::new(Vec::new()),
             dispatch: AtomicUsize::new(0),
             handshake,
             rediscover,
+            resolver,
+            last_dns_refresh: Mutex::new(Instant::now()),
         });
         pool.warm_up().await?;
         spawn_maintenance(Arc::downgrade(&pool));
@@ -147,7 +204,7 @@ impl Pool {
     }
 
     async fn create_conn(&self) -> RedisResult<MultiplexedConnection> {
-        let endpoint = self.endpoint();
+        let endpoint = self.next_endpoint();
         let handshake = self.handshake.clone();
         tokio::time::timeout(
             self.config.op_timeout,
@@ -159,6 +216,19 @@ impl Pool {
         )
         .await
         .map_err(|_| RedisError::from_kind(ErrorKind::Timeout, "connection timed out"))?
+    }
+
+    /// Pick the target for a new connection: round-robin over the DNS answer
+    /// set in direct mode (clientBalancer `getNextIp`), the fixed endpoint
+    /// otherwise.
+    fn next_endpoint(&self) -> Endpoint {
+        let ips = self.direct_ips.read().unwrap();
+        if ips.is_empty() {
+            drop(ips);
+            return self.endpoint();
+        }
+        let idx = self.ip_cursor.fetch_add(1, Ordering::Relaxed);
+        Endpoint::Tcp(ips[idx % ips.len()])
     }
 
     fn evict_dead(&self) {
@@ -219,28 +289,174 @@ impl Pool {
     /// re-published the resource on a different endpoint, switch to it and
     /// drop the connections bound to the stale one.
     async fn refresh_endpoint(&self) {
-        if !self.rediscover {
+        if self.rediscover {
+            let Some(new) = mesh::scan_current(&self.config).await else {
+                return;
+            };
+            let changed = {
+                let mut current = self.endpoint.write().unwrap();
+                if *current == new {
+                    false
+                } else {
+                    *current = new.clone();
+                    true
+                }
+            };
+            if changed {
+                self.conns.write().unwrap().clear();
+                tracing::info!(
+                    target: "redis::pool",
+                    endpoint = %new,
+                    "mesh endpoint re-published; switched to new endpoint"
+                );
+            }
+        } else if let Some(authority) = self.resolver.clone() {
+            let addrs: Vec<SocketAddr> = match tokio::net::lookup_host(&authority).await {
+                Ok(iter) => iter.collect(),
+                Err(_) => return, // keep the last good answer on DNS failure
+            };
+            self.apply_dns_answer(addrs);
+        }
+    }
+
+    /// Apply a fresh DNS answer set (clientBalancer `refreshEndpointPool`):
+    ///
+    /// 1. Connections to IPs that left the answer are evicted immediately
+    ///    (idle or not — a dead connection here is replaced lazily on the
+    ///    next borrow, unlike the Java borrow/return pool).
+    /// 2. If all current IPs are still valid but new IPs appeared, one
+    ///    connection per new IP is evicted from the most-loaded old IPs so
+    ///    the round-robin creation fast-tracks connections onto the new IPs.
+    ///
+    /// Returns without changes when the answer is empty (DNS failure) or
+    /// identical to the current set.
+    pub(crate) fn apply_dns_answer(&self, mut addrs: Vec<SocketAddr>) {
+        if addrs.is_empty() {
             return;
         }
-        let Some(new) = mesh::scan_current(&self.config).await else {
-            return;
-        };
-        let changed = {
-            let mut current = self.endpoint.write().unwrap();
-            if *current == new {
-                false
-            } else {
-                *current = new.clone();
-                true
+        addrs.sort();
+        addrs.dedup();
+
+        let (new_ips, offline_ips) = {
+            let mut ips = self.direct_ips.write().unwrap();
+            if *ips == addrs {
+                return;
             }
+            let old = std::mem::replace(&mut *ips, addrs.clone());
+            let new_ips: Vec<SocketAddr> =
+                addrs.iter().filter(|a| !old.contains(a)).copied().collect();
+            let offline_ips: Vec<SocketAddr> =
+                old.iter().filter(|a| !addrs.contains(a)).copied().collect();
+            (new_ips, offline_ips)
         };
-        if changed {
-            self.conns.write().unwrap().clear();
+
+        if !offline_ips.is_empty() {
+            let mut conns = self.conns.write().unwrap();
+            let before = conns.len();
+            conns.retain(|c| match c.addr() {
+                Some(addr) => !offline_ips.contains(&addr),
+                None => true,
+            });
             tracing::info!(
                 target: "redis::pool",
-                endpoint = %new,
-                "mesh endpoint re-published; switched to new endpoint"
+                offline = ?offline_ips,
+                evicted = before - conns.len(),
+                "dns answer changed; evicted connections to offline ips"
             );
+        }
+
+        // Fast-track new IPs into the pool.
+        for _ in &new_ips {
+            self.evict_one_from_most_loaded();
+        }
+        if !new_ips.is_empty() {
+            tracing::info!(
+                target: "redis::pool",
+                new = ?new_ips,
+                "dns answer changed; fast-tracking new ips"
+            );
+        }
+    }
+
+    /// Per-IP connection counts over live connections.
+    fn ip_loads(&self) -> std::collections::HashMap<SocketAddr, usize> {
+        let mut loads = std::collections::HashMap::new();
+        for conn in self.conns.read().unwrap().iter() {
+            if !conn.is_alive() {
+                continue;
+            }
+            if let Some(addr) = conn.addr() {
+                *loads.entry(addr).or_insert(0) += 1;
+            }
+        }
+        loads
+    }
+
+    /// Evict one live connection from the most-loaded IP. Returns whether
+    /// anything was evicted.
+    fn evict_one_from_most_loaded(&self) -> bool {
+        let mut conns = self.conns.write().unwrap();
+        let mut loads: std::collections::HashMap<SocketAddr, usize> =
+            std::collections::HashMap::new();
+        for conn in conns.iter().filter(|c| c.is_alive()) {
+            if let Some(addr) = conn.addr() {
+                *loads.entry(addr).or_insert(0) += 1;
+            }
+        }
+        let Some((&max_addr, _)) = loads.iter().max_by_key(|(_, n)| *n) else {
+            return false;
+        };
+        if let Some(pos) = conns
+            .iter()
+            .position(|c| c.is_alive() && c.addr() == Some(max_addr))
+        {
+            conns.remove(pos);
+            return true;
+        }
+        false
+    }
+
+    /// The clientBalancer `watchPool` balance sweep: while per-IP live
+    /// connection counts differ by more than one, evict one connection from
+    /// the most-loaded IP (round-robin creation lands its replacement on a
+    /// less-loaded IP). Runs on healthy maintenance ticks.
+    fn rebalance_ips(&self) {
+        if self.direct_ips.read().unwrap().len() < 2 {
+            return;
+        }
+        loop {
+            let loads = self.ip_loads();
+            if loads.len() < 2 {
+                return;
+            }
+            let min = loads.values().min().copied().unwrap_or(0);
+            let max = loads.values().max().copied().unwrap_or(0);
+            if max - min <= 1 {
+                return;
+            }
+            if !self.evict_one_from_most_loaded() {
+                return;
+            }
+        }
+    }
+
+    /// The periodic healthy-state DNS refresh (clientBalancer
+    /// `HostAddressWatcher` periodic re-resolution).
+    async fn maybe_refresh_dns(&self) {
+        if self.resolver.is_none() {
+            return;
+        }
+        let due = {
+            let mut last = self.last_dns_refresh.lock().unwrap();
+            if last.elapsed() >= DNS_REFRESH_INTERVAL {
+                *last = Instant::now();
+                true
+            } else {
+                false
+            }
+        };
+        if due {
+            self.refresh_endpoint().await;
         }
     }
 }
@@ -269,6 +485,8 @@ fn spawn_maintenance(weak: Weak<Pool>) {
                 if !pool.health.is_healthy() {
                     pool.probe().await;
                 } else {
+                    pool.maybe_refresh_dns().await;
+                    pool.rebalance_ips();
                     while pool.live_count() < pool.config.pool_size {
                         match pool.create_conn().await {
                             Ok(conn) => pool.conns.write().unwrap().push(conn),
@@ -279,4 +497,96 @@ fn spawn_maintenance(weak: Weak<Pool>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listener that accepts and holds connections, discarding input.
+    async fn fake_listener() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket); // keep the connection open
+            }
+        });
+        addr
+    }
+
+    fn test_config(pool_size: usize) -> MeshConfig {
+        let mut config = MeshConfig::new("test");
+        config.pool_size = pool_size;
+        config
+    }
+
+    #[tokio::test]
+    async fn connections_spread_round_robin_across_ips() {
+        let a = fake_listener().await;
+        let b = fake_listener().await;
+        let pool = Pool::connect_direct(vec![a, b], None, None, test_config(4))
+            .await
+            .unwrap();
+        let loads = pool.ip_loads();
+        assert_eq!(loads.len(), 2, "expected connections on both ips");
+        assert_eq!(
+            loads.values().min(),
+            loads.values().max(),
+            "expected a 2/2 split, got {loads:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_change_evicts_offline_ips_and_admits_new_ones() {
+        let a = fake_listener().await;
+        let b = fake_listener().await;
+        let c = fake_listener().await;
+        let pool = Pool::connect_direct(vec![a, b], None, None, test_config(4))
+            .await
+            .unwrap();
+        assert_eq!(pool.ip_loads().len(), 2);
+
+        // a goes offline, c appears.
+        pool.apply_dns_answer(vec![b, c]);
+
+        let loads = pool.ip_loads();
+        assert!(
+            !loads.contains_key(&a),
+            "offline ip must be evicted: {loads:?}"
+        );
+        // New connections only target the fresh answer set.
+        for _ in 0..4 {
+            let conn = pool.create_conn().await.unwrap();
+            assert!(matches!(conn.addr(), Some(addr) if addr == b || addr == c));
+        }
+    }
+
+    #[tokio::test]
+    async fn rebalance_converges_to_within_one() {
+        let a = fake_listener().await;
+        let pool = Pool::connect_direct(vec![a], None, None, test_config(4))
+            .await
+            .unwrap();
+        assert_eq!(pool.ip_loads()[&a], 4);
+
+        // b joins; one connection is evicted to fast-track it.
+        let b = fake_listener().await;
+        pool.apply_dns_answer(vec![a, b]);
+        let on_a = pool.ip_loads()[&a];
+        assert_eq!(on_a, 3, "one connection evicted for the new ip");
+
+        // Recreate on the new set, then sweep until balanced.
+        for _ in 0..2 {
+            let conn = pool.create_conn().await.unwrap();
+            assert!(matches!(conn.addr(), Some(addr) if addr == a || addr == b));
+            pool.conns.write().unwrap().push(conn);
+        }
+        pool.rebalance_ips();
+        let loads = pool.ip_loads();
+        let min = *loads.values().min().unwrap();
+        let max = *loads.values().max().unwrap();
+        assert!(max - min <= 1, "unbalanced: {loads:?}");
+    }
 }
