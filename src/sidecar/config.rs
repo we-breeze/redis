@@ -3,7 +3,7 @@
 //! The client talks to a single local mesh agent that proxies to the real
 //! Redis backends. Connection is by resource **namespace**: the mesh exposes a
 //! per-namespace endpoint (a unix socket or a `127.0.0.1` port) which we
-//! discover from the sock-file directory (see [`crate::mesh`]).
+//! discover from the sock-file directory (see [`crate::sidecar::discovery`]).
 
 use std::path::PathBuf;
 use std::time::Duration;

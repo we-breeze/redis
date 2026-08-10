@@ -24,7 +24,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::config::{MeshConfig, Transport};
+use super::config::{MeshConfig, Transport};
 use crate::error::{ErrorKind, RedisError, RedisResult};
 
 /// A resolved, connectable mesh endpoint.

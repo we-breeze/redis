@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::connection::{ConnectionLike, RedisFuture};
 use crate::error::{ErrorKind, RedisError, RedisResult};
-use crate::mesh::Endpoint;
+use crate::sidecar::discovery::Endpoint;
 use crate::pipeline::Pipeline;
 use crate::resp::parser::{ParseResult, parse_reply};
 use crate::types::Value;

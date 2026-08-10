@@ -10,7 +10,8 @@
 
 #![cfg(feature = "integration-tests")]
 
-use redis::{Client, Commands, MeshConfig, MeshRouting};
+use redis::sidecar::{Client, MeshConfig, MeshRouting};
+use redis::Commands;
 
 fn namespace() -> Option<String> {
     std::env::var("BREEZE_REDIS_NS")

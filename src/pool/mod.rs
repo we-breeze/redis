@@ -27,10 +27,10 @@ use std::time::{Duration, Instant};
 use rand::seq::SliceRandom;
 
 use crate::cmd::cmd;
-use crate::config::MeshConfig;
+use crate::sidecar::config::MeshConfig;
 use crate::connection::{Handshake, MultiplexedConnection};
 use crate::error::{ErrorKind, RedisError, RedisResult};
-use crate::mesh::{self, Endpoint};
+use crate::sidecar::discovery::{self, Endpoint};
 
 use health::HealthState;
 
@@ -57,7 +57,7 @@ pub struct Pool {
     rediscover: bool,
     /// `host:port` authority for direct backends configured by hostname.
     /// Re-resolved on breaker trips (the clientBalancer "immediate re-watch
-    /// on min failures" role) and every [`DNS_REFRESH_INTERVAL`] while
+    /// on min failures" role) and every `DNS_REFRESH_INTERVAL` while
     /// healthy; `None` for mesh pools and IP literals.
     resolver: Option<String>,
     /// Last successful DNS re-resolution (healthy-cadence refresh).
@@ -71,7 +71,7 @@ const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 impl Pool {
     /// Discover the mesh endpoint, warm up the pool, and start maintenance.
     pub async fn connect(config: MeshConfig) -> RedisResult<Arc<Self>> {
-        let endpoint = mesh::discover(&config).await?;
+        let endpoint = discovery::discover(&config).await?;
         Self::start(endpoint, Vec::new(), None, true, None, config).await
     }
 
@@ -82,7 +82,7 @@ impl Pool {
     /// literal); connections are created round-robin across it. `resolver`
     /// is the `host:port` authority when the backend was configured by
     /// hostname: the pool then re-resolves it on breaker trips and every
-    /// [`DNS_REFRESH_INTERVAL`] while healthy, rebalancing and evicting
+    /// `DNS_REFRESH_INTERVAL` while healthy, rebalancing and evicting
     /// offline IPs when the answer changes. Pass `None` for IP literals.
     pub async fn connect_direct(
         addrs: Vec<SocketAddr>,
@@ -290,7 +290,7 @@ impl Pool {
     /// drop the connections bound to the stale one.
     async fn refresh_endpoint(&self) {
         if self.rediscover {
-            let Some(new) = mesh::scan_current(&self.config).await else {
+            let Some(new) = discovery::scan_current(&self.config).await else {
                 return;
             };
             let changed = {

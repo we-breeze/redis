@@ -13,7 +13,7 @@
 //!   `slave` and fall back to `master`; [`MsServer::at_master`] pins reads to
 //!   the master (read-your-writes / CAS sequences).
 //! - [`Shards`]: client-side shard routing using the same hash/distribution
-//!   algorithms as the breeze mesh ([`crate::sharding`]).
+//!   algorithms as the breeze mesh ([`crate::direct::sharding`]).
 //!
 //! Availability comes from the same circuit breaker and maintenance probe as
 //! the mesh path ([`crate::pool`]). Hostname-configured backends get the
@@ -24,19 +24,21 @@
 //! IPs, clientBalancer load-balances across all of them; this client pins
 //! one and fails over on breaker trip.
 
+pub mod sharding;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::cmd::Cmd;
-use crate::config::MeshConfig;
+use crate::sidecar::config::MeshConfig;
 use crate::connection::{ConnectionLike, Handshake, RedisFuture};
 use crate::error::{ErrorKind, RedisError, RedisResult};
 use crate::pipeline::Pipeline;
 use crate::pool::Pool;
-use crate::sharding::Sharding;
+use crate::direct::sharding::Sharding;
 use crate::types::Value;
-use crate::Client;
+use crate::sidecar::Client;
 
 /// Configuration for one direct backend server, mirroring the Java
 /// `RedisConfig` (`host:port[:db]`, auth, timeout).
@@ -391,7 +393,7 @@ impl HaServer {
             };
             if let Err(err) = &second_call {
                 tracing::warn!(
-                    target: "breeze_redis::backend",
+                    target: "redis::direct",
                     backend = second.label(),
                     error = %err,
                     "double-write to second backend failed"
@@ -571,7 +573,7 @@ impl ConnectionLike for MsServer {
 /// same hash and distribution algorithms as the breeze mesh.
 ///
 /// ```no_run
-/// # use redis::backend::*;
+/// # use redis::direct::*;
 /// # async fn demo() -> redis::RedisResult<()> {
 /// let shards = Shards::new(
 ///     "crc32", "modula",
@@ -607,6 +609,21 @@ impl<T: ConnectionLike> Shards<T> {
     /// The shard responsible for `key`.
     pub fn for_key(&self, key: &[u8]) -> &T {
         &self.shards[self.sharding.shard_idx(key)]
+    }
+
+    /// The shard responsible for a numeric id — the
+    /// `shardingSupport.getClient(uid)` pattern from the Java services. The
+    /// id is hashed in its decimal-string form, exactly like the mesh
+    /// hashes a numeric key.
+    pub fn get_client(&self, id: i64) -> &T {
+        let mut buf = itoa::Buffer::new();
+        self.for_key(buf.format(id).as_bytes())
+    }
+
+    /// The shard responsible for a string id
+    /// (`shardingSupport.getClient(String)`).
+    pub fn get_client_str(&self, id: &str) -> &T {
+        self.for_key(id.as_bytes())
     }
 
     /// The raw hash of `key` (for `contains`-style range checks).

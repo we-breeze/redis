@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use redis::connection::{ConnectionLike, MultiplexedConnection, RedisFuture};
 use redis::error::{ErrorKind, RedisError, RedisResult};
-use redis::mesh::Endpoint;
+use redis::sidecar::Endpoint;
 use redis::types::Value;
 use redis::{Cmd, Pipeline};
 

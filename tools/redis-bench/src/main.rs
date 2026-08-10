@@ -31,7 +31,7 @@ use clap::Parser;
 use direct::DirectClient;
 use driver::{Workload, WorkloadKind};
 use redis::connection::ConnectionLike;
-use redis::{Client, MeshConfig, Transport};
+use redis::sidecar::{Client, MeshConfig, Transport};
 use stats::{MemoryWindow, OpBudget, Summary, WorkerStats};
 
 // Install mimalloc (with per-request heap accounting under the `memory-stats`

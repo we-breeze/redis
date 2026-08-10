@@ -29,7 +29,8 @@ reimplemented in Rust.
 ## Usage
 
 ```rust
-use redis::{Client, Commands, MeshRouting};
+use redis::sidecar::{Client, MeshRouting};
+use redis::Commands;
 
 # async fn demo() -> redis::RedisResult<()> {
 // Connect to the mesh for a resource namespace (defaults to TCP transport).
@@ -50,7 +51,7 @@ let latest: String = client.at_master().get("key").await?;
 Custom configuration (group, transport, pool size, socket dir):
 
 ```rust
-use redis::{Client, MeshConfig, Transport};
+use redis::sidecar::{Client, MeshConfig, Transport};
 
 # async fn demo() -> redis::RedisResult<()> {
 let cfg = MeshConfig::new("my_ns")

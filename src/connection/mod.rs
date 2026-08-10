@@ -25,7 +25,7 @@ pub type RedisFuture<'a, T> = Pin<Box<dyn Future<Output = RedisResult<T>> + Send
 /// Anything that can execute a command or a pipeline.
 ///
 /// Implemented by the raw [`MultiplexedConnection`] as well as higher-level
-/// wrappers ([`crate::Client`]) that add pooling, retries, and stats. Because
+/// wrappers ([`crate::sidecar::Client`]) that add pooling, retries, and stats. Because
 /// implementors use interior mutability (an mpsc sender), methods take `&self`
 /// and callers can share a connection across tasks by cloning.
 pub trait ConnectionLike: Send + Sync {

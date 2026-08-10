@@ -1,4 +1,4 @@
-//! Direct-TCP RESP client (HGET/HMGET only) for replay/comparison topologies
+//! Replay/comparison direct-TCP RESP client (HGET/HMGET only) for replay/comparison topologies
 //! that need a single persistent TCP connection to a recorded Redis endpoint
 //! (e.g. `rs50600:50600`). This is NOT the mesh path; it bypasses the breeze
 //! mesh and speaks RESP directly over a raw `TcpStream`.

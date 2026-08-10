@@ -5,14 +5,14 @@
 //! depending on the error, slow-command logging, and per-command stats. Because
 //! it implements [`ConnectionLike`], the whole
 //! [`Commands`](crate::commands::Commands) surface is available on it directly,
-//! and the mesh routing helpers (see [`crate::routing`]) layer on top.
+//! and the mesh routing helpers (see [`super::routing`]) layer on top.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::cmd::Cmd;
-use crate::config::MeshConfig;
+use super::config::MeshConfig;
 use crate::connection::{ConnectionLike, RedisFuture};
 use crate::error::{RedisError, RedisResult};
 use crate::pipeline::Pipeline;
@@ -66,7 +66,7 @@ impl Client {
     }
 
     /// Wrap an already-connected pool. Used by the direct-backend access
-    /// ([`crate::backend`]), where the pool is built from a static endpoint
+    /// ([`crate::direct`]), where the pool is built from a static endpoint
     /// instead of mesh discovery.
     pub(crate) fn from_pool(
         pool: Arc<Pool>,
@@ -117,12 +117,12 @@ impl Client {
         let ns = &self.inner.namespace;
         if no_available {
             tracing::error!(
-                target: "redis::mesh",
+                target: "redis::sidecar",
                 "redis mesh exception namespace:{ns} ,method:{method} ,key:{key} ,e:{detail}"
             );
         } else {
             tracing::error!(
-                target: "redis::mesh",
+                target: "redis::sidecar",
                 error = %detail,
                 "redis mesh exception namespace:{ns} ,method:{method} ,key:{key} ,e:"
             );
