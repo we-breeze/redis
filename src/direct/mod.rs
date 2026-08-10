@@ -68,6 +68,10 @@ pub struct ServerConfig {
     pub max_try_time: u32,
     /// Retry attempts for write commands (Java `DEFAULT_WRITE_RETRY`).
     pub write_retry: u32,
+    /// Healthy-pool patrol cadence (see [`crate::sidecar::MeshConfig`]).
+    pub healthy_patrol_interval: Duration,
+    /// Breaker-open recovery probe cadence.
+    pub unhealthy_probe_interval: Duration,
 }
 
 impl ServerConfig {
@@ -109,6 +113,8 @@ impl ServerConfig {
             slow_time_threshold: Duration::from_millis(50),
             max_try_time: 2,
             write_retry: 1,
+            healthy_patrol_interval: Duration::from_secs(30),
+            unhealthy_probe_interval: Duration::from_secs(1),
         })
     }
 
@@ -178,6 +184,8 @@ impl DirectClient {
         pool_config.slow_time_threshold = config.slow_time_threshold;
         pool_config.max_try_time = config.max_try_time;
         pool_config.write_retry = config.write_retry;
+        pool_config.healthy_patrol_interval = config.healthy_patrol_interval;
+        pool_config.unhealthy_probe_interval = config.unhealthy_probe_interval;
 
         // Hostnames get a DNS watcher (re-resolve on breaker trip + periodic);
         // IP literals are static.

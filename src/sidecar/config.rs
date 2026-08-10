@@ -54,6 +54,14 @@ pub struct MeshConfig {
     pub max_try_time: u32,
     /// Retry attempts for write commands.
     pub write_retry: u32,
+    /// Maintenance patrol cadence while the pool is healthy (dead-connection
+    /// sweep, DNS refresh gate, min-idle top-up). Default 30s, in the spirit of
+    /// clientBalancer's `poolWatchInterval`.
+    pub healthy_patrol_interval: Duration,
+    /// Recovery probe cadence while the breaker is open. Default 1s,
+    /// matching clientBalancer's `poolHealthyInterval` — keep this small:
+    /// it is the only recovery path while requests fast-fail.
+    pub unhealthy_probe_interval: Duration,
     /// Maximum number of in-flight requests per connection. When the budget
     /// is exhausted new requests fail fast with
     /// [`ErrorKind::Overloaded`](crate::ErrorKind::Overloaded) instead of
@@ -79,6 +87,8 @@ impl MeshConfig {
             max_try_time: 2,
             write_retry: 1,
             max_inflight: 4096,
+            healthy_patrol_interval: Duration::from_secs(30),
+            unhealthy_probe_interval: Duration::from_secs(1),
         }
     }
 
@@ -109,6 +119,18 @@ impl MeshConfig {
     /// Override the per-connection in-flight request budget.
     pub fn with_max_inflight(mut self, max_inflight: usize) -> Self {
         self.max_inflight = max_inflight.max(1);
+        self
+    }
+
+    /// Override the healthy-pool patrol cadence.
+    pub fn with_healthy_patrol_interval(mut self, interval: Duration) -> Self {
+        self.healthy_patrol_interval = interval;
+        self
+    }
+
+    /// Override the unhealthy-pool recovery probe cadence.
+    pub fn with_unhealthy_probe_interval(mut self, interval: Duration) -> Self {
+        self.unhealthy_probe_interval = interval;
         self
     }
 }

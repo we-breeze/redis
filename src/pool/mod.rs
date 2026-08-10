@@ -76,13 +76,6 @@ const MIN_IDLE: usize = 1;
 /// (backend migration/failover) are picked up without waiting for failures.
 const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Maintenance cadence while the pool is healthy (eviction sweep, DNS
-/// refresh, min-idle top-up). An unhealthy pool is probed every second for
-/// fast recovery; a healthy one only needs this slow patrol — which is what
-/// keeps ~1000 namespaces per process cheap.
-const HEALTHY_TICK: Duration = Duration::from_secs(5);
-const UNHEALTHY_TICK: Duration = Duration::from_secs(1);
-
 impl Pool {
     /// Discover the mesh endpoint, warm up the pool, and start maintenance.
     pub async fn connect(config: MeshConfig) -> RedisResult<Arc<Self>> {
@@ -533,10 +526,12 @@ fn spawn_maintenance(weak: Weak<Pool>) {
             let Some(pool) = weak.upgrade() else {
                 return;
             };
+            // Adaptive cadence: slow patrol when healthy, fast probe while
+            // the breaker is open (the only recovery path).
             let tick = if pool.health.is_healthy() {
-                HEALTHY_TICK
+                pool.config.healthy_patrol_interval
             } else {
-                UNHEALTHY_TICK
+                pool.config.unhealthy_probe_interval
             };
             drop(pool);
             tokio::time::sleep(tick).await;
