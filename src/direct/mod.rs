@@ -2,7 +2,7 @@
 //! `JedisPort` / `JedisHAServer` / `JedisMSServer` access strategy on top of
 //! the `clientBalancer` pooling model:
 //!
-//! - [`Backend`] (≈ `JedisPort`): one `host:port[:db]` server. A [`Pool`] with
+//! - [`DirectClient`] (≈ `JedisPort`): one `host:port[:db]` server. A [`Pool`] with
 //!   `AUTH`/`SELECT` handshake, per-command timeout, and read/write split
 //!   retries (reads `max_try_time`, writes `write_retry`, matching the Java
 //!   `callable`/`callUpdate` split). `read_only` backends reject writes.
@@ -38,12 +38,12 @@ use crate::pipeline::Pipeline;
 use crate::pool::Pool;
 use crate::direct::sharding::Sharding;
 use crate::types::Value;
-use crate::sidecar::Client;
+use crate::sidecar::SidecarClient as InnerClient;
 
 /// Configuration for one direct backend server, mirroring the Java
 /// `RedisConfig` (`host:port[:db]`, auth, timeout).
 #[derive(Clone, Debug)]
-pub struct BackendConfig {
+pub struct ServerConfig {
     /// Server host (IP or hostname).
     pub host: String,
     /// Server port.
@@ -70,7 +70,7 @@ pub struct BackendConfig {
     pub write_retry: u32,
 }
 
-impl BackendConfig {
+impl ServerConfig {
     /// Parse `host:port[:db]` (db defaults to 0), like the Java
     /// `RedisConfig.setServerPortDb`.
     pub fn new(server_port_db: &str) -> RedisResult<Self> {
@@ -97,7 +97,7 @@ impl BackendConfig {
         } else {
             0
         };
-        Ok(BackendConfig {
+        Ok(ServerConfig {
             host: parts[0].to_string(),
             port,
             db,
@@ -136,22 +136,22 @@ impl BackendConfig {
     }
 }
 
-struct BackendInner {
-    client: Client,
+struct DirectClientInner {
+    client: InnerClient,
     read_only: AtomicBool,
     label: String,
 }
 
 /// One direct backend server (≈ Java `JedisPort`). Cheap to clone.
 #[derive(Clone)]
-pub struct Backend {
-    inner: Arc<BackendInner>,
+pub struct DirectClient {
+    inner: Arc<DirectClientInner>,
 }
 
-impl Backend {
+impl DirectClient {
     /// Resolve the address, connect the pool (with `AUTH`/`SELECT` handshake
     /// on every connection), and start maintenance.
-    pub async fn connect(config: BackendConfig) -> RedisResult<Self> {
+    pub async fn connect(config: ServerConfig) -> RedisResult<Self> {
         let label = config.label();
         let authority = format!("{}:{}", config.host, config.port);
         let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&authority)
@@ -187,7 +187,7 @@ impl Backend {
             Some(authority)
         };
         let pool = Pool::connect_direct(addrs, handshake, resolver, pool_config).await?;
-        let client = Client::from_pool(
+        let client = InnerClient::from_pool(
             pool,
             label.clone(),
             config.max_try_time.max(1),
@@ -195,8 +195,8 @@ impl Backend {
             config.op_timeout,
             config.slow_time_threshold,
         );
-        Ok(Backend {
-            inner: Arc::new(BackendInner {
+        Ok(DirectClient {
+            inner: Arc::new(DirectClientInner {
                 client,
                 read_only: AtomicBool::new(config.read_only),
                 label,
@@ -224,8 +224,8 @@ impl Backend {
         self.inner.read_only.store(read_only, Ordering::Release);
     }
 
-    /// The underlying client (for stats and operator controls).
-    pub fn client(&self) -> &Client {
+    /// The underlying pooled client (for stats and operator controls).
+    pub fn pooled_client(&self) -> &InnerClient {
         &self.inner.client
     }
 
@@ -240,7 +240,7 @@ impl Backend {
     }
 }
 
-impl ConnectionLike for Backend {
+impl ConnectionLike for DirectClient {
     fn req_command<'a>(&'a self, command: &'a Cmd) -> RedisFuture<'a, Value> {
         Box::pin(async move {
             self.check_writable(command.is_readonly())?;
@@ -264,8 +264,8 @@ impl ConnectionLike for Backend {
 /// Read-fallback helper: run `command` on `primary`, and if it is
 /// unavailable or the attempt fails retriably, run it on `secondary`.
 async fn command_with_fallback(
-    primary: &Backend,
-    secondary: Option<&Backend>,
+    primary: &DirectClient,
+    secondary: Option<&DirectClient>,
     command: &Cmd,
 ) -> RedisResult<Value> {
     let mut last_err = None;
@@ -291,8 +291,8 @@ async fn command_with_fallback(
 /// `double_write`, writes are additionally applied to `second` (the first's
 /// result wins; second's errors are logged, never propagated).
 pub struct HaServer {
-    first: Backend,
-    second: Option<Backend>,
+    first: DirectClient,
+    second: Option<DirectClient>,
     double_write: bool,
     /// Counter-sync mode (Java `setSecond`): for counter commands
     /// (INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT), instead of replaying the
@@ -311,7 +311,7 @@ fn is_setsecond_command(name: &str) -> bool {
 
 impl HaServer {
     /// Build from a first (read-write) backend and an optional fallback.
-    pub fn new(first: Backend, second: Option<Backend>) -> Self {
+    pub fn new(first: DirectClient, second: Option<DirectClient>) -> Self {
         HaServer {
             first,
             second,
@@ -351,12 +351,12 @@ impl HaServer {
     }
 
     /// The first (read-write) backend.
-    pub fn first(&self) -> &Backend {
+    pub fn first(&self) -> &DirectClient {
         &self.first
     }
 
     /// The read-fallback backend, if configured.
-    pub fn second(&self) -> Option<&Backend> {
+    pub fn second(&self) -> Option<&DirectClient> {
         self.second.as_ref()
     }
 
@@ -380,7 +380,7 @@ impl HaServer {
             && self
                 .second
                 .as_ref()
-                .is_some_and(Backend::is_available);
+                .is_some_and(DirectClient::is_available);
         if second_live {
             let second = self.second.as_ref().unwrap();
             let sync = match (&first_result, self.set_second) {
@@ -484,8 +484,8 @@ impl ConnectionLike for HaServer {
 /// [`MsServer::at_master`] for read-your-writes sequences (the Java
 /// `*FromMaster` variants).
 pub struct MsServer {
-    master: Backend,
-    slave: Option<Backend>,
+    master: DirectClient,
+    slave: Option<DirectClient>,
     /// Optional `[min, max]` hash range for id-based routing (`contains`).
     hash_range: Option<(i64, i64)>,
 }
@@ -494,7 +494,7 @@ impl MsServer {
     /// Build from a master (required, read-write) and an optional slave.
     ///
     /// The slave is forced read-only, like the Java `slave.setReadonly(true)`.
-    pub fn new(master: Backend, slave: Option<Backend>) -> Self {
+    pub fn new(master: DirectClient, slave: Option<DirectClient>) -> Self {
         if let Some(slave) = &slave {
             slave.set_read_only(true);
         }
@@ -520,18 +520,18 @@ impl MsServer {
     }
 
     /// The master backend (read-write).
-    pub fn master(&self) -> &Backend {
+    pub fn master(&self) -> &DirectClient {
         &self.master
     }
 
     /// The slave backend, if configured.
-    pub fn slave(&self) -> Option<&Backend> {
+    pub fn slave(&self) -> Option<&DirectClient> {
         self.slave.as_ref()
     }
 
     /// Pin reads to the master (read-your-writes). The returned backend
     /// exposes the full [`crate::Commands`] surface.
-    pub fn at_master(&self) -> &Backend {
+    pub fn at_master(&self) -> &DirectClient {
         &self.master
     }
 }
@@ -579,8 +579,8 @@ impl ConnectionLike for MsServer {
 ///     "crc32", "modula",
 ///     vec!["10.0.0.1:6379:0".to_string(), "10.0.0.2:6379:0".to_string()],
 ///     vec![
-///         Backend::connect(BackendConfig::new("10.0.0.1:6379")?).await?,
-///         Backend::connect(BackendConfig::new("10.0.0.2:6379")?).await?,
+///         DirectClient::connect(ServerConfig::new("10.0.0.1:6379")?).await?,
+///         DirectClient::connect(ServerConfig::new("10.0.0.2:6379")?).await?,
 ///     ],
 /// );
 /// # Ok(()) }
@@ -675,20 +675,20 @@ mod tests {
 
     #[test]
     fn parses_server_port_db() {
-        let cfg = BackendConfig::new("10.0.0.1:6379").unwrap();
+        let cfg = ServerConfig::new("10.0.0.1:6379").unwrap();
         assert_eq!(cfg.host, "10.0.0.1");
         assert_eq!(cfg.port, 6379);
         assert_eq!(cfg.db, 0);
         assert_eq!(cfg.label(), "10.0.0.1:6379:0");
 
-        let cfg = BackendConfig::new("10.0.0.1:6379:3").unwrap();
+        let cfg = ServerConfig::new("10.0.0.1:6379:3").unwrap();
         assert_eq!(cfg.db, 3);
         assert_eq!(cfg.label(), "10.0.0.1:6379:3");
 
-        assert!(BackendConfig::new("no-port").is_err());
-        assert!(BackendConfig::new("host:notaport").is_err());
-        assert!(BackendConfig::new("host:6379:notadb").is_err());
-        assert!(BackendConfig::new("a:1:2:3").is_err());
+        assert!(ServerConfig::new("no-port").is_err());
+        assert!(ServerConfig::new("host:notaport").is_err());
+        assert!(ServerConfig::new("host:6379:notadb").is_err());
+        assert!(ServerConfig::new("a:1:2:3").is_err());
     }
 
     /// A minimal fake Redis: replies `+OK` to AUTH/SELECT/SET, a bulk string
@@ -740,10 +740,10 @@ mod tests {
     #[tokio::test]
     async fn handshake_and_read_only_enforcement() {
         let (port, seen) = fake_redis().await;
-        let cfg = BackendConfig::new(&format!("127.0.0.1:{port}:2"))
+        let cfg = ServerConfig::new(&format!("127.0.0.1:{port}:2"))
             .unwrap()
             .with_auth("secret");
-        let backend = Backend::connect(cfg).await.unwrap();
+        let backend = DirectClient::connect(cfg).await.unwrap();
 
         let v: String = backend.get("k").await.unwrap();
         assert_eq!(v, "v");
@@ -776,11 +776,11 @@ mod tests {
         let (first_port, _) = counter_redis(7).await;
         let (second_port, second_seen) = counter_redis(3).await;
 
-        let first = Backend::connect(BackendConfig::new(&format!("127.0.0.1:{first_port}")).unwrap())
+        let first = DirectClient::connect(ServerConfig::new(&format!("127.0.0.1:{first_port}")).unwrap())
             .await
             .unwrap();
         let second =
-            Backend::connect(BackendConfig::new(&format!("127.0.0.1:{second_port}")).unwrap())
+            DirectClient::connect(ServerConfig::new(&format!("127.0.0.1:{second_port}")).unwrap())
                 .await
                 .unwrap();
 
@@ -797,11 +797,11 @@ mod tests {
         let (first2_port, _) = counter_redis(9).await;
         let (second2_port, second2_seen) = counter_redis(4).await;
         let first2 =
-            Backend::connect(BackendConfig::new(&format!("127.0.0.1:{first2_port}")).unwrap())
+            DirectClient::connect(ServerConfig::new(&format!("127.0.0.1:{first2_port}")).unwrap())
                 .await
                 .unwrap();
         let second2 =
-            Backend::connect(BackendConfig::new(&format!("127.0.0.1:{second2_port}")).unwrap())
+            DirectClient::connect(ServerConfig::new(&format!("127.0.0.1:{second2_port}")).unwrap())
                 .await
                 .unwrap();
         let ha2 = HaServer::new(first2, Some(second2)).with_double_write(true);
@@ -815,19 +815,19 @@ mod tests {
     async fn ha_write_falls_back_to_second_when_first_down() {
         // first points at a closed port; second serves.
         let (second_port, _) = counter_redis(5).await;
-        let first = Backend::connect(BackendConfig::new("127.0.0.1:1").unwrap())
+        let first = DirectClient::connect(ServerConfig::new("127.0.0.1:1").unwrap())
             .await;
         // Connecting to a dead port must fail fast at warm-up.
         assert!(first.is_err());
 
-        let first = Backend::connect(
-            BackendConfig::new(&format!("127.0.0.1:{second_port}")).unwrap(),
+        let first = DirectClient::connect(
+            ServerConfig::new(&format!("127.0.0.1:{second_port}")).unwrap(),
         )
         .await
         .unwrap();
-        first.client().pause(); // simulate a tripped breaker
+        first.pooled_client().pause(); // simulate a tripped breaker
         let second =
-            Backend::connect(BackendConfig::new(&format!("127.0.0.1:{second_port}")).unwrap())
+            DirectClient::connect(ServerConfig::new(&format!("127.0.0.1:{second_port}")).unwrap())
                 .await
                 .unwrap();
         let ha = HaServer::new(first, Some(second)).with_double_write(true);

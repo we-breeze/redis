@@ -1,4 +1,4 @@
-//! The pooled, retrying [`Client`] — the primary entry point.
+//! The pooled, retrying [`SidecarClient`] — the primary entry point.
 //!
 //! Wraps a [`Pool`] of multiplexed connections to the mesh and adds bounded
 //! retries on transient failures, connection invalidation vs. retention
@@ -37,11 +37,11 @@ struct Inner {
 /// A high-availability, pooled mesh Redis client. Cheap to clone (shares one
 /// pool).
 #[derive(Clone)]
-pub struct Client {
+pub struct SidecarClient {
     inner: Arc<Inner>,
 }
 
-impl Client {
+impl SidecarClient {
     /// Connect to the mesh for `namespace` with default settings.
     pub async fn connect(namespace: impl Into<String>) -> RedisResult<Self> {
         Self::from_config(MeshConfig::new(namespace)).await
@@ -76,7 +76,7 @@ impl Client {
         op_timeout: Duration,
         slow_threshold: Duration,
     ) -> Self {
-        Client {
+        SidecarClient {
             inner: Arc::new(Inner {
                 pool,
                 stats: Stats::new(),
@@ -264,7 +264,7 @@ impl Client {
     }
 }
 
-impl ConnectionLike for Client {
+impl ConnectionLike for SidecarClient {
     fn req_command<'a>(&'a self, command: &'a Cmd) -> RedisFuture<'a, Value> {
         Box::pin(async move { self.execute(command).await })
     }

@@ -7,8 +7,8 @@
 //!
 //! Entry points:
 //!
-//! - [`Client`] — the pooled, retrying client
-//!   ([`Client::connect("namespace")`](Client::connect));
+//! - [`SidecarClient`] — the pooled, retrying client
+//!   ([`SidecarClient::connect("namespace")`](SidecarClient::connect));
 //! - [`MeshConfig`] — namespace/group/transport/pool/timeout settings;
 //! - [`MeshRouting`] — `with_hashkey` / `broadcast` / `at_master` routing
 //!   preambles understood by the mesh.
@@ -20,7 +20,7 @@ pub mod config;
 pub mod discovery;
 pub mod routing;
 
-pub use client::Client;
+pub use client::SidecarClient;
 pub use config::{MeshConfig, Transport};
 pub use discovery::Endpoint;
 pub use routing::{MeshRouting, Prefixed};

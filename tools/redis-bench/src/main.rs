@@ -4,7 +4,7 @@
 //! reports throughput plus latency percentiles (p50/p95/p99). It drives the
 //! SDK's real RESP/multiplexing stack:
 //!
-//! - **mesh mode** (default, `--namespace`): through the SDK's [`Client`],
+//! - **mesh mode** (default, `--namespace`): through the SDK's [`SidecarClient`],
 //!   measuring the full pool/multiplexing/routing/HA stack against the breeze
 //!   mesh.
 //! - **direct mode** (`--direct host:port`): through the harness's
@@ -31,7 +31,7 @@ use clap::Parser;
 use direct::DirectClient;
 use driver::{Workload, WorkloadKind};
 use redis::connection::ConnectionLike;
-use redis::sidecar::{Client, MeshConfig, Transport};
+use redis::sidecar::{SidecarClient, MeshConfig, Transport};
 use stats::{MemoryWindow, OpBudget, Summary, WorkerStats};
 
 // Install mimalloc (with per-request heap accounting under the `memory-stats`
@@ -253,7 +253,7 @@ async fn build_client(args: &Args) -> Result<Arc<dyn ConnectionLike>, String> {
     }
     cfg.op_timeout = Duration::from_millis(args.op_timeout_ms);
 
-    let client = Client::from_config(cfg).await.map_err(|e| e.to_string())?;
+    let client = SidecarClient::from_config(cfg).await.map_err(|e| e.to_string())?;
     Ok(Arc::new(client))
 }
 

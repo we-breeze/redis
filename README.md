@@ -29,12 +29,12 @@ reimplemented in Rust.
 ## Usage
 
 ```rust
-use redis::sidecar::{Client, MeshRouting};
+use redis::sidecar::{SidecarClient, MeshRouting};
 use redis::Commands;
 
 # async fn demo() -> redis::RedisResult<()> {
 // Connect to the mesh for a resource namespace (defaults to TCP transport).
-let client = Client::connect("my_redis_namespace").await?;
+let client = SidecarClient::connect("my_redis_namespace").await?;
 
 client.set::<()>("key", "value").await?;
 let v: String = client.get("key").await?;
@@ -51,14 +51,14 @@ let latest: String = client.at_master().get("key").await?;
 Custom configuration (group, transport, pool size, socket dir):
 
 ```rust
-use redis::sidecar::{Client, MeshConfig, Transport};
+use redis::sidecar::{SidecarClient, MeshConfig, Transport};
 
 # async fn demo() -> redis::RedisResult<()> {
 let cfg = MeshConfig::new("my_ns")
     .with_group("prod")
     .with_transport(Transport::Unix)
     .with_pool_size(16);
-let client = Client::from_config(cfg).await?;
+let client = SidecarClient::from_config(cfg).await?;
 # let _ = client;
 # Ok(())
 # }

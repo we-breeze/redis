@@ -3,7 +3,7 @@
 //! Workloads are written against the [`Commands`] trait, which is implemented
 //! for every [`ConnectionLike`]. The harness holds the active connection as a
 //! trait object (`Arc<dyn ConnectionLike>`) so the same workload code drives
-//! both the mesh [`Client`](redis::sidecar::Client) and the harness's direct
+//! both the mesh [`Client`](redis::sidecar::SidecarClient) and the harness's direct
 //! client.
 //!
 //! To keep the per-op allocation count honest (so it reflects the *SDK's*
