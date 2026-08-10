@@ -1,9 +1,10 @@
 //! The Redis command surface, generated from a single declarative list via
 //! [`implement_commands!`](crate::implement_commands).
 //!
-//! The command set mirrors the common subset of the Java `JedisClient`
-//! contract: keys/TTL, strings, hashes, lists, sets, sorted-sets, scanning,
-//! and scripting. Method names are snake-cased Redis verbs.
+//! Currently enabled: `HGET`/`HMGET` plus the auxiliary commands needed to
+//! benchmark and operate them (`PING` health checks, `HSET` seeding, `DEL`
+//! cleanup). The rest of the Java `JedisClient`-mirroring surface is kept
+//! commented out below for easy re-enabling as consumers are validated.
 
 pub mod macros;
 
@@ -11,6 +12,25 @@ crate::implement_commands! {
     // ---- connection / server ----
     /// `PING` — check the connection.
     @ro fn ping() => ["PING"];
+
+    // ---- keys (cleanup helper) ----
+    /// `DEL key [key ...]` — delete keys.
+    fn del(keys) => ["DEL"];
+
+    // ---- hashes ----
+    /// `HGET key field`.
+    @ro fn hget(key, field) => ["HGET"];
+    /// `HMGET key field [field ...]`.
+    @ro fn hmget(key, fields) => ["HMGET"];
+    /// `HSET key field value` — seeding/setup helper.
+    fn hset(key, field, value) => ["HSET"];
+}
+
+// ---- Everything below is disabled for now; re-enable as needed. ----
+// To restore, move entries back into the macro invocation above.
+/*
+crate::implement_commands! {
+    // ---- connection / server ----
     /// `ECHO message` — echo the given string.
     @ro fn echo(message) => ["ECHO"];
     /// `INFO` — server information and statistics.
@@ -18,9 +38,6 @@ crate::implement_commands! {
     /// `SELECT db` — switch the logical database.
     @ro fn select(db) => ["SELECT"];
 
-    // ---- keys / ttl ----
-    /// `DEL key [key ...]` — delete keys.
-    fn del(keys) => ["DEL"];
     /// `UNLINK key [key ...]` — asynchronously delete keys.
     fn unlink(keys) => ["UNLINK"];
     /// `EXISTS key [key ...]` — count of existing keys.
@@ -222,3 +239,4 @@ crate::implement_commands! {
     /// `sendtoall` — broadcast the next command to all shards.
     @ro fn sendtoall() => ["sendtoall"];
 }
+*/

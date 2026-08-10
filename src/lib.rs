@@ -17,10 +17,10 @@
 //!
 //! # async fn demo() -> redis::RedisResult<()> {
 //! let client = SidecarClient::connect("my_redis_namespace").await?;
-//! client.set::<()>("key", "value").await?;
-//! let v: String = client.get("key").await?;
+//! client.hset::<i64>("key", "f", "value").await?;
+//! let v: String = client.hget("key", "f").await?;
 //! assert_eq!(v, "value");
-//! let n: i64 = client.with_hashkey("uid:42").incr("counter:uid:42").await?;
+//! let n: i64 = client.with_hashkey("uid:42").hset("counter:uid:42", "f", 1).await?;
 //! # let _ = n;
 //! # Ok(())
 //! # }
@@ -51,7 +51,7 @@
 //! );
 //! // shardingSupport.getClient(uid) style:
 //! let client = shards.get_client(12345678);
-//! client.set::<()>("u:12345678", "data").await?;
+//! client.hset::<i64>("u:12345678", "f", "data").await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -70,7 +70,7 @@
 //! let sidecar = SidecarClient::connect("my_ns").await?;
 //! let clients: Vec<Client> = vec![sidecar.into(), direct.into()];
 //! for client in &clients {
-//!     let _: Option<String> = client.get("key").await?;
+//!     let _: Option<String> = client.hget("key", "f").await?;
 //! }
 //! # Ok(())
 //! # }

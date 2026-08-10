@@ -36,13 +36,13 @@ use redis::Commands;
 // Connect to the mesh for a resource namespace (defaults to TCP transport).
 let client = SidecarClient::connect("my_redis_namespace").await?;
 
-client.set::<()>("key", "value").await?;
-let v: String = client.get("key").await?;
+client.hset::<i64>("key", "f", "value").await?;
+let v: String = client.hget("key", "f").await?;
 
 // Mesh routing: pin the next command to a shard via the hashkey side-channel,
 // broadcast to all shards, or force the master (read-your-writes).
-let n: i64 = client.with_hashkey("uid:42").incr("counter:uid:42").await?;
-let latest: String = client.at_master().get("key").await?;
+let n: i64 = client.with_hashkey("uid:42").hset("counter:uid:42", "f", 1).await?;
+let latest: String = client.at_master().hget("key", "f").await?;
 # let _ = (v, n, latest);
 # Ok(())
 # }

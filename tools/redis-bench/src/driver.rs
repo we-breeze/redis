@@ -25,20 +25,23 @@ pub type WorkFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 /// The kind of workload to run.
 #[derive(Clone, Copy, Debug)]
 pub enum WorkloadKind {
-    /// One GET per op — pure single-round-trip read (ping/pong).
-    Get,
-    /// One SET per op — pure single-round-trip write (ping/pong).
-    Set,
+    /// One HGET per op — pure single-round-trip read (ping/pong).
+    Hget,
+    /// One HMGET (4 fields) per op — multi-field read.
+    Hmget,
 }
 
 impl WorkloadKind {
     pub fn runner(self, pool: Arc<Pool>) -> Box<dyn Workload> {
         match self {
-            WorkloadKind::Get => Box::new(GetPing { pool }),
-            WorkloadKind::Set => Box::new(SetPing { pool }),
+            WorkloadKind::Hget => Box::new(HgetPing { pool }),
+            WorkloadKind::Hmget => Box::new(HmgetPing { pool }),
         }
     }
 }
+
+/// Hash fields every workload key is seeded with.
+pub const FIELDS: [&str; 4] = ["f1", "f2", "f3", "f4"];
 
 /// One logical operation against a connection.
 pub trait Workload: Send + Sync {
@@ -93,6 +96,7 @@ impl Pool {
         &self.keys[index % self.keys.len()]
     }
 
+    #[allow(dead_code)] // still used by SET-style workloads when re-enabled
     /// Pick a value whose size cycles through `1..=max_value_size`.
     pub fn value(&self, index: usize) -> &[u8] {
         &self.values[index % self.values.len()]
@@ -124,29 +128,28 @@ fn value_bytes(size: usize) -> Vec<u8> {
     buf
 }
 
-struct GetPing {
+struct HgetPing {
     pool: Arc<Pool>,
 }
-impl Workload for GetPing {
+impl Workload for HgetPing {
     fn run<'a>(&'a self, client: &'a dyn ConnectionLike, op: u64) -> WorkFuture<'a> {
         let key = self.pool.key(op as usize);
         Box::pin(async move {
-            let _: Value = match client.get(key).await {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            true
+            let result: redis::RedisResult<Option<Value>> = client.hget(key, FIELDS[0]).await;
+            result.is_ok()
         })
     }
 }
 
-struct SetPing {
+struct HmgetPing {
     pool: Arc<Pool>,
 }
-impl Workload for SetPing {
+impl Workload for HmgetPing {
     fn run<'a>(&'a self, client: &'a dyn ConnectionLike, op: u64) -> WorkFuture<'a> {
         let key = self.pool.key(op as usize);
-        let value = self.pool.value(op as usize);
-        Box::pin(async move { client.set::<()>(key, value).await.is_ok() })
+        Box::pin(async move {
+            let result: redis::RedisResult<Vec<Value>> = client.hmget(key, FIELDS).await;
+            result.is_ok()
+        })
     }
 }

@@ -26,34 +26,37 @@ async fn connect() -> SidecarClient {
 }
 
 #[tokio::test]
-async fn set_get_roundtrip() {
+async fn hset_hget_roundtrip() {
     let Some(_) = namespace() else {
         eprintln!("skipping: BREEZE_REDIS_NS not set");
         return;
     };
     let client = connect().await;
-    client.set::<()>("breeze_redis:it:k", "v").await.unwrap();
-    let v: String = client.get("breeze_redis:it:k").await.unwrap();
+    client
+        .hset::<i64>("breeze_redis:it:k", "f", "v")
+        .await
+        .unwrap();
+    let v: String = client.hget("breeze_redis:it:k", "f").await.unwrap();
     assert_eq!(v, "v");
 }
 
 #[tokio::test]
-async fn hash_and_incr() {
+async fn hmget_roundtrip() {
     let Some(_) = namespace() else {
         eprintln!("skipping: BREEZE_REDIS_NS not set");
         return;
     };
     let client = connect().await;
-    client.del::<i64>("breeze_redis:it:n").await.unwrap();
-    let n: i64 = client.incr("breeze_redis:it:n").await.unwrap();
-    assert_eq!(n, 1);
-
+    client.del::<i64>("breeze_redis:it:h").await.unwrap();
     client
         .hset::<i64>("breeze_redis:it:h", "f", "1")
         .await
         .unwrap();
-    let f: String = client.hget("breeze_redis:it:h", "f").await.unwrap();
-    assert_eq!(f, "1");
+    let vals: Vec<Option<String>> = client
+        .hmget("breeze_redis:it:h", vec!["f", "missing"])
+        .await
+        .unwrap();
+    assert_eq!(vals, vec![Some("1".to_string()), None]);
 }
 
 #[tokio::test]
@@ -64,14 +67,12 @@ async fn pipeline_batches() {
     };
     let client = connect().await;
     let mut pipe = redis::pipe();
-    pipe.set("breeze_redis:it:p1", "a")
-        .set("breeze_redis:it:p2", "b");
+    pipe.hset("breeze_redis:it:p1", "f", "a")
+        .hset("breeze_redis:it:p2", "f", "b");
     let _: Vec<redis::Value> = pipe.query_async(&client).await.unwrap();
-    let vals: Vec<String> = client
-        .mget(vec!["breeze_redis:it:p1", "breeze_redis:it:p2"])
-        .await
-        .unwrap();
-    assert_eq!(vals, vec!["a".to_string(), "b".to_string()]);
+    let a: String = client.hget("breeze_redis:it:p1", "f").await.unwrap();
+    let b: String = client.hget("breeze_redis:it:p2", "f").await.unwrap();
+    assert_eq!((a, b), ("a".to_string(), "b".to_string()));
 }
 
 #[tokio::test]
@@ -84,12 +85,12 @@ async fn hashkey_routing() {
     // Route by an explicit hashkey; the mesh applies it to the next command.
     client
         .with_hashkey("uid:42")
-        .set::<()>("breeze_redis:it:uid:42", "x")
+        .hset::<i64>("breeze_redis:it:uid:42", "f", "x")
         .await
         .unwrap();
     let v: String = client
         .with_hashkey("uid:42")
-        .get("breeze_redis:it:uid:42")
+        .hget("breeze_redis:it:uid:42", "f")
         .await
         .unwrap();
     assert_eq!(v, "x");

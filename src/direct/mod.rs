@@ -753,7 +753,7 @@ mod tests {
             .with_auth("secret");
         let backend = DirectClient::connect(cfg).await.unwrap();
 
-        let v: String = backend.get("k").await.unwrap();
+        let v: String = backend.hget("k", "f").await.unwrap();
         assert_eq!(v, "v");
 
         // The connection ran AUTH + SELECT before serving.
@@ -763,10 +763,20 @@ mod tests {
 
         // Flip to read-only: reads keep working, writes are rejected locally.
         backend.set_read_only(true);
-        let err = backend.set::<()>("k", "v").await.unwrap_err();
+        let mut set = crate::cmd::cmd("SET");
+        set.arg("k").arg("v");
+        let err = backend.req_command(&set).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ClientError);
-        let v: String = backend.get("k").await.unwrap();
+        let v: String = backend.hget("k", "f").await.unwrap();
         assert_eq!(v, "v");
+    }
+
+    /// Raw INCR against an `HaServer` (counter commands are not in the
+    /// trimmed Commands surface, so tests build the command directly).
+    async fn raw_incr<C: ConnectionLike>(conn: &C, key: &str) -> crate::types::Value {
+        let mut incr = crate::cmd::cmd("INCR");
+        incr.arg(key);
+        conn.req_command(&incr).await.unwrap()
     }
 
     /// INCR answers `:7`, everything else `+OK`.
@@ -794,8 +804,7 @@ mod tests {
 
         // set-second: second is calibrated with SET key <first's result>.
         let ha = HaServer::new(first.clone(), Some(second.clone())).with_set_second(true);
-        let n: i64 = ha.incr("counter").await.unwrap();
-        assert_eq!(n, 7);
+        assert_eq!(raw_incr(&ha, "counter").await, crate::types::Value::Int(7));
         let log = second_seen.lock().unwrap().join("|");
         assert!(log.contains("SET"), "expected SET sync, got: {log}");
         assert!(log.contains("7"), "expected first's result in SET: {log}");
@@ -813,8 +822,7 @@ mod tests {
                 .await
                 .unwrap();
         let ha2 = HaServer::new(first2, Some(second2)).with_double_write(true);
-        let n: i64 = ha2.incr("counter").await.unwrap();
-        assert_eq!(n, 9);
+        assert_eq!(raw_incr(&ha2, "counter").await, crate::types::Value::Int(9));
         let log2 = second2_seen.lock().unwrap().join("|");
         assert!(log2.contains("INCR"), "expected replay on second: {log2}");
     }
@@ -839,7 +847,6 @@ mod tests {
                 .await
                 .unwrap();
         let ha = HaServer::new(first, Some(second)).with_double_write(true);
-        let n: i64 = ha.incr("counter").await.unwrap();
-        assert_eq!(n, 5);
+        assert_eq!(raw_incr(&ha, "counter").await, crate::types::Value::Int(5));
     }
 }

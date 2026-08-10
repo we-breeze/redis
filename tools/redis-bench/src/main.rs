@@ -119,23 +119,23 @@ struct Args {
     max_error_rate: f64,
 
     /// Workload to run.
-    #[arg(value_enum, default_value_t = WorkloadKindArg::Get)]
+    #[arg(value_enum, default_value_t = WorkloadKindArg::Hget)]
     workload: WorkloadKindArg,
 }
 /// CLI-facing mirror of [`WorkloadKind`] (clap needs its own ValueEnum here).
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum WorkloadKindArg {
-    /// One GET per op — pure single-round-trip read (ping/pong).
-    Get,
-    /// One SET per op — pure single-round-trip write (ping/pong).
-    Set,
+    /// One HGET per op — pure single-round-trip read (ping/pong).
+    Hget,
+    /// One HMGET (4 fields) per op — multi-field read.
+    Hmget,
 }
 
 impl From<WorkloadKindArg> for WorkloadKind {
     fn from(a: WorkloadKindArg) -> Self {
         match a {
-            WorkloadKindArg::Get => WorkloadKind::Get,
-            WorkloadKindArg::Set => WorkloadKind::Set,
+            WorkloadKindArg::Hget => WorkloadKind::Hget,
+            WorkloadKindArg::Hmget => WorkloadKind::Hmget,
         }
     }
 }
@@ -307,7 +307,6 @@ async fn warmup(
 /// measured phase, so it runs concurrently across the harness pool to keep it
 /// fast for large key counts.
 async fn seed_keys(client: &Arc<dyn ConnectionLike>, pool: &driver::Pool) -> Result<(), String> {
-    use redis::Commands;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Snapshot the keys/values into owned Arcs so spawned tasks are 'static.
@@ -330,8 +329,14 @@ async fn seed_keys(client: &Arc<dyn ConnectionLike>, pool: &driver::Pool) -> Res
                 }
                 let key: &[u8] = &keys[i % keys.len()];
                 let value: &[u8] = &values[i % values.len()];
-                if let Err(e) = client.set::<()>(key, value).await {
-                    eprintln!("seed SET failed at key index {i}: {e}");
+                // One HSET per key, all workload fields at once.
+                let mut cmd = redis::cmd("HSET");
+                cmd.arg(key);
+                for field in driver::FIELDS {
+                    cmd.arg(field).arg(value);
+                }
+                if let Err(e) = cmd.exec_async(&*client).await {
+                    eprintln!("seed HSET failed at key index {i}: {e}");
                     return false;
                 }
             }
@@ -341,7 +346,7 @@ async fn seed_keys(client: &Arc<dyn ConnectionLike>, pool: &driver::Pool) -> Res
     for h in handles {
         match h.await {
             Ok(true) => {}
-            Ok(false) => return Err("a seed SET failed".into()),
+            Ok(false) => return Err("a seed HSET failed".into()),
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -448,7 +453,6 @@ fn report(summary: &Summary, elapsed: Duration, memory: &MemoryWindow) {
 /// replay client is read-only.
 #[cfg(feature = "replay")]
 async fn run_replay(args: Args) -> i32 {
-    use redis::Commands;
     use redis::replay::RedisConnection;
 
     let addr = args.replay.clone().unwrap();
@@ -499,6 +503,7 @@ async fn run_replay(args: Args) -> i32 {
             let keys = keys.clone();
             let next = next.clone();
             seed_handles.push(tokio::spawn(async move {
+                use redis::Commands as _;
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if i >= keys.len() {
