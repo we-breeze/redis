@@ -26,6 +26,16 @@ use crate::pipeline::Pipeline;
 use crate::resp::parser::{ParseResult, parse_reply};
 use crate::types::Value;
 
+/// Optional per-connection handshake for direct backend access (no mesh):
+/// `AUTH` then `SELECT`, sent immediately after the socket opens.
+#[derive(Clone, Debug, Default)]
+pub struct Handshake {
+    /// Redis password, sent as `AUTH <password>`.
+    pub auth: Option<String>,
+    /// Logical database, sent as `SELECT <db>` when `Some`.
+    pub db: Option<i64>,
+}
+
 /// One unit of work handed to the driver: an encoded payload and the number of
 /// replies it expects, plus a channel to deliver them.
 struct Request {
@@ -58,6 +68,16 @@ impl MultiplexedConnection {
     ///
     /// `max_inflight` bounds the request channel; see the struct docs.
     pub async fn connect(endpoint: &Endpoint, max_inflight: usize) -> RedisResult<Self> {
+        Self::connect_with_handshake(endpoint, max_inflight, None).await
+    }
+
+    /// Open a connection and, when `handshake` is given, authenticate and/or
+    /// select the logical database before the connection is handed out.
+    pub async fn connect_with_handshake(
+        endpoint: &Endpoint,
+        max_inflight: usize,
+        handshake: Option<&Handshake>,
+    ) -> RedisResult<Self> {
         let (tx, rx) = mpsc::channel::<Request>(max_inflight.max(1));
         let alive = Arc::new(AtomicBool::new(true));
         let max_inflight = max_inflight.max(1);
@@ -72,7 +92,28 @@ impl MultiplexedConnection {
                 tokio::spawn(drive(stream, rx, alive.clone(), max_inflight));
             }
         }
-        Ok(MultiplexedConnection { tx, alive })
+        let conn = MultiplexedConnection { tx, alive };
+        if let Some(handshake) = handshake {
+            conn.run_handshake(handshake).await?;
+        }
+        Ok(conn)
+    }
+
+    /// `AUTH`/`SELECT` on a fresh connection; any failure rejects the
+    /// connection (the caller drops it and the driver task exits).
+    async fn run_handshake(&self, handshake: &Handshake) -> RedisResult<()> {
+        use crate::connection::ConnectionLike;
+        if let Some(password) = &handshake.auth {
+            let mut auth = crate::cmd::cmd("AUTH");
+            auth.arg(password.as_str());
+            expect_ok(self.req_command(&auth).await?, "AUTH")?;
+        }
+        if let Some(db) = handshake.db {
+            let mut select = crate::cmd::cmd("SELECT");
+            select.arg(db);
+            expect_ok(self.req_command(&select).await?, "SELECT")?;
+        }
+        Ok(())
     }
 
     /// Whether the driver task is still running (socket healthy).
@@ -139,6 +180,18 @@ fn overloaded_error() -> RedisError {
         ErrorKind::Overloaded,
         "connection in-flight budget exhausted",
     )
+}
+
+fn expect_ok(value: Value, what: &'static str) -> RedisResult<()> {
+    match value {
+        Value::Okay => Ok(()),
+        Value::ServerError(err) => Err(err.into()),
+        other => Err(RedisError::with_detail(
+            ErrorKind::ResponseError,
+            "unexpected handshake reply",
+            format!("{what}: {other:?}"),
+        )),
+    }
 }
 
 /// The driver loop: pumps requests to the socket and replies back to waiters.

@@ -11,21 +11,29 @@
 //! ```ignore
 //! /// doc line
 //! fn method_name(arg1, arg2, ...) => ["VERB", "SUBVERB"];
-//! fn method_name(arg1) => ["VERB"] => ["SUFFIX"];   // trailing literals
+//! @ro fn method_name(arg1) => ["VERB"];              // read-only command
+//! fn method_name(arg1) => ["VERB"] => ["SUFFIX"];    // trailing literals
 //! ```
 //!
 //! Every argument is `impl ToRedisArgs`, so scalars, slices, tuples and maps
 //! all work. The first bracketed literals are the fixed command words written
 //! before the arguments; an optional second bracket appends fixed literals
-//! after the arguments (e.g. `WITHSCORES`).
+//! after the arguments (e.g. `WITHSCORES`). `@ro` marks a command read-only:
+//! read-only commands use the client's read retry budget and are allowed on
+//! read-only backends, while all other commands use the write retry budget
+//! and are rejected by read-only backends.
 
 /// See the [module docs](self).
 #[macro_export]
 macro_rules! implement_commands {
+    // Internal: emit the read-only marker when the entry had `@ro`.
+    (@ro_mark $command:ident @ro) => { $command.mark_readonly(); };
+    (@ro_mark $command:ident) => {};
+
     (
         $(
             $(#[doc = $doc:literal])*
-            fn $name:ident ( $($arg:ident),* $(,)? ) => [ $($verb:literal),+ ]
+            $(@$ro:ident)? fn $name:ident ( $($arg:ident),* $(,)? ) => [ $($verb:literal),+ ]
                 $(=> [ $($suffix:literal),+ ])? ;
         )*
     ) => {
@@ -43,6 +51,7 @@ macro_rules! implement_commands {
                     $($arg: impl $crate::to_args::ToRedisArgs),*
                 ) -> $crate::connection::RedisFuture<'a, RV> {
                     let mut command = $crate::cmd::Cmd::new();
+                    $crate::implement_commands!(@ro_mark command $(@$ro)?);
                     $( command.arg($verb); )+
                     $( command.arg($arg); )*
                     $( $( command.arg($suffix); )+ )?
@@ -61,6 +70,7 @@ macro_rules! implement_commands {
                     $($arg: impl $crate::to_args::ToRedisArgs),*
                 ) -> &mut Self {
                     let mut command = $crate::cmd::Cmd::new();
+                    $crate::implement_commands!(@ro_mark command $(@$ro)?);
                     $( command.arg($verb); )+
                     $( command.arg($arg); )*
                     $( $( command.arg($suffix); )+ )?

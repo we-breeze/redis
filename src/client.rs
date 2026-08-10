@@ -29,6 +29,7 @@ struct Inner {
     stats: Stats,
     namespace: String,
     max_try_time: u32,
+    write_retry: u32,
     op_timeout: Duration,
     slow_threshold: Duration,
 }
@@ -49,20 +50,43 @@ impl Client {
     /// Connect using an explicit [`MeshConfig`].
     pub async fn from_config(config: MeshConfig) -> RedisResult<Self> {
         let max_try_time = config.max_try_time.max(1);
+        let write_retry = config.write_retry.max(1);
         let op_timeout = config.op_timeout;
         let slow_threshold = config.slow_time_threshold;
         let namespace = config.namespace.clone();
         let pool = Pool::connect(config).await?;
-        Ok(Client {
+        Ok(Self::from_pool(
+            pool,
+            namespace,
+            max_try_time,
+            write_retry,
+            op_timeout,
+            slow_threshold,
+        ))
+    }
+
+    /// Wrap an already-connected pool. Used by the direct-backend access
+    /// ([`crate::backend`]), where the pool is built from a static endpoint
+    /// instead of mesh discovery.
+    pub(crate) fn from_pool(
+        pool: Arc<Pool>,
+        namespace: String,
+        max_try_time: u32,
+        write_retry: u32,
+        op_timeout: Duration,
+        slow_threshold: Duration,
+    ) -> Self {
+        Client {
             inner: Arc::new(Inner {
                 pool,
                 stats: Stats::new(),
                 namespace,
                 max_try_time,
+                write_retry,
                 op_timeout,
                 slow_threshold,
             }),
-        })
+        }
     }
 
     /// A snapshot of this client's command statistics.
@@ -114,6 +138,15 @@ impl Client {
         let inner = &self.inner;
         let name = command.name();
         let key = command.key();
+        // Read commands use the read budget (max_try_time); everything else
+        // uses the write budget (write_retry), mirroring the Java JedisPort
+        // callable(callUpdate) split. Writes retry less because a retried
+        // non-idempotent write may be applied twice.
+        let max_attempts = if command.is_readonly() {
+            inner.max_try_time
+        } else {
+            inner.write_retry
+        };
         let mut attempt = 0u32;
         loop {
             attempt += 1;
@@ -151,7 +184,7 @@ impl Client {
                         } else {
                             inner.pool.note_failure();
                         }
-                        if attempt >= inner.max_try_time || !err.is_retriable() {
+                        if attempt >= max_attempts || !err.is_retriable() {
                             return Err(err);
                         }
                     }
@@ -160,7 +193,7 @@ impl Client {
                     inner.stats.record_unavailable();
                     self.log_exception(&name, &key, &err.to_string(), false);
                     inner.pool.note_failure();
-                    if attempt >= inner.max_try_time {
+                    if attempt >= max_attempts {
                         return Err(err);
                     }
                 }

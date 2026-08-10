@@ -22,6 +22,13 @@
 //! - **Mesh routing** ([`routing`]) — [`MeshRouting::with_hashkey`],
 //!   [`MeshRouting::broadcast`], and [`MeshRouting::at_master`].
 //!
+//! Direct backend access (bypassing the mesh) lives in [`backend`]:
+//! [`Backend`](backend::Backend) (one `host:port[:db]` server with
+//! `AUTH`/`SELECT`), [`HaServer`](backend::HaServer) (read fallback +
+//! double-write), [`MsServer`](backend::MsServer) (master/slave read
+//! splitting), and [`Shards`](backend::Shards) for client-side shard routing
+//! with the same hash/distribution algorithms as the mesh ([`sharding`]).
+//!
 //! ```no_run
 //! use redis::{Client, Commands, MeshRouting};
 //!
@@ -40,6 +47,7 @@
 //! ```
 
 pub mod client;
+pub mod backend;
 pub mod cmd;
 pub mod commands;
 pub mod config;
@@ -52,6 +60,7 @@ pub mod pool;
 pub mod resp;
 pub mod routing;
 pub mod script;
+pub mod sharding;
 pub mod stats;
 pub mod to_args;
 pub mod types;
@@ -60,10 +69,11 @@ pub mod types;
 pub mod direct;
 
 pub use client::Client;
+pub use backend::{Backend, BackendConfig, HaServer, MsServer, Shards};
 pub use cmd::{Cmd, cmd, pipe};
 pub use commands::Commands;
 pub use config::{MeshConfig, Transport};
-pub use connection::MultiplexedConnection;
+pub use connection::{Handshake, MultiplexedConnection};
 pub use error::{ErrorKind, RedisError, RedisResult};
 pub use from_value::FromRedisValue;
 pub use mesh::Endpoint;

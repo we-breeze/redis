@@ -12,6 +12,9 @@ use crate::to_args::ToRedisArgs;
 #[derive(Clone, Debug, Default)]
 pub struct Cmd {
     args: Vec<Vec<u8>>,
+    /// Whether this command is read-only. Read-only commands use the read
+    /// retry budget and are permitted on read-only backends.
+    readonly: bool,
 }
 
 /// Start building a command, e.g. `cmd("GET").arg("key")`.
@@ -29,7 +32,21 @@ pub fn pipe() -> Pipeline {
 impl Cmd {
     /// An empty command with no name yet.
     pub fn new() -> Self {
-        Cmd { args: Vec::new() }
+        Cmd {
+            args: Vec::new(),
+            readonly: false,
+        }
+    }
+
+    /// Mark this command as read-only (set by the `Commands` macro from the
+    /// command list's `@ro` annotation).
+    pub fn mark_readonly(&mut self) {
+        self.readonly = true;
+    }
+
+    /// Whether this command is read-only.
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
     }
 
     /// Append one logical argument (which may expand to several RESP args).

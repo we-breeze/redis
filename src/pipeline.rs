@@ -81,6 +81,12 @@ impl Pipeline {
         self.transaction_mode
     }
 
+    /// Whether every queued command is read-only. Read-only pipelines may run
+    /// on read-only backends and read replicas.
+    pub fn is_readonly(&self) -> bool {
+        !self.transaction_mode && self.commands.iter().all(Cmd::is_readonly)
+    }
+
     /// Total number of commands actually written to the wire, including the
     /// `MULTI` and `EXEC` framing commands when atomic. Used by the connection
     /// to know how many replies to await.

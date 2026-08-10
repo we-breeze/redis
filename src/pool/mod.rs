@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::cmd::cmd;
 use crate::config::MeshConfig;
-use crate::connection::MultiplexedConnection;
+use crate::connection::{Handshake, MultiplexedConnection};
 use crate::error::{ErrorKind, RedisError, RedisResult};
 use crate::mesh::{self, Endpoint};
 
@@ -29,12 +29,36 @@ pub struct Pool {
     health: HealthState,
     conns: RwLock<Vec<MultiplexedConnection>>,
     dispatch: AtomicUsize,
+    /// AUTH/SELECT for direct backend connections; `None` on the mesh path.
+    handshake: Option<Handshake>,
+    /// Whether the maintenance probe may re-resolve the endpoint from the
+    /// sock directory (mesh path only; direct endpoints are static).
+    rediscover: bool,
 }
 
 impl Pool {
     /// Discover the mesh endpoint, warm up the pool, and start maintenance.
     pub async fn connect(config: MeshConfig) -> RedisResult<Arc<Self>> {
         let endpoint = mesh::discover(&config).await?;
+        Self::start(endpoint, None, true, config).await
+    }
+
+    /// Connect to a static backend endpoint directly (no mesh), performing
+    /// the optional `AUTH`/`SELECT` handshake on every connection.
+    pub async fn connect_direct(
+        endpoint: Endpoint,
+        handshake: Option<Handshake>,
+        config: MeshConfig,
+    ) -> RedisResult<Arc<Self>> {
+        Self::start(endpoint, handshake, false, config).await
+    }
+
+    async fn start(
+        endpoint: Endpoint,
+        handshake: Option<Handshake>,
+        rediscover: bool,
+        config: MeshConfig,
+    ) -> RedisResult<Arc<Self>> {
         let min = config.pool_size.max(1) as u32;
         let max = (config.pool_size as u32 * 4).max(4);
         let pool = Arc::new(Pool {
@@ -43,6 +67,8 @@ impl Pool {
             health: HealthState::new(min, max),
             conns: RwLock::new(Vec::new()),
             dispatch: AtomicUsize::new(0),
+            handshake,
+            rediscover,
         });
         pool.warm_up().await?;
         spawn_maintenance(Arc::downgrade(&pool));
@@ -122,9 +148,14 @@ impl Pool {
 
     async fn create_conn(&self) -> RedisResult<MultiplexedConnection> {
         let endpoint = self.endpoint();
+        let handshake = self.handshake.clone();
         tokio::time::timeout(
             self.config.op_timeout,
-            MultiplexedConnection::connect(&endpoint, self.config.max_inflight),
+            MultiplexedConnection::connect_with_handshake(
+                &endpoint,
+                self.config.max_inflight,
+                handshake.as_ref(),
+            ),
         )
         .await
         .map_err(|_| RedisError::from_kind(ErrorKind::Timeout, "connection timed out"))?
@@ -188,6 +219,9 @@ impl Pool {
     /// re-published the resource on a different endpoint, switch to it and
     /// drop the connections bound to the stale one.
     async fn refresh_endpoint(&self) {
+        if !self.rediscover {
+            return;
+        }
         let Some(new) = mesh::scan_current(&self.config).await else {
             return;
         };
