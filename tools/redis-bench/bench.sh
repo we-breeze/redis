@@ -1,31 +1,41 @@
 #!/usr/bin/env bash
 #
 # One-shot load test: start a throwaway redis-server container, run redis-bench
-# against it in direct mode, then stop the container — on success, failure, or
-# Ctrl-C.
+# against it, then stop the container — on success, failure, or Ctrl-C.
 #
 # Forward any redis-bench flags; they pass through verbatim, e.g.:
 #   ./bench.sh --concurrency 64 --ops 100000
 #   ./bench.sh -c 128 -d 60
+#   MODE=sidecar ./bench.sh --ops 100000 get           # through a fake mesh sock file
 #   ./bench.sh --replay 127.0.0.1:16379 --ops 100000   # replay client (HGET)
 #
 # Optional env vars:
+#   MODE    direct | sidecar                (default: direct)
 #   IMAGE   redis image to run            (default: the example redis:7 image)
 #   PORT    host port the server binds to (default: 16379, host networking)
 #   CARGO   cargo binary                  (default: cargo)
+#
+# MODE=sidecar emulates the mesh by publishing a sock config file pointing at
+# the container, so the SDK takes the full sidecar path (discovery, pool,
+# breaker). Namespace/group are fixed bench values; NAMESPACE/GROUP overridable.
 #
 # Uses host networking (Linux). First run compiles redis-bench in release mode
 # (a few seconds); later runs reuse the cached build.
 
 set -euo pipefail
 
+MODE="${MODE:-direct}"
 IMAGE="${IMAGE:-redis:7}"
 PORT="${PORT:-16379}"
+NAMESPACE="${NAMESPACE:-bench_ns}"
+GROUP="${GROUP:-bench}"
 CARGO="${CARGO:-cargo}"
 NAME="redis-bench-$$"
+SOCK_DIR="$(mktemp -d)"
 
 cleanup() {
   docker stop "$NAME" >/dev/null 2>&1 || true
+  rm -rf "$SOCK_DIR"
 }
 trap cleanup EXIT INT TERM
 
@@ -52,5 +62,24 @@ fi
 echo " ready"
 echo
 
-"$CARGO" run --release -p redis-bench -- \
-  --direct "127.0.0.1:$PORT" "$@"
+case "$MODE" in
+  direct)
+    "$CARGO" run --release -p redis-bench -- \
+      --direct "127.0.0.1:$PORT" "$@"
+    ;;
+  sidecar)
+    # Publish a sock config file exactly like the mesh agent would:
+    #   <service path with + separators>@redis:<port>@rs
+    # ending in +<group>+<namespace>.
+    sock="$SOCK_DIR/static.config.api.example.com+3+config+cloud+redis+${GROUP}+${NAMESPACE}@redis:${PORT}@rs"
+    touch "$sock"
+    echo "sidecar mode: published sock file $(basename "$sock")"
+    echo
+    "$CARGO" run --release -p redis-bench -- \
+      --namespace "$NAMESPACE" --group "$GROUP" --socket-dir "$SOCK_DIR" "$@"
+    ;;
+  *)
+    echo "error: unknown MODE '$MODE' (direct | sidecar)" >&2
+    exit 2
+    ;;
+esac
