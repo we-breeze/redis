@@ -73,6 +73,11 @@ pub struct MultiplexedConnection {
     /// "the connection is dead" (silent), so a single slow request doesn't
     /// get the whole connection poisoned.
     last_reply_ms: Arc<AtomicU64>,
+    /// Set when this connection's death has been reported to the pool's
+    /// breaker. A stalled connection fails its whole in-flight batch at the
+    /// same timeout deadline; only the first failure should tick the
+    /// consecutive-failure counter, or one stall looks like N failures.
+    fail_noted: Arc<AtomicBool>,
 }
 
 fn now_millis() -> u64 {
@@ -132,6 +137,7 @@ impl MultiplexedConnection {
             addr,
             inflight: Arc::new(AtomicUsize::new(0)),
             last_reply_ms,
+            fail_noted: Arc::new(AtomicBool::new(false)),
         };
         if let Some(handshake) = handshake {
             conn.run_handshake(handshake).await?;
@@ -152,6 +158,12 @@ impl MultiplexedConnection {
     /// Identity check (all clones of one connection share `alive`).
     pub fn same(&self, other: &MultiplexedConnection) -> bool {
         Arc::ptr_eq(&self.alive, &other.alive)
+    }
+
+    /// Marks this connection's failure as reported to the breaker; returns
+    /// true for the first caller only.
+    pub fn note_fail_once(&self) -> bool {
+        !self.fail_noted.swap(true, Ordering::AcqRel)
     }
 
     /// Whether a reply arrived on this connection within `window`. Used on
@@ -219,14 +231,31 @@ impl MultiplexedConnection {
         self.inflight.fetch_sub(1, Ordering::AcqRel);
         result?
     }
+
+    /// Send one command and await its reply. Inherent (unboxed) sibling of
+    /// the [`ConnectionLike`] method — hot paths should prefer this to skip
+    /// one future-boxing allocation per call.
+    pub async fn request(&self, command: &crate::cmd::Cmd) -> RedisResult<Value> {
+        let mut replies = self.send(command.encoded(), 1).await?;
+        Ok(replies.pop().unwrap_or(Value::Nil))
+    }
+
+    /// Unboxed sibling of [`ConnectionLike::req_pipeline`].
+    pub async fn request_pipeline(
+        &self,
+        pipeline: &Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisResult<Vec<Value>> {
+        let total = pipeline.command_count();
+        let replies = self.send(pipeline.encoded(), total).await?;
+        Ok(replies.into_iter().skip(offset).take(count).collect())
+    }
 }
 
 impl ConnectionLike for MultiplexedConnection {
     fn req_command<'a>(&'a self, command: &'a crate::cmd::Cmd) -> RedisFuture<'a, Value> {
-        Box::pin(async move {
-            let mut replies = self.send(command.encoded(), 1).await?;
-            Ok(replies.pop().unwrap_or(Value::Nil))
-        })
+        Box::pin(async move { self.request(command).await })
     }
 
     fn req_pipeline<'a>(
@@ -235,11 +264,7 @@ impl ConnectionLike for MultiplexedConnection {
         offset: usize,
         count: usize,
     ) -> RedisFuture<'a, Vec<Value>> {
-        Box::pin(async move {
-            let total = pipeline.command_count();
-            let replies = self.send(pipeline.encoded(), total).await?;
-            Ok(replies.into_iter().skip(offset).take(count).collect())
-        })
+        Box::pin(async move { self.request_pipeline(pipeline, offset, count).await })
     }
 }
 

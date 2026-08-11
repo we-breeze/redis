@@ -134,9 +134,9 @@ mod tests {
         let script = Script::new("return KEYS[1]");
         let inv = script.key("k").arg("a");
         let cmd = inv.build("EVALSHA", script.hash());
-        assert_eq!(cmd.args()[0], b"EVALSHA");
-        assert_eq!(cmd.args()[2], b"1"); // numkeys
-        assert_eq!(cmd.args()[3], b"k");
-        assert_eq!(cmd.args()[4], b"a");
+        assert_eq!(cmd.arg_at(0).unwrap(), b"EVALSHA");
+        assert_eq!(cmd.arg_at(2).unwrap(), b"1"); // numkeys
+        assert_eq!(cmd.arg_at(3).unwrap(), b"k");
+        assert_eq!(cmd.arg_at(4).unwrap(), b"a");
     }
 }

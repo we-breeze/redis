@@ -100,11 +100,21 @@ pub async fn start_proxy(
         .map_err(|e| format!("fault proxy bind failed: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
     tokio::spawn(async move {
-        while let Ok((inbound, _)) = listener.accept().await {
-            let injector = injector.clone();
-            tokio::spawn(async move {
-                forward(inbound, target, injector).await;
-            });
+        loop {
+            match listener.accept().await {
+                Ok((inbound, _)) => {
+                    let injector = injector.clone();
+                    tokio::spawn(async move {
+                        forward(inbound, target, injector).await;
+                    });
+                }
+                Err(err) => {
+                    // Transient accept errors (e.g. fd pressure) must not
+                    // kill the proxy permanently.
+                    eprintln!("fault proxy: accept error: {err}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
         }
     });
     Ok(local)
@@ -223,6 +233,35 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
+    }
+
+    /// The listener must survive connection churn (open/close storms as
+    /// pools evict and reconnect). Requires REDIS_BENCH_PROXY_TEST_ADDR.
+    #[tokio::test]
+    async fn proxy_survives_connection_churn() {
+        let Ok(target) = std::env::var("REDIS_BENCH_PROXY_TEST_ADDR") else {
+            eprintln!("skip: REDIS_BENCH_PROXY_TEST_ADDR not set");
+            return;
+        };
+        let injector = Arc::new(FaultInjector::new(0.001, 5, 0.001, 50).unwrap());
+        let proxy = start_proxy(target.parse().unwrap(), injector).await.unwrap();
+
+        // Churn: open, send one command, close — 500 times.
+        for _ in 0..500 {
+            let mut s = TcpStream::connect(proxy).await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            s.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
+            let mut buf = [0u8; 64];
+            let _ = s.read(&mut buf).await;
+            drop(s);
+        }
+        // The proxy must still accept and forward.
+        let mut s = TcpStream::connect(proxy).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        s.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = s.read(&mut buf).await.unwrap();
+        assert!(n > 0, "proxy must still forward after churn");
     }
 
     #[test]

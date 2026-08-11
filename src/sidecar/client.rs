@@ -168,7 +168,7 @@ impl SidecarClient {
                 None => inner.pool.get().await,
             };
             match borrow {
-                Ok(conn) => match self.with_timeout(conn.req_command(command)).await {
+                Ok(conn) => match self.with_timeout(conn.request(command)).await {
                     Ok(value) => {
                         // A reply arrived — even an inline server error means the
                         // socket is healthy, so the pool is credited.
@@ -200,7 +200,11 @@ impl SidecarClient {
                             // genuinely suspect: poison it.
                             if !conn.responsive_within(inner.op_timeout) {
                                 conn.poison();
-                                inner.pool.note_failure();
+                                // One stall fails the whole in-flight batch
+                                // at the same deadline; count it once.
+                                if conn.note_fail_once() {
+                                    inner.pool.note_failure();
+                                }
                             }
                         } else if err.connection_still_valid() {
                             // A response-level error keeps the connection; an
@@ -208,7 +212,11 @@ impl SidecarClient {
                             // exception").
                             inner.pool.note_success();
                         } else {
-                            inner.pool.note_failure();
+                            // Ditto: a dead connection's queued waiters all
+                            // report I/O errors; count the incident once.
+                            if conn.note_fail_once() {
+                                inner.pool.note_failure();
+                            }
                         }
                         if attempt >= max_attempts || !err.is_retriable() {
                             return Err(err);
@@ -218,7 +226,12 @@ impl SidecarClient {
                 Err(err) => {
                     inner.stats.record_unavailable();
                     self.log_exception(&name, &key, &err.to_string(), false);
-                    inner.pool.note_failure();
+                    // Only count borrow failures while the pool believes it
+                    // is healthy; fast-fails on an open breaker did not
+                    // attempt anything and must not re-trip it.
+                    if inner.pool.can_serve() {
+                        inner.pool.note_failure();
+                    }
                     if attempt >= max_attempts {
                         return Err(err);
                     }
@@ -242,12 +255,14 @@ impl SidecarClient {
             Err(err) => {
                 inner.stats.record_unavailable();
                 self.log_exception("pipeline", "", &err.to_string(), false);
-                inner.pool.note_failure();
+                if inner.pool.can_serve() {
+                    inner.pool.note_failure();
+                }
                 return Err(err);
             }
         };
         match self
-            .with_timeout(conn.req_pipeline(pipeline, offset, count))
+            .with_timeout(conn.request_pipeline(pipeline, offset, count))
             .await
         {
             Ok(values) => {
@@ -268,12 +283,16 @@ impl SidecarClient {
                     // not poison it nor tick the breaker.
                     if !conn.responsive_within(inner.op_timeout) {
                         conn.poison();
-                        inner.pool.note_failure();
+                        if conn.note_fail_once() {
+                            inner.pool.note_failure();
+                        }
                     }
                 } else if err.connection_still_valid() {
                     inner.pool.note_success();
                 } else {
-                    inner.pool.note_failure();
+                    if conn.note_fail_once() {
+                        inner.pool.note_failure();
+                    }
                 }
                 Err(err)
             }

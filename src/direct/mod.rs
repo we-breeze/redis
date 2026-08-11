@@ -443,7 +443,7 @@ impl HaServer {
         if !is_setsecond_command(&command.name()) {
             return None;
         }
-        let key = command.args().get(1)?;
+        let key = command.arg_at(1)?;
         let mut sync = crate::cmd::cmd("SET");
         sync.arg_bytes(key);
         match value {
@@ -661,8 +661,7 @@ impl<T: ConnectionLike> ConnectionLike for Shards<T> {
     fn req_command<'a>(&'a self, command: &'a Cmd) -> RedisFuture<'a, Value> {
         Box::pin(async move {
             let key = command
-                .args()
-                .get(1)
+                .arg_at(1)
                 .ok_or_else(|| RedisError::new(ErrorKind::ClientError, "command has no key"))?;
             self.for_key(key).req_command(command).await
         })

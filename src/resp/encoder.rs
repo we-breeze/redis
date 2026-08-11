@@ -13,6 +13,19 @@ pub fn encode_command(args: &[Vec<u8>], out: &mut Vec<u8>) {
     }
 }
 
+/// Slice-based variant of [`encode_command`]: avoids materializing per-arg
+/// vectors (used by the flat-buffer [`Cmd`](crate::cmd::Cmd)).
+pub fn encode_command_slices<'a>(
+    args: impl Iterator<Item = &'a [u8]>,
+    count: usize,
+    out: &mut Vec<u8>,
+) {
+    write_array_header(count, out);
+    for arg in args {
+        write_bulk_string(arg, out);
+    }
+}
+
 /// Encode a pipeline of commands back-to-back into a single buffer.
 pub fn encode_pipeline(commands: &[Vec<Vec<u8>>], out: &mut Vec<u8>) {
     for args in commands {

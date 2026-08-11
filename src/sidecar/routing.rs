@@ -139,7 +139,7 @@ mod tests {
                 // Assert the preamble+command pairing on the wire.
                 let cmds = pipeline.commands();
                 assert_eq!(cmds[0].name(), HASHKEYQ);
-                assert_eq!(cmds[0].args()[1], b"uid:1");
+                assert_eq!(cmds[0].arg_at(1).unwrap(), b"uid:1");
                 assert_eq!(cmds[1].name(), "GET");
                 Box::pin(async { Ok(vec![Value::Okay, Value::BulkString(b"v".to_vec())]) })
             }

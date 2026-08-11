@@ -523,8 +523,24 @@ async fn seed_keys(client: &Arc<dyn ConnectionLike>, pool: &driver::Pool) -> Res
                 for field in driver::FIELDS {
                     cmd.arg(field).arg(value);
                 }
-                if let Err(e) = cmd.exec_async(&*client).await {
-                    eprintln!("seed HSET failed at key index {i}: {e}");
+                // Tolerate transient faults (fault injection may hang a
+                // connection; writes don't auto-retry by design).
+                let mut ok = false;
+                for attempt in 0..5 {
+                    match cmd.exec_async(&*client).await {
+                        Ok(()) => {
+                            ok = true;
+                            break;
+                        }
+                        Err(e) if attempt == 4 => {
+                            eprintln!("seed HSET failed at key index {i}: {e}");
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+                if !ok {
                     return false;
                 }
             }
@@ -696,7 +712,15 @@ async fn run_replay(args: Args, injector: Option<Arc<FaultInjector>>) -> i32 {
                     if i >= keys.len() {
                         return true;
                     }
-                    if seeder.hset::<i64>(&keys[i], FIELD, i as i64).await.is_err() {
+                    let mut ok = false;
+                    for _ in 0..5 {
+                        if seeder.hset::<i64>(&keys[i], FIELD, i as i64).await.is_ok() {
+                            ok = true;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    if !ok {
                         return false;
                     }
                 }
