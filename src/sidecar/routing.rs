@@ -121,6 +121,7 @@ impl<T: ConnectionLike + ?Sized> MeshRouting for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn hashkey_preamble_is_built() {
@@ -141,7 +142,7 @@ mod tests {
                 assert_eq!(cmds[0].name(), HASHKEYQ);
                 assert_eq!(cmds[0].arg_at(1).unwrap(), b"uid:1");
                 assert_eq!(cmds[1].name(), "GET");
-                Box::pin(async { Ok(vec![Value::Okay, Value::BulkString(b"v".to_vec())]) })
+                Box::pin(async { Ok(vec![Value::Okay, Value::BulkString(Bytes::from_static(b"v"))]) })
             }
         }
 
@@ -153,6 +154,6 @@ mod tests {
         get.arg("k");
         let routed = stub.with_hashkey("uid:1");
         let value = rt.block_on(routed.req_command(&get)).unwrap();
-        assert_eq!(value, Value::BulkString(b"v".to_vec()));
+        assert_eq!(value, Value::BulkString(Bytes::from_static(b"v")));
     }
 }

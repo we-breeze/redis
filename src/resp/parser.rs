@@ -1,9 +1,12 @@
 //! Incremental RESP2/RESP3 reply parser.
 //!
-//! Hand-rolled (no `combine` dependency) so it can be driven directly off a
-//! connection's read buffer: [`parse_reply`] returns [`ParseResult::Incomplete`]
-//! when more bytes are needed, and otherwise reports exactly how many bytes the
-//! reply consumed so the caller can advance its buffer.
+//! Hand-rolled so it can be driven directly off a connection's read buffer:
+//! [`parse_reply`] returns [`ParseResult::Incomplete`] when more bytes are
+//! needed, and otherwise reports exactly how many bytes the reply consumed
+//! so the caller can advance its buffer. Bulk strings are zero-copy
+//! [`Bytes`] slices of the input.
+
+use bytes::Bytes;
 
 use crate::error::{ErrorKind, RedisError, ServerError};
 use crate::types::Value;
@@ -29,7 +32,7 @@ const MAX_DEPTH: usize = 128;
 ///
 /// Returns [`ParseResult::Incomplete`] if the buffer is a prefix of a valid
 /// reply. Returns `Err` for a protocol violation or a server error reply.
-pub fn parse_reply(buf: &[u8]) -> Result<ParseResult, RedisError> {
+pub fn parse_reply(buf: &Bytes) -> Result<ParseResult, RedisError> {
     let mut parser = Parser { buf, pos: 0 };
     match parser.parse_value(0)? {
         Some(value) => Ok(ParseResult::Complete {
@@ -41,7 +44,7 @@ pub fn parse_reply(buf: &[u8]) -> Result<ParseResult, RedisError> {
 }
 
 struct Parser<'a> {
-    buf: &'a [u8],
+    buf: &'a Bytes,
     pos: usize,
 }
 
@@ -135,7 +138,7 @@ impl Parser<'_> {
         if self.buf.len() < self.pos + len + 2 {
             return Ok(None);
         }
-        let body = self.buf[self.pos..self.pos + len].to_vec();
+        let body = self.buf.slice(self.pos..self.pos + len);
         self.pos += len + 2;
         Ok(Some(Value::BulkString(body)))
     }
@@ -302,9 +305,10 @@ fn bad_number() -> RedisError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     fn parse(buf: &[u8]) -> (Value, usize) {
-        match parse_reply(buf).unwrap() {
+        match parse_reply(&Bytes::copy_from_slice(buf)).unwrap() {
             ParseResult::Complete { value, consumed } => (value, consumed),
             ParseResult::Incomplete => panic!("unexpected incomplete parse"),
         }
@@ -321,10 +325,10 @@ mod tests {
         assert_eq!(parse(b":42\r\n").0, Value::Int(42));
         assert_eq!(
             parse(b"$3\r\nabc\r\n").0,
-            Value::BulkString(b"abc".to_vec())
+            Value::BulkString(Bytes::from_static(b"abc"))
         );
         assert_eq!(parse(b"$-1\r\n").0, Value::Nil);
-        assert_eq!(parse(b"$0\r\n\r\n").0, Value::BulkString(vec![]));
+        assert_eq!(parse(b"$0\r\n\r\n").0, Value::BulkString(Bytes::new()));
     }
 
     #[test]
@@ -332,7 +336,7 @@ mod tests {
         let (v, consumed) = parse(b"*2\r\n:1\r\n$2\r\nhi\r\n");
         assert_eq!(
             v,
-            Value::Array(vec![Value::Int(1), Value::BulkString(b"hi".to_vec())])
+            Value::Array(vec![Value::Int(1), Value::BulkString(Bytes::from_static(b"hi"))])
         );
         assert_eq!(consumed, 16);
         assert_eq!(parse(b"*-1\r\n").0, Value::Nil);
@@ -359,14 +363,14 @@ mod tests {
     #[test]
     fn incomplete_when_truncated() {
         assert!(matches!(
-            parse_reply(b"$3\r\nab").unwrap(),
+            parse_reply(&Bytes::from_static(b"$3\r\nab")).unwrap(),
             ParseResult::Incomplete
         ));
         assert!(matches!(
-            parse_reply(b"*2\r\n:1\r\n").unwrap(),
+            parse_reply(&Bytes::from_static(b"*2\r\n:1\r\n")).unwrap(),
             ParseResult::Incomplete
         ));
-        assert!(matches!(parse_reply(b"").unwrap(), ParseResult::Incomplete));
+        assert!(matches!(parse_reply(&Bytes::from_static(b"")).unwrap(), ParseResult::Incomplete));
     }
 
     #[test]
@@ -377,7 +381,7 @@ mod tests {
         assert_eq!(parse(b"_\r\n").0, Value::Nil);
         assert_eq!(
             parse(b"%1\r\n$1\r\na\r\n:1\r\n").0,
-            Value::Map(vec![(Value::BulkString(b"a".to_vec()), Value::Int(1))])
+            Value::Map(vec![(Value::BulkString(Bytes::from_static(b"a")), Value::Int(1))])
         );
     }
 }

@@ -513,14 +513,23 @@ where
 /// handed to waiters in this batch.
 fn dispatch_replies(read_buf: &mut BytesMut, pending: &mut VecDeque<Pending>) -> (bool, usize) {
     let mut delivered = 0usize;
+    if read_buf.is_empty() {
+        return (true, 0);
+    }
+    // Zero-copy: freeze the buffered bytes into a shared snapshot; reply bulk
+    // strings are slices of it. Only the unparsed partial tail is copied
+    // back into the read buffer.
+    let snapshot = read_buf.split().freeze();
+    let mut pos = 0usize;
     loop {
-        match parse_reply(read_buf) {
+        match parse_reply(&snapshot.slice(pos..)) {
             Ok(ParseResult::Complete { value, consumed }) => {
-                let _ = read_buf.split_to(consumed);
+                pos += consumed;
                 deliver(value, pending);
                 delivered += 1;
             }
             Ok(ParseResult::Incomplete) => {
+                read_buf.extend_from_slice(&snapshot[pos..]);
                 // Release memory after an oversized reply so a mostly-idle
                 // connection doesn't pin a huge buffer (matters at ~1000
                 // namespaces × pool connections per process).

@@ -126,13 +126,22 @@ struct Args {
     keys: usize,
 
     /// Fixed length of each key, in bytes.
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = 32)]
     key_len: usize,
 
     /// Maximum value size, in bytes; the SET workload cycles through
     /// `1..=max`. Ignored by the GET workload.
     #[arg(long, default_value_t = 1024)]
     val_size: usize,
+
+    /// Fraction of keys whose value is "big" (--big-value-size), spread
+    /// deterministically across the key pool. Default 0 (no big values).
+    #[arg(long, default_value_t = 0.0)]
+    big_value_rate: f64,
+
+    /// Size of the "big" values, in bytes (e.g. 1024 for 1k, 10240 for 10k).
+    #[arg(long, default_value_t = 1024)]
+    big_value_size: usize,
 
     /// Warm-up operations per worker before measurement begins (the `getset`
     /// legacy path). For `get`/`set` the keys are pre-seeded instead.
@@ -164,6 +173,12 @@ struct Args {
     /// Workload to run.
     #[arg(value_enum, default_value_t = WorkloadKindArg::Hget)]
     workload: WorkloadKindArg,
+
+    /// Verify replies: seed values as `field || key` and check every reply
+    /// matches, detecting request/response mixups (mismatches count as
+    /// errors).
+    #[arg(long)]
+    verify: bool,
 }
 /// CLI-facing mirror of [`WorkloadKind`] (clap needs its own ValueEnum here).
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -241,7 +256,13 @@ async fn run(mut args: Args) -> i32 {
     // cycle through `1..=val_size`. Workers index into this with a plain
     // integer, so the hot path has no `format!()` allocations — the per-op
     // allocation count then reflects the SDK alone.
-    let pool = Arc::new(driver::Pool::new(args.keys, args.key_len, args.val_size));
+    let pool = Arc::new(driver::Pool::new(
+        args.keys,
+        args.key_len,
+        args.val_size,
+        args.big_value_rate,
+        args.big_value_size,
+    ));
     eprintln!(
         "redis-bench: workload={:?} keys={} key_len={} val_size={} concurrency={} min_conns={} max_conns={} max_inflight={}",
         workload,
@@ -262,7 +283,7 @@ async fn run(mut args: Args) -> i32 {
         return 2;
     }
 
-    let runner = Arc::from(workload.runner(pool));
+    let runner = Arc::from(workload.runner(pool, args.verify));
     eprintln!("warming up ({} ops/worker)...", args.warmup);
     warmup(&client, &runner, args.concurrency, args.warmup).await;
 
@@ -494,34 +515,39 @@ async fn warmup(
 /// existing keys and the SET workload pure-overwrite. Seeding is not the
 /// measured phase, so it runs concurrently across the harness pool to keep it
 /// fast for large key counts.
-async fn seed_keys(client: &Arc<dyn ConnectionLike>, pool: &driver::Pool) -> Result<(), String> {
+async fn seed_keys(
+    client: &Arc<dyn ConnectionLike>,
+    pool: &Arc<driver::Pool>,
+) -> Result<(), String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // Snapshot the keys/values into owned Arcs so spawned tasks are 'static.
-    let keys: Arc<[Vec<u8>]> = Arc::from(pool.keys());
-    let values: Arc<[Vec<u8>]> = Arc::from(pool.values());
     let next = Arc::new(AtomicUsize::new(0));
-    let total = keys.len();
+    let total = pool.keys().len();
     let workers = 8.min(total.max(1));
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
         let client = client.clone();
+        let pool = pool.clone();
         let next = next.clone();
-        let keys = keys.clone();
-        let values = values.clone();
         handles.push(tokio::spawn(async move {
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= total {
                     break;
                 }
-                let key: &[u8] = &keys[i % keys.len()];
-                let value: &[u8] = &values[i % values.len()];
-                // One HSET per key, all workload fields at once.
+                let key: &[u8] = pool.key(i);
+                let value: &[u8] = pool.value(i);
+                // One HSET per key, all workload fields at once. Values are
+                // always self-describing (field || key || padding), so
+                // --verify runs can check replies; the flag only toggles
+                // checking, not the seed format.
                 let mut cmd = redis::cmd("HSET");
                 cmd.arg(key);
                 for field in driver::FIELDS {
-                    cmd.arg(field).arg(value);
+                    // arg_bytes: a Vec<u8> passed to arg() would expand
+                    // variadically (one arg per byte).
+                    cmd.arg(field)
+                        .arg_bytes(&driver::seeded_value(field, key, value));
                 }
                 // Tolerate transient faults (fault injection may hang a
                 // connection; writes don't auto-retry by design).

@@ -93,7 +93,7 @@ impl FromRedisValue for bool {
             Value::Nil => Ok(false),
             Value::Okay => Ok(true),
             Value::SimpleString(s) => Ok(s == "OK" || s == "1"),
-            Value::BulkString(b) => Ok(b == b"1"),
+            Value::BulkString(b) => Ok(b.as_ref() == b"1"),
             _ => Err(type_error("expected a boolean-ish reply")),
         }
     }
@@ -226,12 +226,13 @@ tuple_from_value!(A, B, C, D);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn scalars() {
         assert_eq!(i64::from_redis_value(&Value::Int(5)).unwrap(), 5);
         assert_eq!(
-            String::from_redis_value(&Value::BulkString(b"hi".to_vec())).unwrap(),
+            String::from_redis_value(&Value::BulkString(Bytes::from_static(b"hi"))).unwrap(),
             "hi"
         );
         assert_eq!(String::from_redis_value(&Value::Okay).unwrap(), "OK");
@@ -251,8 +252,8 @@ mod tests {
     #[test]
     fn maps_from_flat_array() {
         let arr = Value::Array(vec![
-            Value::BulkString(b"f1".to_vec()),
-            Value::BulkString(b"v1".to_vec()),
+            Value::BulkString(Bytes::from_static(b"f1")),
+            Value::BulkString(Bytes::from_static(b"v1")),
         ]);
         let map: HashMap<String, String> = HashMap::from_redis_value(&arr).unwrap();
         assert_eq!(map.get("f1").map(String::as_str), Some("v1"));

@@ -1,5 +1,7 @@
 //! The [`Value`] model — an in-memory representation of any RESP2/RESP3 reply.
 
+use bytes::Bytes;
+
 use crate::error::{RedisResult, ServerError};
 
 /// A parsed reply from the Redis server.
@@ -13,8 +15,9 @@ pub enum Value {
     Nil,
     /// An integer reply (`:`).
     Int(i64),
-    /// A binary-safe bulk string (`$`).
-    BulkString(Vec<u8>),
+    /// A binary-safe bulk string (`$`). Zero-copy: shares the connection's
+    /// read buffer via [`Bytes`], so large replies are not memcpy'd.
+    BulkString(Bytes),
     /// An array reply (`*`).
     Array(Vec<Value>),
     /// A simple string reply (`+`), e.g. a status other than `OK`.

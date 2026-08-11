@@ -32,16 +32,46 @@ pub enum WorkloadKind {
 }
 
 impl WorkloadKind {
-    pub fn runner(self, pool: Arc<Pool>) -> Box<dyn Workload> {
+    pub fn runner(self, pool: Arc<Pool>, verify: bool) -> Box<dyn Workload> {
         match self {
-            WorkloadKind::Hget => Box::new(HgetPing { pool }),
-            WorkloadKind::Hmget => Box::new(HmgetPing { pool }),
+            WorkloadKind::Hget => Box::new(HgetPing { pool, verify }),
+            WorkloadKind::Hmget => Box::new(HmgetPing { pool, verify }),
         }
     }
 }
 
 /// Hash fields every workload key is seeded with.
 pub const FIELDS: [&str; 4] = ["f1", "f2", "f3", "f4"];
+
+/// Seeded values always start with `field || key` (self-describing content,
+/// optionally padded to a size distribution), so replies can be checked for
+/// request/response mixups whenever `--verify` is on.
+/// Returns true if `value` carries that prefix.
+pub fn expected_value_matches(field: &str, key: &[u8], value: &Value) -> bool {
+    match value {
+        Value::BulkString(bytes) => {
+            bytes.len() >= field.len() + key.len()
+                && bytes.starts_with(field.as_bytes())
+                && &bytes[field.len()..field.len() + key.len()] == key
+        }
+        // Nil (missing key/field) also counts as corruption: everything was
+        // seeded, so a miss means routing/storage went wrong.
+        _ => false,
+    }
+}
+
+/// Build the seed value for (key, field): `field || key`, padded with the
+/// size-cycled pattern `fill` when it is larger, so the value size spread is
+/// preserved while the content stays verifiable.
+pub fn seeded_value(field: &str, key: &[u8], fill: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(fill.len().max(field.len() + key.len()));
+    v.extend_from_slice(field.as_bytes());
+    v.extend_from_slice(key);
+    if fill.len() > v.len() {
+        v.extend_from_slice(&fill[v.len()..]);
+    }
+    v
+}
 
 /// One logical operation against a connection.
 pub trait Workload: Send + Sync {
@@ -54,13 +84,24 @@ pub trait Workload: Send + Sync {
 pub struct Pool {
     keys: Vec<Vec<u8>>,
     values: Vec<Vec<u8>>,
+    /// Big-value pattern and stride: every `big_stride`-th key gets the big
+    /// value; stride 0 = disabled.
+    big_value: Option<Vec<u8>>,
+    big_stride: usize,
 }
 
 impl Pool {
-    /// Build a pool of `num_keys` keys (each `key_len` bytes) and values whose
-    /// sizes cycle through `1..=max_value_size` (so the SET workload exercises
-    /// a realistic spread of value sizes).
-    pub fn new(num_keys: usize, key_len: usize, max_value_size: usize) -> Self {
+    /// Build a pool of `num_keys` keys (each `key_len` bytes) and values
+    /// whose sizes cycle through `1..=max_value_size`. With
+    /// `big_value_rate > 0`, every `1/rate`-th key gets a
+    /// `big_value_size`-byte value instead.
+    pub fn new(
+        num_keys: usize,
+        key_len: usize,
+        max_value_size: usize,
+        big_value_rate: f64,
+        big_value_size: usize,
+    ) -> Self {
         let keys = (0..num_keys).map(|i| key_bytes(i, key_len)).collect();
         let values: Vec<Vec<u8>> = if max_value_size == 0 {
             vec![Vec::new()]
@@ -72,7 +113,20 @@ impl Pool {
         } else {
             values
         };
-        Pool { keys, values }
+        let (big_value, big_stride) = if big_value_rate > 0.0 {
+            (
+                Some(value_bytes(big_value_size)),
+                (1.0 / big_value_rate).round().max(1.0) as usize,
+            )
+        } else {
+            (None, 0)
+        };
+        Pool {
+            keys,
+            values,
+            big_value,
+            big_stride,
+        }
     }
 
     /// Number of distinct keys in the pool.
@@ -86,19 +140,17 @@ impl Pool {
         &self.keys
     }
 
-    /// All pre-generated values, for seeding.
-    pub fn values(&self) -> &[Vec<u8>] {
-        &self.values
-    }
-
     /// Pick key at `index` (caller wraps with modulo).
     pub fn key(&self, index: usize) -> &[u8] {
         &self.keys[index % self.keys.len()]
     }
 
-    #[allow(dead_code)] // still used by SET-style workloads when re-enabled
-    /// Pick a value whose size cycles through `1..=max_value_size`.
+    /// The fill value for key `index`: the big pattern for big-value keys,
+    /// otherwise the size-cycled pattern.
     pub fn value(&self, index: usize) -> &[u8] {
+        if self.big_stride > 0 && index.is_multiple_of(self.big_stride) {
+            return self.big_value.as_deref().unwrap();
+        }
         &self.values[index % self.values.len()]
     }
 }
@@ -130,26 +182,55 @@ fn value_bytes(size: usize) -> Vec<u8> {
 
 struct HgetPing {
     pool: Arc<Pool>,
+    verify: bool,
 }
 impl Workload for HgetPing {
     fn run<'a>(&'a self, client: &'a dyn ConnectionLike, op: u64) -> WorkFuture<'a> {
         let key = self.pool.key(op as usize);
         Box::pin(async move {
             let result: redis::RedisResult<Option<Value>> = client.hget(key, FIELDS[0]).await;
-            result.is_ok()
+            match result {
+                Ok(Some(value)) => {
+                    let ok = !self.verify || expected_value_matches(FIELDS[0], key, &value);
+                    if self.verify && !ok && std::env::var("VERIFY_DEBUG").is_ok() {
+                        eprintln!(
+                            "verify mismatch: field={} key={:?} got={:?}",
+                            FIELDS[0],
+                            String::from_utf8_lossy(key),
+                            value
+                        );
+                    }
+                    ok
+                }
+                Ok(None) => !self.verify,
+                Err(_) => false,
+            }
         })
     }
 }
 
 struct HmgetPing {
     pool: Arc<Pool>,
+    verify: bool,
 }
 impl Workload for HmgetPing {
     fn run<'a>(&'a self, client: &'a dyn ConnectionLike, op: u64) -> WorkFuture<'a> {
         let key = self.pool.key(op as usize);
         Box::pin(async move {
             let result: redis::RedisResult<Vec<Value>> = client.hmget(key, FIELDS).await;
-            result.is_ok()
+            match result {
+                Ok(values) => {
+                    if !self.verify {
+                        return true;
+                    }
+                    values.len() == FIELDS.len()
+                        && values
+                            .iter()
+                            .zip(FIELDS.iter())
+                            .all(|(value, field)| expected_value_matches(field, key, value))
+                }
+                Err(_) => false,
+            }
         })
     }
 }
