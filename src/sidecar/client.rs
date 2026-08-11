@@ -138,9 +138,11 @@ impl SidecarClient {
 
     /// Execute one command with bounded retries and stats/slow-logging.
     ///
-    /// Each attempt is bounded by `op_timeout`. A timeout poisons the
-    /// connection (the mesh may be alive but not answering) so the pool
-    /// replaces it, and surfaces as a retriable [`ErrorKind::Timeout`].
+    /// Each attempt is bounded by `op_timeout`. A timeout on a connection
+    /// that has gone silent poisons it (the mesh may be alive but not
+    /// answering) so the pool replaces it; a timeout on a connection that is
+    /// still delivering replies is treated as an isolated slow request —
+    /// only that request fails, and the breaker is not ticked.
     async fn execute(&self, command: &Cmd) -> RedisResult<Value> {
         let inner = &self.inner;
         let name = command.name();
@@ -154,11 +156,18 @@ impl SidecarClient {
         } else {
             inner.write_retry
         };
+        // The connection the previous attempt failed on; retries avoid it so
+        // they don't queue behind whatever made it slow.
+        let mut avoid: Option<crate::connection::MultiplexedConnection> = None;
         let mut attempt = 0u32;
         loop {
             attempt += 1;
             let start = Instant::now();
-            match inner.pool.get().await {
+            let borrow = match &avoid {
+                Some(bad) => inner.pool.get_avoiding(bad).await,
+                None => inner.pool.get().await,
+            };
+            match borrow {
                 Ok(conn) => match self.with_timeout(conn.req_command(command)).await {
                     Ok(value) => {
                         // A reply arrived — even an inline server error means the
@@ -175,18 +184,28 @@ impl SidecarClient {
                         return Ok(value);
                     }
                     Err(err) => {
-                        if err.kind() == crate::ErrorKind::Timeout {
-                            // The reply never came; the socket is suspect even
-                            // though the driver task may still be running.
-                            conn.poison();
-                        }
                         inner
                             .stats
                             .record(&name, start.elapsed(), true, inner.slow_threshold);
                         self.log_exception(&name, &key, &err.to_string(), false);
-                        // A response-level error keeps the connection; an I/O
-                        // error invalidates it (Java "special data exception").
-                        if err.connection_still_valid() {
+                        // Whatever the failure, retry elsewhere (if retried).
+                        avoid = Some(conn.clone());
+                        if err.kind() == crate::ErrorKind::Timeout {
+                            // Evidence-based handling: if this connection has
+                            // delivered replies within the timeout window, the
+                            // socket is alive and this was an isolated slow
+                            // request — fail just this one, keep the
+                            // connection, and don't blame the pool (no
+                            // breaker tick). A fully silent connection is
+                            // genuinely suspect: poison it.
+                            if !conn.responsive_within(inner.op_timeout) {
+                                conn.poison();
+                                inner.pool.note_failure();
+                            }
+                        } else if err.connection_still_valid() {
+                            // A response-level error keeps the connection; an
+                            // I/O error invalidates it (Java "special data
+                            // exception").
                             inner.pool.note_success();
                         } else {
                             inner.pool.note_failure();
@@ -239,14 +258,19 @@ impl SidecarClient {
                 Ok(values)
             }
             Err(err) => {
-                if err.kind() == crate::ErrorKind::Timeout {
-                    conn.poison();
-                }
                 inner
                     .stats
                     .record("pipeline", start.elapsed(), true, inner.slow_threshold);
                 self.log_exception("pipeline", "", &err.to_string(), false);
-                if err.connection_still_valid() {
+                if err.kind() == crate::ErrorKind::Timeout {
+                    // Same evidence-based handling as single commands: an
+                    // isolated slow pipeline on a responsive connection does
+                    // not poison it nor tick the breaker.
+                    if !conn.responsive_within(inner.op_timeout) {
+                        conn.poison();
+                        inner.pool.note_failure();
+                    }
+                } else if err.connection_still_valid() {
                     inner.pool.note_success();
                 } else {
                     inner.pool.note_failure();

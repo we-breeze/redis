@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -68,6 +68,18 @@ pub struct MultiplexedConnection {
     /// Requests handed to the driver but not yet fully answered. The pool
     /// reads this to grow the pool under load.
     inflight: Arc<AtomicUsize>,
+    /// Wall-clock millis of the last reply received on this connection.
+    /// Distinguishes "one request is slow" (replies still flowing) from
+    /// "the connection is dead" (silent), so a single slow request doesn't
+    /// get the whole connection poisoned.
+    last_reply_ms: Arc<AtomicU64>,
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl MultiplexedConnection {
@@ -87,17 +99,18 @@ impl MultiplexedConnection {
     ) -> RedisResult<Self> {
         let (tx, rx) = mpsc::channel::<Request>(max_inflight.max(1));
         let alive = Arc::new(AtomicBool::new(true));
+        let last_reply_ms = Arc::new(AtomicU64::new(0));
         let max_inflight = max_inflight.max(1);
         let addr = match endpoint {
             Endpoint::Tcp(addr) => {
                 let stream = tokio::net::TcpStream::connect(addr).await?;
                 stream.set_nodelay(true).ok();
-                tokio::spawn(drive(stream, rx, alive.clone(), max_inflight));
+                tokio::spawn(drive(stream, rx, alive.clone(), last_reply_ms.clone(), max_inflight));
                 Some(*addr)
             }
             Endpoint::Unix(path) => {
                 let stream = tokio::net::UnixStream::connect(path).await?;
-                tokio::spawn(drive(stream, rx, alive.clone(), max_inflight));
+                tokio::spawn(drive(stream, rx, alive.clone(), last_reply_ms.clone(), max_inflight));
                 None
             }
         };
@@ -106,6 +119,7 @@ impl MultiplexedConnection {
             alive,
             addr,
             inflight: Arc::new(AtomicUsize::new(0)),
+            last_reply_ms,
         };
         if let Some(handshake) = handshake {
             conn.run_handshake(handshake).await?;
@@ -121,6 +135,19 @@ impl MultiplexedConnection {
     /// Requests currently queued or awaiting replies on this connection.
     pub fn inflight(&self) -> usize {
         self.inflight.load(Ordering::Acquire)
+    }
+
+    /// Identity check (all clones of one connection share `alive`).
+    pub fn same(&self, other: &MultiplexedConnection) -> bool {
+        Arc::ptr_eq(&self.alive, &other.alive)
+    }
+
+    /// Whether a reply arrived on this connection within `window`. Used on
+    /// request timeout: a responsive connection means the timed-out request
+    /// was an isolated slow one and the connection should be kept.
+    pub fn responsive_within(&self, window: std::time::Duration) -> bool {
+        let last = self.last_reply_ms.load(Ordering::Acquire);
+        last > 0 && now_millis().saturating_sub(last) <= window.as_millis() as u64
     }
 
     /// `AUTH`/`SELECT` on a fresh connection; any failure rejects the
@@ -237,6 +264,7 @@ async fn drive<S>(
     stream: S,
     mut rx: mpsc::Receiver<Request>,
     alive: Arc<AtomicBool>,
+    last_reply_ms: Arc<AtomicU64>,
     max_inflight: usize,
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -261,7 +289,7 @@ async fn drive<S>(
                     }
                 }
                 read = reader.read_buf(&mut read_buf) => {
-                    if !on_read(&mut reader, &mut read_buf, &mut pending, read).await {
+                    if !on_read(&mut reader, &mut read_buf, &mut pending, read, &last_reply_ms).await {
                         break;
                     }
                 }
@@ -270,7 +298,7 @@ async fn drive<S>(
             tokio::select! {
                 biased;
                 read = reader.read_buf(&mut read_buf) => {
-                    if !on_read(&mut reader, &mut read_buf, &mut pending, read).await {
+                    if !on_read(&mut reader, &mut read_buf, &mut pending, read, &last_reply_ms).await {
                         break;
                     }
                 }
@@ -327,6 +355,7 @@ async fn on_read<R>(
     read_buf: &mut BytesMut,
     pending: &mut VecDeque<Pending>,
     read: std::io::Result<usize>,
+    last_reply_ms: &AtomicU64,
 ) -> bool
 where
     R: AsyncRead + Unpin,
@@ -335,7 +364,11 @@ where
         Ok(0) => false, // EOF.
         Ok(_) => {
             drain_available(reader, read_buf).await;
-            dispatch_replies(read_buf, pending)
+            let (cont, delivered) = dispatch_replies(read_buf, pending);
+            if delivered > 0 {
+                last_reply_ms.store(now_millis(), Ordering::Release);
+            }
+            cont
         }
         Err(_) => false,
     }
@@ -440,12 +473,16 @@ where
 
 /// Parse as many complete replies as `read_buf` holds and route them to the
 /// front pending entries. Returns `false` on an unrecoverable protocol error.
-fn dispatch_replies(read_buf: &mut BytesMut, pending: &mut VecDeque<Pending>) -> bool {
+/// Returns `(keep_driving, delivered)` — `delivered` counts complete replies
+/// handed to waiters in this batch.
+fn dispatch_replies(read_buf: &mut BytesMut, pending: &mut VecDeque<Pending>) -> (bool, usize) {
+    let mut delivered = 0usize;
     loop {
         match parse_reply(read_buf) {
             Ok(ParseResult::Complete { value, consumed }) => {
                 let _ = read_buf.split_to(consumed);
                 deliver(value, pending);
+                delivered += 1;
             }
             Ok(ParseResult::Incomplete) => {
                 // Release memory after an oversized reply so a mostly-idle
@@ -461,13 +498,13 @@ fn dispatch_replies(read_buf: &mut BytesMut, pending: &mut VecDeque<Pending>) ->
                     fresh.extend_from_slice(&rest);
                     *read_buf = fresh;
                 }
-                return true;
+                return (true, delivered);
             }
             Err(err) => {
                 if let Some(entry) = pending.pop_front() {
                     let _ = entry.responder.send(Err(err));
                 }
-                return false;
+                return (false, delivered);
             }
         }
     }
@@ -549,5 +586,65 @@ mod tests {
         assert!(!conn.is_alive());
         let err = conn.req_command(&cmd("GET")).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Io);
+    }
+
+    /// A server that answers everything except requests containing "SLOW",
+    /// which it delays by 300ms.
+    async fn slow_marker_mesh() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                            .await
+                            .unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        let slow = buf[..n].windows(4).any(|w| w == b"SLOW");
+                        if slow {
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        }
+                        if tokio::io::AsyncWriteExt::write_all(&mut socket, b"+OK\r\n")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    #[tokio::test]
+    async fn responsive_within_distinguishes_slow_request_from_dead_connection() {
+        use std::time::Duration;
+
+        // Replies still flowing around the slow request: responsive.
+        let (addr, _mesh) = slow_marker_mesh().await;
+        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr), 16)
+            .await
+            .unwrap();
+        conn.req_command(&cmd("GET")).await.unwrap();
+        let slow_cmd = cmd("SLOW");
+        let slow = conn.req_command(&slow_cmd);
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), slow).await;
+        assert!(timed_out.is_err(), "slow request should hit the deadline");
+        // The previous reply arrived within the window: the timeout would be
+        // treated as isolated and the connection kept.
+        assert!(conn.responsive_within(Duration::from_millis(150)));
+        assert!(conn.is_alive());
+
+        // A fully silent connection: not responsive, would be poisoned.
+        let (addr, _mesh) = silent_mesh().await;
+        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr), 16)
+            .await
+            .unwrap();
+        assert!(!conn.responsive_within(Duration::from_millis(150)));
     }
 }

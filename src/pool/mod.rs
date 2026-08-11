@@ -186,6 +186,39 @@ impl Pool {
         Ok(conn)
     }
 
+    /// Get a usable connection other than `avoid` — used by the retry path
+    /// so a retried request doesn't land back on the connection that just
+    /// timed out. Falls back to any live connection (or creates one) when no
+    /// alternative exists.
+    pub async fn get_avoiding(
+        &self,
+        avoid: &MultiplexedConnection,
+    ) -> RedisResult<MultiplexedConnection> {
+        if !self.health.can_serve() {
+            return Err(unavailable());
+        }
+        {
+            let conns = self.conns.read().unwrap();
+            let n = conns.len();
+            if n > 0 {
+                let start = self.dispatch.fetch_add(1, Ordering::Relaxed);
+                for offset in 0..n {
+                    let conn = &conns[(start + offset) % n];
+                    if conn.is_alive() && !conn.same(avoid) {
+                        return Ok(conn.clone());
+                    }
+                }
+            }
+        }
+        // No alternative right now: grow if allowed, else reuse anything.
+        if self.live_count() < self.max_conns() {
+            let conn = self.create_conn().await?;
+            self.conns.write().unwrap().push(conn.clone());
+            return Ok(conn);
+        }
+        self.get().await
+    }
+
     /// The hard cap on live connections.
     fn max_conns(&self) -> usize {
         self.config.pool_size.max(MIN_IDLE)
