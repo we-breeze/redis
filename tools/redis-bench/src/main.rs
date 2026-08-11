@@ -62,6 +62,25 @@ struct Args {
     #[arg(long)]
     replay: Option<String>,
 
+    /// Shards mode: comma-separated direct backends
+    /// (`host:port[:db],host:port[:db],...`), driven through the SDK's
+    /// `direct::Shards` client-side router.
+    #[arg(long, value_delimiter = ',')]
+    shards: Option<Vec<String>>,
+
+    /// Hash algorithm for --shards (breeze mesh names, e.g. crc32).
+    #[arg(long, default_value = "crc32")]
+    hash: String,
+
+    /// Distribution for --shards (e.g. modula, range-256, ketama).
+    #[arg(long, default_value = "modula")]
+    distribution: String,
+
+    /// With fault injection in --shards mode: only proxy (delay) this shard
+    /// index. Defaults to shard 0.
+    #[arg(long)]
+    fault_shard: Option<usize>,
+
     /// Use a unix socket for the mesh transport (ignored with --direct).
     #[arg(long)]
     unix: bool,
@@ -293,6 +312,31 @@ enum RunMode {
 /// target, rewriting `args` to point at the proxy. Sidecar mode re-publishes
 /// a bench-owned sock file (proxy port) in a fresh socket dir.
 async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<(), String> {
+    if let Some(shards) = args.shards.clone() {
+        // Only the selected shard goes through the fault proxy; the others
+        // connect directly — modeling "one slow shard among many backends".
+        let fault_shard = args.fault_shard.unwrap_or(0);
+        if fault_shard >= shards.len() {
+            return Err(format!(
+                "--fault-shard {fault_shard} out of range ({} shards)",
+                shards.len()
+            ));
+        }
+        let mut rewritten = shards;
+        let addr = &rewritten[fault_shard];
+        let parts: Vec<&str> = addr.split(':').collect();
+        let (host_port, db) = match parts.len() {
+            2 => (addr.clone(), String::new()),
+            3 => (format!("{}:{}", parts[0], parts[1]), format!(":{}", parts[2])),
+            _ => return Err(format!("invalid shard address '{addr}'")),
+        };
+        let target = resolve(&host_port).await?;
+        let proxy = fault::start_proxy(target, injector).await?;
+        eprintln!("fault proxy: {proxy} -> {target} (shard {fault_shard} only)");
+        rewritten[fault_shard] = format!("{proxy}{db}");
+        args.shards = Some(rewritten);
+        return Ok(());
+    }
     if let Some(addr) = args.direct.clone() {
         // host:port[:db] — proxy the host:port part, keep the db suffix.
         let parts: Vec<&str> = addr.split(':').collect();
@@ -357,6 +401,28 @@ async fn resolve(host_port: &str) -> Result<std::net::SocketAddr, String> {
 /// Build the connection the harness will drive. Returns it as a trait object
 /// so the rest of the harness is agnostic to mesh-vs-direct.
 async fn build_client(args: &Args) -> Result<Arc<dyn ConnectionLike>, String> {
+    if let Some(shards) = &args.shards {
+        let mut clients = Vec::with_capacity(shards.len());
+        for addr in shards {
+            let mut cfg = redis::direct::ServerConfig::new(addr)
+                .map_err(|e| e.to_string())?
+                .with_pool_size(args.pool_size);
+            cfg.max_inflight = args.max_inflight;
+            cfg.op_timeout = Duration::from_millis(args.op_timeout_ms);
+            clients.push(
+                redis::direct::DirectClient::connect(cfg)
+                    .await
+                    .map_err(|e| format!("shard {addr}: {e}"))?,
+            );
+        }
+        let router = redis::direct::Shards::new(
+            &args.hash,
+            &args.distribution,
+            shards.clone(),
+            clients,
+        );
+        return Ok(Arc::new(router));
+    }
     if let Some(addr) = &args.direct {
         let mut cfg = redis::direct::ServerConfig::new(addr)
             .map_err(|e| e.to_string())?
