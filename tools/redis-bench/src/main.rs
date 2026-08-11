@@ -26,6 +26,7 @@
 //! Non-zero if the error rate exceeds `--max-error-rate`.
 
 mod driver;
+mod fault;
 mod stats;
 
 use std::sync::Arc;
@@ -33,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use driver::{Workload, WorkloadKind};
+use fault::FaultInjector;
 use redis::connection::ConnectionLike;
 use redis::sidecar::{SidecarClient, MeshConfig, Transport};
 use stats::{MemoryWindow, OpBudget, Summary, WorkerStats};
@@ -118,6 +120,24 @@ struct Args {
     #[arg(long, default_value_t = 0.01)]
     max_error_rate: f64,
 
+    /// Fraction of operations delayed by --slow-ms (simulated slow requests).
+    #[arg(long, default_value_t = 0.0)]
+    slow_rate: f64,
+
+    /// Delay injected for slow operations, in milliseconds.
+    #[arg(long, default_value_t = 200)]
+    slow_ms: u64,
+
+    /// Fraction of operations delayed past the client timeout (simulated
+    /// timeouts; the SDK's op_timeout/retry path kicks in).
+    #[arg(long, default_value_t = 0.0)]
+    timeout_rate: f64,
+
+    /// Delay injected for timed-out operations, in milliseconds. Should
+    /// exceed --op-timeout-ms.
+    #[arg(long, default_value_t = 5000)]
+    timeout_ms: u64,
+
     /// Workload to run.
     #[arg(value_enum, default_value_t = WorkloadKindArg::Hget)]
     workload: WorkloadKindArg,
@@ -158,9 +178,30 @@ fn main() {
     std::process::exit(code);
 }
 
-async fn run(args: Args) -> i32 {
+async fn run(mut args: Args) -> i32 {
+    // Optional fault injection: insert a delaying TCP proxy between the
+    // bench and the target (mesh endpoint or raw redis) so slow/timeout
+    // faults exercise the SDK's timeout/breaker/retry machinery.
+    let injector = FaultInjector::new(
+        args.slow_rate,
+        args.slow_ms,
+        args.timeout_rate,
+        args.timeout_ms,
+    )
+    .map(Arc::new);
+    if let Some(injector) = &injector {
+        if let Err(e) = inject_faults(&mut args, injector.clone()).await {
+            eprintln!("error: fault injection setup failed: {e}");
+            return 2;
+        }
+        eprintln!(
+            "fault injection: slow={}*{}ms timeout={}*{}ms",
+            args.slow_rate, args.slow_ms, args.timeout_rate, args.timeout_ms
+        );
+    }
+
     if args.replay.is_some() {
-        return run_replay(args).await;
+        return run_replay(args, injector).await;
     }
 
     let workload: WorkloadKind = args.workload.into();
@@ -210,6 +251,10 @@ async fn run(args: Args) -> i32 {
     eprintln!("running...");
     let mem_before = brz_mem::heap();
     let (summary, elapsed) = measured_run(&client, &runner, args.concurrency, mode).await;
+    if let Some(injector) = &injector {
+        let (slow, timeout) = injector.counts();
+        eprintln!("fault injection: slow={slow} timeout={timeout} injected");
+    }
     finish(&summary, elapsed, mem_before, &args)
 }
 
@@ -242,6 +287,71 @@ fn finish(
 enum RunMode {
     Count(u64),
     Timed(Duration),
+}
+
+/// Insert the fault-injecting proxy between the bench and the configured
+/// target, rewriting `args` to point at the proxy. Sidecar mode re-publishes
+/// a bench-owned sock file (proxy port) in a fresh socket dir.
+async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<(), String> {
+    if let Some(addr) = args.direct.clone() {
+        // host:port[:db] — proxy the host:port part, keep the db suffix.
+        let parts: Vec<&str> = addr.split(':').collect();
+        let (host_port, db) = match parts.len() {
+            2 => (addr.clone(), String::new()),
+            3 => (format!("{}:{}", parts[0], parts[1]), format!(":{}", parts[2])),
+            _ => return Err(format!("invalid --direct address '{addr}'")),
+        };
+        let target = resolve(&host_port).await?;
+        let proxy = fault::start_proxy(target, injector).await?;
+        eprintln!("fault proxy: {proxy} -> {target}");
+        args.direct = Some(format!("{proxy}{db}"));
+        return Ok(());
+    }
+    if let Some(addr) = args.replay.clone() {
+        let target = resolve(&addr).await?;
+        let proxy = fault::start_proxy(target, injector).await?;
+        eprintln!("fault proxy: {proxy} -> {target}");
+        args.replay = Some(proxy.to_string());
+        return Ok(());
+    }
+    if let Some(ns) = args.namespace.clone() {
+        let endpoints = redis::sidecar::discovery::scan_endpoints(
+            std::path::Path::new(&args.socket_dir),
+            &args.group,
+            &ns,
+            args.unix,
+        );
+        let target = endpoints
+            .into_iter()
+            .find_map(|e| match e {
+                redis::sidecar::Endpoint::Tcp(addr) => Some(addr),
+                redis::sidecar::Endpoint::Unix(_) => None,
+            })
+            .ok_or("no TCP mesh endpoint to proxy (unix endpoints unsupported)")?;
+        let proxy = fault::start_proxy(target, injector).await?;
+        let dir = std::env::temp_dir().join(format!("redis-bench-fault-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let sock = dir.join(format!(
+            "static.config.api.example.com+3+config+cloud+redis+{}+{}@redis:{}@rs",
+            args.group,
+            ns,
+            proxy.port()
+        ));
+        std::fs::File::create(&sock).map_err(|e| e.to_string())?;
+        eprintln!("fault proxy: {proxy} -> {target} (sock {})", sock.display());
+        args.socket_dir = dir.to_string_lossy().into_owned();
+        args.unix = false;
+        return Ok(());
+    }
+    Err("fault injection requires one of --namespace/--direct/--replay".to_string())
+}
+
+async fn resolve(host_port: &str) -> Result<std::net::SocketAddr, String> {
+    tokio::net::lookup_host(host_port)
+        .await
+        .map_err(|e| format!("resolve {host_port}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("resolve {host_port}: no addresses"))
 }
 
 /// Build the connection the harness will drive. Returns it as a trait object
@@ -452,7 +562,7 @@ fn report(summary: &Summary, elapsed: Duration, memory: &MemoryWindow) {
 /// sequential HGETs. Seeding goes through the SDK's direct client, since the
 /// replay client is read-only.
 #[cfg(feature = "replay")]
-async fn run_replay(args: Args) -> i32 {
+async fn run_replay(args: Args, injector: Option<Arc<FaultInjector>>) -> i32 {
     use redis::replay::RedisConnection;
 
     let addr = args.replay.clone().unwrap();
@@ -555,6 +665,7 @@ async fn run_replay(args: Args) -> i32 {
         let keys = keys.clone();
         let budget = budget.clone();
         let warmup = args.warmup;
+        let injector = injector.clone();
         handles.push(tokio::spawn(async move {
             let mut local = WorkerStats::new();
             let mut conn = match RedisConnection::connect(&host, port).await {
@@ -582,6 +693,9 @@ async fn run_replay(args: Args) -> i32 {
                     break;
                 }
                 let key = &keys[(op as usize) % keys.len()];
+                if let Some(injector) = &injector {
+                    injector.maybe_delay().await;
+                }
                 let t = Instant::now();
                 let ok = conn.hget(key, FIELD).await.is_ok();
                 let elapsed = t.elapsed();
@@ -602,12 +716,16 @@ async fn run_replay(args: Args) -> i32 {
             local.add_to(&mut summary);
         }
     }
+    if let Some(injector) = &injector {
+        let (slow, timeout) = injector.counts();
+        eprintln!("fault injection: slow={slow} timeout={timeout} injected");
+    }
     finish(&summary, start.elapsed(), mem_before, &args)
 }
 
 /// Stub when the `replay` feature is off.
 #[cfg(not(feature = "replay"))]
-async fn run_replay(_args: Args) -> i32 {
+async fn run_replay(_args: Args, _injector: Option<Arc<FaultInjector>>) -> i32 {
     eprintln!("error: --replay requires the `replay` feature");
     eprintln!("hint:  cargo run -p redis-bench --features replay -- --replay host:port");
     2

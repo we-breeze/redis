@@ -23,6 +23,7 @@ replay = ["redis/direct-tcp"]
 redis = { path = "../.." }
 brz-mem.workspace = true
 tokio = { version = "1", features = ["full"] }
+bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 hdrhistogram = "7"
 tracing = "0.1"
