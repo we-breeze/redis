@@ -31,14 +31,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::cmd::Cmd;
-use crate::sidecar::config::MeshConfig;
 use crate::connection::{ConnectionLike, Handshake, RedisFuture};
+use crate::direct::sharding::Sharding;
 use crate::error::{ErrorKind, RedisError, RedisResult};
 use crate::pipeline::Pipeline;
 use crate::pool::Pool;
-use crate::direct::sharding::Sharding;
-use crate::types::Value;
 use crate::sidecar::SidecarClient as InnerClient;
+use crate::sidecar::config::MeshConfig;
+use crate::types::Value;
 
 /// Configuration for one direct backend server, mirroring the Java
 /// `RedisConfig` (`host:port[:db]`, auth, timeout).
@@ -56,8 +56,11 @@ pub struct ServerConfig {
     /// returns default values, a write on a read-only backend fails with
     /// [`ErrorKind::ClientError`]).
     pub read_only: bool,
-    /// Connections in the pool.
-    pub pool_size: usize,
+    /// Minimum live connections kept warm (0 = fully lazy, nothing
+    /// pre-created at startup).
+    pub min_connections: usize,
+    /// Maximum live connections in the pool (grows on demand up to this).
+    pub max_connections: usize,
     /// Per-connection in-flight budget.
     pub max_inflight: usize,
     /// Per-command timeout.
@@ -107,7 +110,8 @@ impl ServerConfig {
             db,
             auth: None,
             read_only: false,
-            pool_size: 4,
+            min_connections: 2,
+            max_connections: 15,
             max_inflight: 4096,
             op_timeout: Duration::from_millis(500),
             slow_time_threshold: Duration::from_millis(50),
@@ -130,9 +134,15 @@ impl ServerConfig {
         self
     }
 
-    /// Set the pool size.
-    pub fn with_pool_size(mut self, size: usize) -> Self {
-        self.pool_size = size.max(1);
+    /// Set the minimum number of live pooled connections (0 = fully lazy).
+    pub fn with_min_connections(mut self, n: usize) -> Self {
+        self.min_connections = n;
+        self
+    }
+
+    /// Set the maximum number of live pooled connections.
+    pub fn with_max_connections(mut self, n: usize) -> Self {
+        self.max_connections = n.max(1);
         self
     }
 
@@ -160,9 +170,7 @@ impl DirectClient {
     pub async fn connect(config: ServerConfig) -> RedisResult<Self> {
         let label = config.label();
         let authority = format!("{}:{}", config.host, config.port);
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&authority)
-            .await?
-            .collect();
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&authority).await?.collect();
         if addrs.is_empty() {
             return Err(RedisError::new(
                 ErrorKind::ClientError,
@@ -178,7 +186,8 @@ impl DirectClient {
             None
         };
         let mut pool_config = MeshConfig::new(label.clone());
-        pool_config.pool_size = config.pool_size;
+        pool_config.min_connections = config.min_connections;
+        pool_config.max_connections = config.max_connections;
         pool_config.max_inflight = config.max_inflight;
         pool_config.op_timeout = config.op_timeout;
         pool_config.slow_time_threshold = config.slow_time_threshold;
@@ -264,7 +273,10 @@ impl ConnectionLike for DirectClient {
     ) -> RedisFuture<'a, Vec<Value>> {
         Box::pin(async move {
             self.check_writable(pipeline.is_readonly())?;
-            self.inner.client.req_pipeline(pipeline, offset, count).await
+            self.inner
+                .client
+                .req_pipeline(pipeline, offset, count)
+                .await
         })
     }
 }
@@ -384,11 +396,8 @@ impl HaServer {
         }
 
         let mut second_result = None;
-        let second_live = self.double_write
-            && self
-                .second
-                .as_ref()
-                .is_some_and(DirectClient::is_available);
+        let second_live =
+            self.double_write && self.second.as_ref().is_some_and(DirectClient::is_available);
         if second_live {
             let second = self.second.as_ref().unwrap();
             let sync = match (&first_result, self.set_second) {
@@ -702,7 +711,12 @@ mod tests {
     /// A minimal fake Redis: replies `+OK` to AUTH/SELECT/SET, a bulk string
     /// to GET. Records whether it saw the AUTH/SELECT handshake.
     async fn fake_redis() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
-        fake_redis_with(|_| "+OK".to_string(), |chunk| chunk.contains("GET"), "$1\r\nv\r\n").await
+        fake_redis_with(
+            |_| "+OK".to_string(),
+            |chunk| chunk.contains("GET"),
+            "$1\r\nv\r\n",
+        )
+        .await
     }
 
     /// A fake Redis whose replies are computed per received chunk:
@@ -759,7 +773,10 @@ mod tests {
         // The connection ran AUTH + SELECT before serving.
         let log = seen.lock().unwrap().join("|");
         assert!(log.contains("AUTH"), "expected AUTH in handshake: {log}");
-        assert!(log.contains("SELECT"), "expected SELECT in handshake: {log}");
+        assert!(
+            log.contains("SELECT"),
+            "expected SELECT in handshake: {log}"
+        );
 
         // Flip to read-only: reads keep working, writes are rejected locally.
         backend.set_read_only(true);
@@ -780,9 +797,7 @@ mod tests {
     }
 
     /// INCR answers `:7`, everything else `+OK`.
-    async fn counter_redis(
-        value: i64,
-    ) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+    async fn counter_redis(value: i64) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
         let reply = format!(":{value}\r\n");
         // Leak to get 'static; tests are short-lived.
         let reply: &'static str = Box::leak(reply.into_boxed_str());
@@ -794,9 +809,10 @@ mod tests {
         let (first_port, _) = counter_redis(7).await;
         let (second_port, second_seen) = counter_redis(3).await;
 
-        let first = DirectClient::connect(ServerConfig::new(&format!("127.0.0.1:{first_port}")).unwrap())
-            .await
-            .unwrap();
+        let first =
+            DirectClient::connect(ServerConfig::new(&format!("127.0.0.1:{first_port}")).unwrap())
+                .await
+                .unwrap();
         let second =
             DirectClient::connect(ServerConfig::new(&format!("127.0.0.1:{second_port}")).unwrap())
                 .await
@@ -831,16 +847,14 @@ mod tests {
     async fn ha_write_falls_back_to_second_when_first_down() {
         // first points at a closed port; second serves.
         let (second_port, _) = counter_redis(5).await;
-        let first = DirectClient::connect(ServerConfig::new("127.0.0.1:1").unwrap())
-            .await;
+        let first = DirectClient::connect(ServerConfig::new("127.0.0.1:1").unwrap()).await;
         // Connecting to a dead port must fail fast at warm-up.
         assert!(first.is_err());
 
-        let first = DirectClient::connect(
-            ServerConfig::new(&format!("127.0.0.1:{second_port}")).unwrap(),
-        )
-        .await
-        .unwrap();
+        let first =
+            DirectClient::connect(ServerConfig::new(&format!("127.0.0.1:{second_port}")).unwrap())
+                .await
+                .unwrap();
         first.pooled_client().pause(); // simulate a tripped breaker
         let second =
             DirectClient::connect(ServerConfig::new(&format!("127.0.0.1:{second_port}")).unwrap())

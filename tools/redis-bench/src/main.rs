@@ -36,7 +36,7 @@ use clap::Parser;
 use driver::{Workload, WorkloadKind};
 use fault::FaultInjector;
 use redis::connection::ConnectionLike;
-use redis::sidecar::{SidecarClient, MeshConfig, Transport};
+use redis::sidecar::{MeshConfig, SidecarClient, Transport};
 use stats::{MemoryWindow, OpBudget, Summary, WorkerStats};
 
 // Install mimalloc (with per-request heap accounting under the `memory-stats`
@@ -93,9 +93,13 @@ struct Args {
     #[arg(long, default_value = "/tmp/breeze/socks")]
     socket_dir: String,
 
-    /// Number of multiplexed connections in the pool (mesh client or direct).
-    #[arg(long, default_value_t = 8)]
-    pool_size: usize,
+    /// Minimum live pooled connections kept warm (0 = fully lazy start).
+    #[arg(long, default_value_t = 2)]
+    min_conns: usize,
+
+    /// Maximum live pooled connections (mesh client or direct).
+    #[arg(long, default_value_t = 15)]
+    max_conns: usize,
 
     /// Per-connection in-flight request budget.
     #[arg(long, default_value_t = 4096)]
@@ -122,7 +126,7 @@ struct Args {
     keys: usize,
 
     /// Fixed length of each key, in bytes.
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 15)]
     key_len: usize,
 
     /// Maximum value size, in bytes; the SET workload cycles through
@@ -239,13 +243,14 @@ async fn run(mut args: Args) -> i32 {
     // allocation count then reflects the SDK alone.
     let pool = Arc::new(driver::Pool::new(args.keys, args.key_len, args.val_size));
     eprintln!(
-        "redis-bench: workload={:?} keys={} key_len={} val_size={} concurrency={} pool_size={} max_inflight={}",
+        "redis-bench: workload={:?} keys={} key_len={} val_size={} concurrency={} min_conns={} max_conns={} max_inflight={}",
         workload,
         args.keys,
         args.key_len,
         args.val_size,
         args.concurrency,
-        args.pool_size,
+        args.min_conns,
+        args.max_conns,
         args.max_inflight
     );
 
@@ -327,7 +332,10 @@ async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<
         let parts: Vec<&str> = addr.split(':').collect();
         let (host_port, db) = match parts.len() {
             2 => (addr.clone(), String::new()),
-            3 => (format!("{}:{}", parts[0], parts[1]), format!(":{}", parts[2])),
+            3 => (
+                format!("{}:{}", parts[0], parts[1]),
+                format!(":{}", parts[2]),
+            ),
             _ => return Err(format!("invalid shard address '{addr}'")),
         };
         let target = resolve(&host_port).await?;
@@ -342,7 +350,10 @@ async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<
         let parts: Vec<&str> = addr.split(':').collect();
         let (host_port, db) = match parts.len() {
             2 => (addr.clone(), String::new()),
-            3 => (format!("{}:{}", parts[0], parts[1]), format!(":{}", parts[2])),
+            3 => (
+                format!("{}:{}", parts[0], parts[1]),
+                format!(":{}", parts[2]),
+            ),
             _ => return Err(format!("invalid --direct address '{addr}'")),
         };
         let target = resolve(&host_port).await?;
@@ -406,7 +417,8 @@ async fn build_client(args: &Args) -> Result<Arc<dyn ConnectionLike>, String> {
         for addr in shards {
             let mut cfg = redis::direct::ServerConfig::new(addr)
                 .map_err(|e| e.to_string())?
-                .with_pool_size(args.pool_size);
+                .with_min_connections(args.min_conns)
+                .with_max_connections(args.max_conns);
             cfg.max_inflight = args.max_inflight;
             cfg.op_timeout = Duration::from_millis(args.op_timeout_ms);
             clients.push(
@@ -415,18 +427,15 @@ async fn build_client(args: &Args) -> Result<Arc<dyn ConnectionLike>, String> {
                     .map_err(|e| format!("shard {addr}: {e}"))?,
             );
         }
-        let router = redis::direct::Shards::new(
-            &args.hash,
-            &args.distribution,
-            shards.clone(),
-            clients,
-        );
+        let router =
+            redis::direct::Shards::new(&args.hash, &args.distribution, shards.clone(), clients);
         return Ok(Arc::new(router));
     }
     if let Some(addr) = &args.direct {
         let mut cfg = redis::direct::ServerConfig::new(addr)
             .map_err(|e| e.to_string())?
-            .with_pool_size(args.pool_size);
+            .with_min_connections(args.min_conns)
+            .with_max_connections(args.max_conns);
         cfg.max_inflight = args.max_inflight;
         cfg.op_timeout = Duration::from_millis(args.op_timeout_ms);
         let dc = redis::direct::DirectClient::connect(cfg)
@@ -443,14 +452,17 @@ async fn build_client(args: &Args) -> Result<Arc<dyn ConnectionLike>, String> {
     let mut cfg = MeshConfig::new(ns)
         .with_group(&args.group)
         .with_socket_dir(&args.socket_dir)
-        .with_pool_size(args.pool_size)
+        .with_min_connections(args.min_conns)
+        .with_max_connections(args.max_conns)
         .with_max_inflight(args.max_inflight);
     if args.unix {
         cfg = cfg.with_transport(Transport::Unix);
     }
     cfg.op_timeout = Duration::from_millis(args.op_timeout_ms);
 
-    let client = SidecarClient::from_config(cfg).await.map_err(|e| e.to_string())?;
+    let client = SidecarClient::from_config(cfg)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(Arc::new(client))
 }
 
@@ -644,8 +656,7 @@ async fn run_replay(args: Args, injector: Option<Arc<FaultInjector>>) -> i32 {
     const FIELD: &str = "f";
 
     // Textual hash keys (the replay client takes `&str`).
-    let keys: Arc<Vec<String>> =
-        Arc::new((0..args.keys).map(|i| format!("h:bench:{i}")).collect());
+    let keys: Arc<Vec<String>> = Arc::new((0..args.keys).map(|i| format!("h:bench:{i}")).collect());
 
     eprintln!(
         "redis-bench: replay={}:{} keys={} concurrency={}",

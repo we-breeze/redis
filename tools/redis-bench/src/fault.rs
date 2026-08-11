@@ -57,7 +57,9 @@ impl FaultInjector {
     /// fault injection.
     #[inline]
     fn roll(&self) -> f64 {
-        let mut x = self.counter.fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed);
+        let mut x = self
+            .counter
+            .fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed);
         x ^= x >> 33;
         x = x.wrapping_mul(0xff51afd7ed558ccd);
         x ^= x >> 33;

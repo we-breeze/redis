@@ -11,8 +11,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::cmd::Cmd;
 use super::config::MeshConfig;
+use crate::cmd::Cmd;
 use crate::connection::{ConnectionLike, RedisFuture};
 use crate::error::{RedisError, RedisResult};
 use crate::pipeline::Pipeline;

@@ -10,8 +10,8 @@
 
 #![cfg(feature = "integration-tests")]
 
-use redis::sidecar::{SidecarClient, MeshConfig, MeshRouting};
 use redis::Commands;
+use redis::sidecar::{MeshConfig, MeshRouting, SidecarClient};
 
 fn namespace() -> Option<String> {
     std::env::var("BREEZE_REDIS_NS")
@@ -22,7 +22,9 @@ fn namespace() -> Option<String> {
 async fn connect() -> SidecarClient {
     let ns = namespace().expect("set BREEZE_REDIS_NS to run integration tests");
     let cfg = MeshConfig::new(ns);
-    SidecarClient::from_config(cfg).await.expect("connect to mesh")
+    SidecarClient::from_config(cfg)
+        .await
+        .expect("connect to mesh")
 }
 
 #[tokio::test]

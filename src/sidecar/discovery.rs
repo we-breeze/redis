@@ -264,10 +264,8 @@ mod tests {
             "static.config.api.example.com+3+config+cloud+redis+feed+auto_translate_llm@redis:9470@rs",
         ))
         .unwrap();
-        File::create(dir.join(
-            "dom+3+config+cloud+redis+feed+auto_translate_llm@redis:9471@rs",
-        ))
-        .unwrap();
+        File::create(dir.join("dom+3+config+cloud+redis+feed+auto_translate_llm@redis:9471@rs"))
+            .unwrap();
 
         let all = scan_endpoints(&dir, "feed", "auto_translate_llm", false);
         assert_eq!(all.len(), 2);

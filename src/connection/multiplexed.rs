@@ -22,9 +22,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::connection::{ConnectionLike, RedisFuture};
 use crate::error::{ErrorKind, RedisError, RedisResult};
-use crate::sidecar::discovery::Endpoint;
 use crate::pipeline::Pipeline;
 use crate::resp::parser::{ParseResult, parse_reply};
+use crate::sidecar::discovery::Endpoint;
 use crate::types::Value;
 
 /// Optional per-connection handshake for direct backend access (no mesh):
@@ -105,12 +105,24 @@ impl MultiplexedConnection {
             Endpoint::Tcp(addr) => {
                 let stream = tokio::net::TcpStream::connect(addr).await?;
                 stream.set_nodelay(true).ok();
-                tokio::spawn(drive(stream, rx, alive.clone(), last_reply_ms.clone(), max_inflight));
+                tokio::spawn(drive(
+                    stream,
+                    rx,
+                    alive.clone(),
+                    last_reply_ms.clone(),
+                    max_inflight,
+                ));
                 Some(*addr)
             }
             Endpoint::Unix(path) => {
                 let stream = tokio::net::UnixStream::connect(path).await?;
-                tokio::spawn(drive(stream, rx, alive.clone(), last_reply_ms.clone(), max_inflight));
+                tokio::spawn(drive(
+                    stream,
+                    rx,
+                    alive.clone(),
+                    last_reply_ms.clone(),
+                    max_inflight,
+                ));
                 None
             }
         };
@@ -427,8 +439,7 @@ where
 
     let written = if writer.is_write_vectored() && payloads.len() > 1 {
         // Vectored write: one syscall, no coalescing copy.
-        let mut slices: Vec<IoSlice<'_>> =
-            payloads.iter().map(|p| IoSlice::new(p)).collect();
+        let mut slices: Vec<IoSlice<'_>> = payloads.iter().map(|p| IoSlice::new(p)).collect();
         write_all_vectored(writer, &mut slices).await
     } else {
         let mut iter = payloads.into_iter();
@@ -489,9 +500,7 @@ fn dispatch_replies(read_buf: &mut BytesMut, pending: &mut VecDeque<Pending>) ->
                 // connection doesn't pin a huge buffer (matters at ~1000
                 // namespaces × pool connections per process).
                 const SHRINK_THRESHOLD: usize = 64 * 1024;
-                if read_buf.capacity() > SHRINK_THRESHOLD
-                    && read_buf.len() < SHRINK_THRESHOLD / 2
-                {
+                if read_buf.capacity() > SHRINK_THRESHOLD && read_buf.len() < SHRINK_THRESHOLD / 2 {
                     // No shrink API on BytesMut: swap in a fresh small buffer.
                     let rest = read_buf.split();
                     let mut fresh = BytesMut::with_capacity(4 * 1024);

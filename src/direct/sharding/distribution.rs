@@ -16,9 +16,17 @@ pub enum Distribute {
     /// `modula` / `absmodula`.
     Modula(Modula),
     /// `range[-slot]`: `hash/slot%slot/(slot/shards)`.
-    Range { slot: u64, interval: u64, shards: usize },
+    Range {
+        slot: u64,
+        interval: u64,
+        shards: usize,
+    },
     /// `modrange[-slot]`: `hash%slot/(slot/shards)`.
-    ModRange { slot: u64, interval: u64, shards: usize },
+    ModRange {
+        slot: u64,
+        interval: u64,
+        shards: usize,
+    },
     /// `splitmod[-count]`: `hash/count%count%shards`.
     SplitMod { split_count: u64, shard_count: u64 },
     /// `slotmod[-count]`: `hash%count%shards`.
@@ -143,9 +151,7 @@ impl Distribute {
                 interval,
                 shards,
             } => {
-                let mut val = hash
-                    .wrapping_div(*slot as i64)
-                    .wrapping_rem(*slot as i64);
+                let mut val = hash.wrapping_div(*slot as i64).wrapping_rem(*slot as i64);
                 if val < 0 {
                     tracing::warn!("negative range pre hash: {val}");
                     val = val.wrapping_abs();

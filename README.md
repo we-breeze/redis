@@ -57,7 +57,7 @@ use redis::sidecar::{SidecarClient, MeshConfig, Transport};
 let cfg = MeshConfig::new("my_ns")
     .with_group("prod")
     .with_transport(Transport::Unix)
-    .with_pool_size(16);
+    .with_max_connections(16);
 let client = SidecarClient::from_config(cfg).await?;
 # let _ = client;
 # Ok(())

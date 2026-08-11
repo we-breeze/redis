@@ -15,8 +15,8 @@ use crate::error::RedisResult;
 use crate::pipeline::Pipeline;
 use crate::types::Value;
 
-pub use multiplexed::MultiplexedConnection;
 pub use multiplexed::Handshake;
+pub use multiplexed::MultiplexedConnection;
 
 /// A boxed, `Send` future returned by connection operations. Boxing keeps the
 /// [`ConnectionLike`] trait object-safe and its futures uniformly `Send`.

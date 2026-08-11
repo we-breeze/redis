@@ -39,11 +39,16 @@ pub struct MeshConfig {
     pub transport: Transport,
     /// Directory the mesh publishes sock files / listens in.
     pub socket_dir: PathBuf,
-    /// Maximum live connections in the pool. The pool starts at one
-    /// connection and grows on demand (when every live connection is above
-    /// half its in-flight budget), so this is a cap, not a fixed size —
-    /// important when one process serves ~1000 namespaces.
-    pub pool_size: usize,
+    /// Minimum live connections the pool keeps (warmed at startup and
+    /// maintained by the maintenance task). Set to 0 for a fully lazy pool:
+    /// no connections are pre-created at startup and the first request opens
+    /// one on demand.
+    pub min_connections: usize,
+    /// Maximum live connections in the pool. The pool grows on demand (when
+    /// every live connection is above half its in-flight budget), so this is
+    /// a cap, not a fixed size — important when one process serves ~1000
+    /// namespaces.
+    pub max_connections: usize,
     /// Per-command operation timeout.
     pub op_timeout: Duration,
     /// How long to wait for the mesh endpoint to become connectable.
@@ -80,7 +85,8 @@ impl MeshConfig {
             resource: DEFAULT_RESOURCE.to_string(),
             transport: Transport::Tcp,
             socket_dir: PathBuf::from(DEFAULT_SOCKET_DIR),
-            pool_size: 4,
+            min_connections: 2,
+            max_connections: 15,
             op_timeout: Duration::from_millis(1000),
             connect_wait: Duration::from_secs(10),
             slow_time_threshold: Duration::from_millis(50),
@@ -110,9 +116,16 @@ impl MeshConfig {
         self
     }
 
+    /// Override the minimum number of live pooled connections (0 = fully
+    /// lazy, nothing pre-created at startup).
+    pub fn with_min_connections(mut self, n: usize) -> Self {
+        self.min_connections = n;
+        self
+    }
+
     /// Override the maximum number of live pooled connections.
-    pub fn with_pool_size(mut self, size: usize) -> Self {
-        self.pool_size = size.max(1);
+    pub fn with_max_connections(mut self, n: usize) -> Self {
+        self.max_connections = n.max(1);
         self
     }
 

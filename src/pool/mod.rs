@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 use rand::seq::SliceRandom;
 
 use crate::cmd::cmd;
-use crate::sidecar::config::MeshConfig;
 use crate::connection::{Handshake, MultiplexedConnection};
 use crate::error::{ErrorKind, RedisError, RedisResult};
+use crate::sidecar::config::MeshConfig;
 use crate::sidecar::discovery::{self, Endpoint};
 
 use health::HealthState;
@@ -64,13 +64,9 @@ pub struct Pool {
     last_dns_refresh: Mutex<Instant>,
     /// Single-flight connection creation: getters queue here when no live
     /// connection is available, so a burst creates at most one connection at
-    /// a time and `pool_size` stays a hard cap.
+    /// a time and `max_connections` stays a hard cap.
     connect_lock: tokio::sync::Mutex<()>,
 }
-
-/// Live connections the maintenance task keeps warmed. Beyond this the pool
-/// grows on demand (see [`Pool::get`]), up to `pool_size`.
-const MIN_IDLE: usize = 1;
 
 /// How often a healthy direct pool re-resolves its hostname, so DNS changes
 /// (backend migration/failover) are picked up without waiting for failures.
@@ -120,8 +116,11 @@ impl Pool {
         resolver: Option<String>,
         config: MeshConfig,
     ) -> RedisResult<Arc<Self>> {
-        let min = config.pool_size.max(1) as u32;
-        let max = (config.pool_size as u32 * 4).max(4);
+        // Breaker thresholds follow the pool bounds: min_connections
+        // consecutive failures trigger endpoint re-discovery, max_connections
+        // trip the breaker.
+        let min = config.min_connections.max(1) as u32;
+        let max = config.max_connections.max(1) as u32;
         let pool = Arc::new(Pool {
             endpoint: RwLock::new(endpoint),
             direct_ips: RwLock::new(direct_ips),
@@ -154,9 +153,9 @@ impl Pool {
 
     /// Get a usable connection.
     ///
-    /// The pool starts at [`MIN_IDLE`] connections and grows on demand: when
+    /// The pool starts at `min_connections` connections and grows on demand: when
     /// every live connection is above half its in-flight budget a new one is
-    /// opened, up to the hard cap of `pool_size`. Creation is single-flight
+    /// opened, up to the hard cap of `max_connections`. Creation is single-flight
     /// (`connect_lock`), so a concurrent burst cannot overshoot the cap.
     pub async fn get(&self) -> RedisResult<MultiplexedConnection> {
         if !self.health.can_serve() {
@@ -221,7 +220,12 @@ impl Pool {
 
     /// The hard cap on live connections.
     fn max_conns(&self) -> usize {
-        self.config.pool_size.max(MIN_IDLE)
+        self.config.max_connections.max(1)
+    }
+
+    /// Connections to keep warm (0 = fully lazy pool).
+    fn min_connections(&self) -> usize {
+        self.config.min_connections
     }
 
     /// A live connection with headroom, if one exists. "Headroom" means its
@@ -328,17 +332,22 @@ impl Pool {
     }
 
     async fn warm_up(&self) -> RedisResult<()> {
-        // Lazy start: open only MIN_IDLE connections; the pool grows on
-        // demand via `get`. This keeps process startup cheap when many
-        // namespaces are configured.
-        if let Ok(conn) = self.create_conn().await {
-            self.conns.write().unwrap().push(conn);
-        } else {
-            tracing::warn!(
-                target: "redis::pool",
-                endpoint = %self.endpoint(),
-                "warm-up connection failed"
-            );
+        // Warm the configured minimum; the pool grows on demand via `get`.
+        // min_connections == 0 means a fully lazy start: nothing is created
+        // and an unreachable backend does not fail `connect`.
+        for _ in 0..self.config.min_connections {
+            match self.create_conn().await {
+                Ok(conn) => self.conns.write().unwrap().push(conn),
+                Err(err) => tracing::warn!(
+                    target: "redis::pool",
+                    endpoint = %self.endpoint(),
+                    error = %err,
+                    "warm-up connection failed"
+                ),
+            }
+        }
+        if self.config.min_connections == 0 {
+            return Ok(());
         }
         if self.live_count() == 0 {
             return Err(unavailable());
@@ -550,7 +559,7 @@ fn unavailable() -> RedisError {
 }
 
 /// Background maintenance: drop dead connections, probe recovery when
-/// unhealthy, and keep [`MIN_IDLE`] live connections. Healthy pools patrol on
+/// unhealthy, and keep `min_connections` live connections. Healthy pools patrol on
 /// a slow cadence; unhealthy pools probe every second for fast recovery.
 /// Stops when the pool is dropped (weak upgrade fails).
 fn spawn_maintenance(weak: Weak<Pool>) {
@@ -578,7 +587,7 @@ fn spawn_maintenance(weak: Weak<Pool>) {
                 } else {
                     pool.maybe_refresh_dns().await;
                     pool.rebalance_ips();
-                    while pool.live_count() < MIN_IDLE {
+                    while pool.live_count() < pool.min_connections() {
                         match pool.create_conn().await {
                             Ok(conn) => pool.conns.write().unwrap().push(conn),
                             Err(_) => break,
@@ -607,9 +616,10 @@ mod tests {
         addr
     }
 
-    fn test_config(pool_size: usize) -> MeshConfig {
+    fn test_config(max_connections: usize) -> MeshConfig {
         let mut config = MeshConfig::new("test");
-        config.pool_size = pool_size;
+        config.min_connections = 1;
+        config.max_connections = max_connections;
         config
     }
 
@@ -620,6 +630,34 @@ mod tests {
             let conn = pool.create_conn().await.unwrap();
             pool.conns.write().unwrap().push(conn);
         }
+    }
+
+    #[tokio::test]
+    async fn min_connections_zero_starts_fully_lazy() {
+        // Nothing listens on 127.0.0.1:1; with min_connections = 0 the pool
+        // starts successfully anyway and holds no connections.
+        let mut config = test_config(4);
+        config.min_connections = 0;
+        let pool = Pool::connect_direct(
+            vec!["127.0.0.1:1".parse().unwrap()],
+            None,
+            None,
+            config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pool.live_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn min_connections_warms_at_startup() {
+        let a = fake_listener().await;
+        let mut config = test_config(4);
+        config.min_connections = 3;
+        let pool = Pool::connect_direct(vec![a], None, None, config)
+            .await
+            .unwrap();
+        assert_eq!(pool.live_count(), 3);
     }
 
     #[tokio::test]

@@ -39,16 +39,24 @@ pub enum Hasher {
     /// mc short crc32.
     Crc32Short,
     /// crc32 over digits starting at `start_pos`.
-    Crc32Num { start_pos: usize },
+    Crc32Num {
+        start_pos: usize,
+    },
     /// crc32 over the first digit run of length >= 5.
     Crc32SmartNum,
     /// crc32 over all digits concatenated.
     Crc32MixNum,
     /// crc32 over `key[start_pos..]` up to `delimiter`.
-    Crc32Delimiter { start_pos: usize, delimiter: u8 },
+    Crc32Delimiter {
+        start_pos: usize,
+        delimiter: u8,
+    },
     /// reference-library `Util.crc32()` compatible (i32 abs).
     Crc32local,
-    Crc32localDelimiter { start_pos: usize, delimiter: u8 },
+    Crc32localDelimiter {
+        start_pos: usize,
+        delimiter: u8,
+    },
     Crc32localSmartNum,
     /// `Util.crc32(Longs.toByteArray(id))` compatible.
     LBCrc32localDelimiter,
@@ -56,12 +64,17 @@ pub enum Hasher {
     Rawcrc32local,
     /// i32-based crc32 then abs.
     Crc32Abs,
-    Crc32AbsDelimiter { start_pos: usize, delimiter: u8 },
+    Crc32AbsDelimiter {
+        start_pos: usize,
+        delimiter: u8,
+    },
     Crc64,
     Fnv1aF64,
     Random,
     /// digits after a single delimiter, verbatim.
-    RawSuffix { delimiter: u8 },
+    RawSuffix {
+        delimiter: u8,
+    },
     Fnv1F32,
 }
 
@@ -582,10 +595,7 @@ mod tests {
         );
         assert_eq!(Hasher::from("rawsuffix-point").hash(b"abc.789"), 789);
         assert_eq!(Hasher::from("bkdrsub").hash(b"abc#123_456"), 847490);
-        assert_eq!(
-            Hasher::from("rawcrc32local").hash(b"12345_xx"),
-            12345
-        );
+        assert_eq!(Hasher::from("rawcrc32local").hash(b"12345_xx"), 12345);
         assert_eq!(
             Hasher::from("lbcrc32local").hash(b"12345"),
             crc32local(&12345u64.to_be_bytes())
