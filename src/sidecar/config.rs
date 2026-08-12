@@ -86,7 +86,7 @@ impl MeshConfig {
             transport: Transport::Tcp,
             socket_dir: PathBuf::from(DEFAULT_SOCKET_DIR),
             min_connections: 2,
-            max_connections: 15,
+            max_connections: 16,
             op_timeout: Duration::from_millis(1000),
             connect_wait: Duration::from_secs(10),
             slow_time_threshold: Duration::from_millis(50),

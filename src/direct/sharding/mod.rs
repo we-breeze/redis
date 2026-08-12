@@ -15,6 +15,7 @@ pub mod distribution;
 pub mod hash;
 
 pub use distribution::Distribute;
+pub use distribution::{DBRange, Padding};
 pub use hash::Hasher;
 
 /// A resolved client-side sharding plan: hash algorithm + slot distribution.

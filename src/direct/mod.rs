@@ -111,7 +111,7 @@ impl ServerConfig {
             auth: None,
             read_only: false,
             min_connections: 2,
-            max_connections: 15,
+            max_connections: 16,
             max_inflight: 4096,
             op_timeout: Duration::from_millis(500),
             slow_time_threshold: Duration::from_millis(50),

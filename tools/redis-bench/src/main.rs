@@ -98,7 +98,7 @@ struct Args {
     min_conns: usize,
 
     /// Maximum live pooled connections (mesh client or direct).
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = 16)]
     max_conns: usize,
 
     /// Per-connection in-flight request budget.

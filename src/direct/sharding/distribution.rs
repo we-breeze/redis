@@ -5,6 +5,78 @@
 use std::collections::BTreeMap;
 use std::ops::Bound::Included;
 
+/// `DBRange` — db/table two-level distribution for sharded resources that
+/// map a hash onto (db, table). Ported 1:1 from breeze
+/// `sharding/src/distribution/dbrange.rs`.
+#[derive(Debug, Clone, Default)]
+pub struct DBRange {
+    table_count: usize, // tables per db
+    slot: usize,        // total tables: db_count * table_count
+    db_per_shard: usize,
+}
+
+impl DBRange {
+    pub fn new(db_count: usize, table_count: usize, shards: usize) -> Self {
+        DBRange {
+            table_count,
+            slot: db_count * table_count,
+            db_per_shard: db_count / shards,
+        }
+    }
+
+    /// Shard index: `hash_abs / slot % slot / table_count / db_per_shard`.
+    pub fn index(&self, hash: i64) -> usize {
+        let hash_abs = if hash > 0 {
+            hash as usize
+        } else {
+            hash.unsigned_abs() as usize
+        };
+        hash_abs
+            .wrapping_div(self.slot)
+            .wrapping_rem(self.slot)
+            .wrapping_div(self.table_count)
+            .wrapping_div(self.db_per_shard)
+    }
+
+    /// Db index: `hash_abs / slot % slot / table_count`.
+    pub fn db_idx(&self, hash: i64) -> usize {
+        let hash_abs = if hash > 0 {
+            hash as usize
+        } else {
+            hash.unsigned_abs() as usize
+        };
+        hash_abs
+            .wrapping_div(self.slot)
+            .wrapping_rem(self.slot)
+            .wrapping_div(self.table_count)
+    }
+
+    /// Table index: `hash_abs / slot % slot % table_count`.
+    pub fn table_idx(&self, hash: i64) -> usize {
+        let hash_abs = if hash > 0 {
+            hash as usize
+        } else {
+            hash.unsigned_abs() as usize
+        };
+        hash_abs
+            .wrapping_div(self.slot)
+            .wrapping_rem(self.slot)
+            .wrapping_rem(self.table_count)
+    }
+}
+
+/// `Padding` — placeholder distribution for framework compatibility; always
+/// returns 1 and should never be used for real traffic (same as breeze).
+#[derive(Debug, Clone, Default)]
+pub struct Padding;
+
+impl Padding {
+    pub fn index(&self, hash: i64) -> usize {
+        tracing::warn!("careful - should not padding dist with {hash}");
+        1
+    }
+}
+
 /// Default slot count for `range`/`modrange` (the mesh's "hash-gen" concept).
 const DIST_RANGE_SLOT_COUNT_DEFAULT: u64 = 256;
 
@@ -295,5 +367,19 @@ mod tests {
         {
             assert_eq!(d.index(9), 9 / 4 % 4);
         }
+    }
+
+    #[test]
+    fn dbrange_indices() {
+        // 4 db x 8 tables x 2 shards: slot=32, db_per_shard=2.
+        let d = DBRange::new(4, 8, 2);
+        for h in [0i64, 1, 31, 32, 33, 123456789] {
+            assert!(d.index(h) < 2);
+            assert!(d.db_idx(h) < 4);
+            assert!(d.table_idx(h) < 8);
+            // index == db_idx / db_per_shard
+            assert_eq!(d.index(h), d.db_idx(h) / 2);
+        }
+        assert_eq!(Padding.index(7), 1);
     }
 }
