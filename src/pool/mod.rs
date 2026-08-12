@@ -66,6 +66,11 @@ pub struct Pool {
     /// connection is available, so a burst creates at most one connection at
     /// a time and `max_connections` stays a hard cap.
     connect_lock: tokio::sync::Mutex<()>,
+    /// Wakes the maintenance task immediately when the health state changes
+    /// (breaker trip), so recovery probing starts at once instead of waiting
+    /// out the long healthy patrol sleep. `Arc` so the maintenance loop can
+    /// await it without holding the pool alive.
+    state_changed: Arc<tokio::sync::Notify>,
 }
 
 /// How often a healthy direct pool re-resolves its hostname, so DNS changes
@@ -134,6 +139,7 @@ impl Pool {
             resolver,
             last_dns_refresh: Mutex::new(Instant::now()),
             connect_lock: tokio::sync::Mutex::new(()),
+            state_changed: Arc::new(tokio::sync::Notify::new()),
         });
         pool.warm_up().await?;
         spawn_maintenance(Arc::downgrade(&pool));
@@ -252,6 +258,9 @@ impl Pool {
         self.evict_dead();
         let outcome = self.health.on_failure();
         if outcome.tripped {
+            // Wake the maintenance task now; it may be in a long healthy
+            // patrol sleep, and probing is the only recovery path.
+            self.state_changed.notify_one();
             tracing::warn!(
                 target: "redis::pool",
                 endpoint = %self.endpoint(),
@@ -359,6 +368,11 @@ impl Pool {
     /// restarted on a new port while the breaker was open), then open one
     /// fresh connection and PING it with a timeout.
     async fn probe(&self) {
+        tracing::debug!(
+            target: "redis::pool",
+            endpoint = %self.endpoint(),
+            "recovery probe start"
+        );
         self.refresh_endpoint().await;
         if let Ok(conn) = self.create_conn().await
             && tokio::time::timeout(self.config.op_timeout, cmd("PING").exec_async(&conn))
@@ -372,7 +386,13 @@ impl Pool {
                 endpoint = %self.endpoint(),
                 "recovery probe succeeded; mesh healthy again"
             );
+            return;
         }
+        tracing::debug!(
+            target: "redis::pool",
+            endpoint = %self.endpoint(),
+            "recovery probe failed"
+        );
     }
 
     /// Re-resolve the mesh endpoint from the sock directory. If the mesh has
@@ -575,11 +595,22 @@ fn spawn_maintenance(weak: Weak<Pool>) {
             } else {
                 pool.config.unhealthy_probe_interval
             };
+            let state_changed = pool.state_changed.clone();
             drop(pool);
-            tokio::time::sleep(tick).await;
+            // Sleep until the next tick OR a health-state change (breaker
+            // trip) wakes us to start probing immediately.
+            tokio::select! {
+                _ = tokio::time::sleep(tick) => {}
+                _ = state_changed.notified() => {}
+            }
             let Some(pool) = weak.upgrade() else {
                 return;
             };
+            tracing::debug!(
+                target: "redis::pool",
+                healthy = pool.health.is_healthy(),
+                "maintenance tick"
+            );
             pool.evict_dead();
             if pool.health.is_kept() {
                 if !pool.health.is_healthy() {
@@ -611,6 +642,34 @@ mod tests {
             let mut held = Vec::new();
             while let Ok((socket, _)) = listener.accept().await {
                 held.push(socket); // keep the connection open
+            }
+        });
+        addr
+    }
+
+    /// A listener that answers every command with `+OK`.
+    async fn ok_listener() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                            .await
+                            .unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        if tokio::io::AsyncWriteExt::write_all(&mut socket, b"+OK\r\n")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
             }
         });
         addr
@@ -653,6 +712,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pool.live_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn breaker_trip_wakes_maintenance_for_fast_recovery() {
+        let addr = ok_listener().await;
+        let mut config = test_config(4);
+        // A long healthy patrol: without the trip wake-up, recovery would
+        // wait this whole interval.
+        config.healthy_patrol_interval = Duration::from_secs(3600);
+        config.unhealthy_probe_interval = Duration::from_millis(50);
+        let pool = Pool::connect_direct(vec![addr], None, None, config)
+            .await
+            .unwrap();
+        assert!(pool.can_serve());
+        // Trip the breaker (threshold = max_connections = 4).
+        for _ in 0..4 {
+            pool.note_failure();
+        }
+        assert!(!pool.can_serve());
+        // The trip notifies the maintenance task, which probes (backend is
+        // healthy) and closes the breaker well within a second.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pool.can_serve() {
+            assert!(Instant::now() < deadline, "pool did not recover in time");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

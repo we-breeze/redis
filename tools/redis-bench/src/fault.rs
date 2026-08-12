@@ -30,15 +30,37 @@ pub struct FaultInjector {
     slow: Duration,
     timeout_rate: f64,
     timeout: Duration,
+    /// Per-frame probability of killing the connection right after
+    /// forwarding it (models a reset by LB/kernel/proxy).
+    reset_rate: f64,
+    /// Periodic full blackhole window (models an outage / deploy window):
+    /// while open, every frame is held until the window closes.
+    outage: Duration,
+    outage_interval: Duration,
+    /// Next outage start (millis since epoch); 0 = schedule on first use.
+    outage_next_ms: AtomicU64,
+    /// Current outage end (millis since epoch); 0 = no outage open.
+    outage_until_ms: AtomicU64,
     counter: AtomicU64,
     slow_injected: AtomicU64,
     timeout_injected: AtomicU64,
+    reset_injected: AtomicU64,
+    outage_injected: AtomicU64,
 }
 
 impl FaultInjector {
     /// `None` when both rates are zero (no injection, zero overhead).
-    pub fn new(slow_rate: f64, slow_ms: u64, timeout_rate: f64, timeout_ms: u64) -> Option<Self> {
-        if slow_rate <= 0.0 && timeout_rate <= 0.0 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        slow_rate: f64,
+        slow_ms: u64,
+        timeout_rate: f64,
+        timeout_ms: u64,
+        reset_rate: f64,
+        outage_ms: u64,
+        outage_interval_ms: u64,
+    ) -> Option<Self> {
+        if slow_rate <= 0.0 && timeout_rate <= 0.0 && reset_rate <= 0.0 && outage_ms == 0 {
             return None;
         }
         Some(FaultInjector {
@@ -46,9 +68,16 @@ impl FaultInjector {
             slow: Duration::from_millis(slow_ms),
             timeout_rate,
             timeout: Duration::from_millis(timeout_ms),
+            reset_rate,
+            outage: Duration::from_millis(outage_ms),
+            outage_interval: Duration::from_millis(outage_interval_ms.max(1)),
+            outage_next_ms: AtomicU64::new(0),
+            outage_until_ms: AtomicU64::new(0),
             counter: AtomicU64::new(0x243F6A8885A308D3),
             slow_injected: AtomicU64::new(0),
             timeout_injected: AtomicU64::new(0),
+            reset_injected: AtomicU64::new(0),
+            outage_injected: AtomicU64::new(0),
         })
     }
 
@@ -66,8 +95,14 @@ impl FaultInjector {
         (x >> 40) as f64 / (1u64 << 24) as f64
     }
 
-    /// Sleep according to the dice. Timeout takes precedence over slow.
+    /// Sleep according to the dice. An open outage window takes precedence
+    /// (everything is held), then timeout, then slow.
     pub async fn maybe_delay(&self) {
+        if let Some(remaining) = self.outage_remaining() {
+            self.outage_injected.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(remaining).await;
+            return;
+        }
         let r = self.roll();
         if r < self.timeout_rate {
             self.timeout_injected.fetch_add(1, Ordering::Relaxed);
@@ -78,11 +113,51 @@ impl FaultInjector {
         }
     }
 
-    /// (slow, timeout) injection counts so far.
-    pub fn counts(&self) -> (u64, u64) {
+    /// Whether to kill the connection after this frame (post-forward roll).
+    pub fn should_reset(&self) -> bool {
+        self.reset_rate > 0.0 && {
+            let hit = self.roll() < self.reset_rate;
+            if hit {
+                self.reset_injected.fetch_add(1, Ordering::Relaxed);
+            }
+            hit
+        }
+    }
+
+    /// If an outage window is currently open, how long until it closes.
+    /// Also advances the schedule when a new window is due.
+    fn outage_remaining(&self) -> Option<Duration> {
+        if self.outage.is_zero() {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let until = self.outage_until_ms.load(Ordering::Acquire);
+        if now < until {
+            return Some(Duration::from_millis(until - now));
+        }
+        let next = self.outage_next_ms.load(Ordering::Acquire);
+        if now >= next {
+            // Open a new window and schedule the next one. Racy updates are
+            // fine for fault injection.
+            let new_until = now + self.outage.as_millis() as u64;
+            self.outage_until_ms.store(new_until, Ordering::Release);
+            self.outage_next_ms
+                .store(now + self.outage_interval.as_millis() as u64, Ordering::Release);
+            return Some(self.outage);
+        }
+        None
+    }
+
+    /// (slow, timeout, reset, outage) injection counts so far.
+    pub fn counts(&self) -> (u64, u64, u64, u64) {
         (
             self.slow_injected.load(Ordering::Relaxed),
             self.timeout_injected.load(Ordering::Relaxed),
+            self.reset_injected.load(Ordering::Relaxed),
+            self.outage_injected.load(Ordering::Relaxed),
         )
     }
 }
@@ -153,6 +228,11 @@ async fn forward(inbound: TcpStream, target: std::net::SocketAddr, injector: Arc
                 downstream.abort();
                 return;
             }
+            if injector.should_reset() {
+                // Simulate a connection reset: drop both sides.
+                downstream.abort();
+                return;
+            }
         }
     }
     downstream.abort();
@@ -206,7 +286,7 @@ mod tests {
             eprintln!("skip: REDIS_BENCH_PROXY_TEST_ADDR not set");
             return;
         };
-        let injector = Arc::new(FaultInjector::new(0.000001, 1, 0.0, 0).unwrap());
+        let injector = Arc::new(FaultInjector::new(0.000001, 1, 0.0, 0, 0.0, 0, 0).unwrap());
         let target_addr: std::net::SocketAddr = target.parse().unwrap();
         let proxy = start_proxy(target_addr, injector).await.unwrap();
 
@@ -243,7 +323,7 @@ mod tests {
             eprintln!("skip: REDIS_BENCH_PROXY_TEST_ADDR not set");
             return;
         };
-        let injector = Arc::new(FaultInjector::new(0.001, 5, 0.001, 50).unwrap());
+        let injector = Arc::new(FaultInjector::new(0.001, 5, 0.001, 50, 0.0, 0, 0).unwrap());
         let proxy = start_proxy(target.parse().unwrap(), injector)
             .await
             .unwrap();

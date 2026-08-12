@@ -170,6 +170,30 @@ struct Args {
     #[arg(long, default_value_t = 5000)]
     timeout_ms: u64,
 
+    /// Fraction of frames after which the proxy kills the connection
+    /// (simulated resets: LB/proxy/mesh restart).
+    #[arg(long, default_value_t = 0.0)]
+    reset_rate: f64,
+
+    /// Full-blackhole outage window length, in milliseconds (0 = off).
+    /// While open, every frame is held until the window closes — models a
+    /// backend outage or deploy window.
+    #[arg(long, default_value_t = 0)]
+    outage_ms: u64,
+
+    /// Interval between outage windows, in milliseconds.
+    #[arg(long, default_value_t = 30000)]
+    outage_interval_ms: u64,
+
+    /// Fraction of operations preceded by a client-side CPU stall
+    /// (simulated SDK-process CPU overload / GC pause).
+    #[arg(long, default_value_t = 0.0)]
+    cpu_stall_rate: f64,
+
+    /// Length of the client-side CPU stall, in milliseconds.
+    #[arg(long, default_value_t = 20)]
+    cpu_stall_ms: u64,
+
     /// Workload to run.
     #[arg(value_enum, default_value_t = WorkloadKindArg::Hget)]
     workload: WorkloadKindArg,
@@ -225,6 +249,9 @@ async fn run(mut args: Args) -> i32 {
         args.slow_ms,
         args.timeout_rate,
         args.timeout_ms,
+        args.reset_rate,
+        args.outage_ms,
+        args.outage_interval_ms,
     )
     .map(Arc::new);
     if let Some(injector) = &injector {
@@ -283,6 +310,14 @@ async fn run(mut args: Args) -> i32 {
         return 2;
     }
 
+    // Verify the seeded key/field/value correspondence before measuring, so
+    // a bad seed can't silently skew the run.
+    eprintln!("verifying seeded data...");
+    if let Err(e) = verify_seeds(&client, &pool).await {
+        eprintln!("error: seed verification failed: {e}");
+        return 2;
+    }
+
     let runner = Arc::from(workload.runner(pool, args.verify));
     eprintln!("warming up ({} ops/worker)...", args.warmup);
     warmup(&client, &runner, args.concurrency, args.warmup).await;
@@ -295,10 +330,10 @@ async fn run(mut args: Args) -> i32 {
 
     eprintln!("running...");
     let mem_before = brz_mem::heap();
-    let (summary, elapsed) = measured_run(&client, &runner, args.concurrency, mode).await;
+    let (summary, elapsed) = measured_run(&client, &runner, args.concurrency, mode, args.cpu_stall_rate, args.cpu_stall_ms).await;
     if let Some(injector) = &injector {
-        let (slow, timeout) = injector.counts();
-        eprintln!("fault injection: slow={slow} timeout={timeout} injected");
+        let (slow, timeout, reset, outage) = injector.counts();
+        eprintln!("fault injection: slow={slow} timeout={timeout} reset={reset} outage={outage} injected");
     }
     finish(&summary, elapsed, mem_before, &args)
 }
@@ -591,6 +626,8 @@ async fn measured_run(
     runner: &Arc<dyn Workload>,
     concurrency: usize,
     mode: RunMode,
+    cpu_stall_rate: f64,
+    cpu_stall_ms: u64,
 ) -> (Summary, Duration) {
     let budget = Arc::new(OpBudget::new(match &mode {
         RunMode::Count(n) => *n,
@@ -612,6 +649,7 @@ async fn measured_run(
         handles.push(tokio::spawn(async move {
             let mut local = WorkerStats::new();
             let mut op = (w as u64) * 1_000_000;
+            let mut rng = (w as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15);
             loop {
                 if let Some(dl) = deadline
                     && Instant::now() >= dl
@@ -621,6 +659,20 @@ async fn measured_run(
                 if bounded && !budget.try_claim() {
                     break;
                 }
+                // Simulated SDK-side CPU overload: burn CPU on this worker
+                // thread before issuing the op (GC pause / scheduling delay).
+                if cpu_stall_rate > 0.0 {
+                    rng ^= rng >> 33;
+                    rng = rng.wrapping_mul(0xff51afd7ed558ccd);
+                    rng ^= rng >> 33;
+                    if (rng >> 40) as f64 / (1u64 << 24) as f64 <= cpu_stall_rate {
+                        let deadline =
+                            Instant::now() + Duration::from_millis(cpu_stall_ms);
+                        while Instant::now() < deadline {
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
                 let t = Instant::now();
                 let ok = runner.run(&*client, op).await;
                 let elapsed = t.elapsed();
@@ -628,6 +680,10 @@ async fn measured_run(
                     local.record(elapsed);
                 } else {
                     local.record_error();
+                    // Fast-fail loops (breaker open) complete without ever
+                    // yielding; yield so timers/maintenance can run, like a
+                    // real app that does other work between calls.
+                    tokio::task::yield_now().await;
                 }
                 op += 1;
             }
@@ -642,6 +698,70 @@ async fn measured_run(
         }
     }
     (summary, start.elapsed())
+}
+
+/// Full pre-bench data check: HMGET every key and verify each field's value
+/// carries the expected `field || key` prefix (see [`driver::seeded_value`]).
+/// Any mismatch aborts the run.
+async fn verify_seeds(
+    client: &Arc<dyn ConnectionLike>,
+    pool: &Arc<driver::Pool>,
+) -> Result<(), String> {
+    use redis::Commands;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let next = Arc::new(AtomicUsize::new(0));
+    let mismatches = Arc::new(AtomicUsize::new(0));
+    let total = pool.keys().len();
+    let workers = 8.min(total.max(1));
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let client = client.clone();
+        let pool = pool.clone();
+        let next = next.clone();
+        let mismatches = mismatches.clone();
+        handles.push(tokio::spawn(async move {
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= total {
+                    break;
+                }
+                let key = pool.key(i);
+                let result: redis::RedisResult<Vec<redis::types::Value>> =
+                    client.hmget(key, driver::FIELDS).await;
+                match result {
+                    Ok(values)
+                        if values.len() == driver::FIELDS.len()
+                            && values.iter().zip(driver::FIELDS.iter()).all(
+                                |(value, field)| {
+                                    driver::expected_value_matches(field, key, value)
+                                },
+                            ) => {}
+                    Ok(values) => {
+                        let prior = mismatches.fetch_add(1, Ordering::Relaxed);
+                        if prior == 0 {
+                            eprintln!("seed mismatch at key index {i}: got {values:?}");
+                        }
+                    }
+                    Err(e) => {
+                        let prior = mismatches.fetch_add(1, Ordering::Relaxed);
+                        if prior == 0 {
+                            eprintln!("seed check failed at key index {i}: {e}");
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    let bad = mismatches.load(Ordering::Relaxed);
+    if bad > 0 {
+        return Err(format!("{bad}/{total} keys failed verification"));
+    }
+    eprintln!("seed data verified: {total} keys x {} fields", driver::FIELDS.len());
+    Ok(())
 }
 
 /// Print the result table.
@@ -765,6 +885,18 @@ async fn run_replay(args: Args, injector: Option<Arc<FaultInjector>>) -> i32 {
                 }
             }
         }
+        // Verify the seeded key/value correspondence before measuring.
+        for (i, key) in keys.iter().enumerate() {
+            use redis::Commands as _;
+            match seeder.hget::<String>(key, FIELD).await {
+                Ok(v) if v == i.to_string() => {}
+                other => {
+                    eprintln!("error: seed verification failed at {key}: {other:?}");
+                    return 2;
+                }
+            }
+        }
+        eprintln!("seed data verified: {} keys x 1 field", keys.len());
     }
 
     let mode = if args.ops > 0 {
@@ -844,8 +976,8 @@ async fn run_replay(args: Args, injector: Option<Arc<FaultInjector>>) -> i32 {
         }
     }
     if let Some(injector) = &injector {
-        let (slow, timeout) = injector.counts();
-        eprintln!("fault injection: slow={slow} timeout={timeout} injected");
+        let (slow, timeout, reset, outage) = injector.counts();
+        eprintln!("fault injection: slow={slow} timeout={timeout} reset={reset} outage={outage} injected");
     }
     finish(&summary, start.elapsed(), mem_before, &args)
 }
