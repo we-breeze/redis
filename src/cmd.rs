@@ -92,9 +92,9 @@ impl Cmd {
 
     /// The `i`th RESP argument, if present.
     pub fn arg_at(&self, index: usize) -> Option<&[u8]> {
-        self.spans.get(index).map(|&(start, len)| {
-            &self.buf[start as usize..start as usize + len as usize]
-        })
+        self.spans
+            .get(index)
+            .map(|&(start, len)| &self.buf[start as usize..start as usize + len as usize])
     }
 
     /// The command verb (first argument) as a UTF-8 string, for logging and

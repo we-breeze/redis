@@ -638,14 +638,9 @@ mod tests {
         // starts successfully anyway and holds no connections.
         let mut config = test_config(4);
         config.min_connections = 0;
-        let pool = Pool::connect_direct(
-            vec!["127.0.0.1:1".parse().unwrap()],
-            None,
-            None,
-            config,
-        )
-        .await
-        .unwrap();
+        let pool = Pool::connect_direct(vec!["127.0.0.1:1".parse().unwrap()], None, None, config)
+            .await
+            .unwrap();
         assert_eq!(pool.live_count(), 0);
     }
 

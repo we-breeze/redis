@@ -142,7 +142,12 @@ mod tests {
                 assert_eq!(cmds[0].name(), HASHKEYQ);
                 assert_eq!(cmds[0].arg_at(1).unwrap(), b"uid:1");
                 assert_eq!(cmds[1].name(), "GET");
-                Box::pin(async { Ok(vec![Value::Okay, Value::BulkString(Bytes::from_static(b"v"))]) })
+                Box::pin(async {
+                    Ok(vec![
+                        Value::Okay,
+                        Value::BulkString(Bytes::from_static(b"v")),
+                    ])
+                })
             }
         }
 

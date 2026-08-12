@@ -336,7 +336,10 @@ mod tests {
         let (v, consumed) = parse(b"*2\r\n:1\r\n$2\r\nhi\r\n");
         assert_eq!(
             v,
-            Value::Array(vec![Value::Int(1), Value::BulkString(Bytes::from_static(b"hi"))])
+            Value::Array(vec![
+                Value::Int(1),
+                Value::BulkString(Bytes::from_static(b"hi"))
+            ])
         );
         assert_eq!(consumed, 16);
         assert_eq!(parse(b"*-1\r\n").0, Value::Nil);
@@ -370,7 +373,10 @@ mod tests {
             parse_reply(&Bytes::from_static(b"*2\r\n:1\r\n")).unwrap(),
             ParseResult::Incomplete
         ));
-        assert!(matches!(parse_reply(&Bytes::from_static(b"")).unwrap(), ParseResult::Incomplete));
+        assert!(matches!(
+            parse_reply(&Bytes::from_static(b"")).unwrap(),
+            ParseResult::Incomplete
+        ));
     }
 
     #[test]
@@ -381,7 +387,10 @@ mod tests {
         assert_eq!(parse(b"_\r\n").0, Value::Nil);
         assert_eq!(
             parse(b"%1\r\n$1\r\na\r\n:1\r\n").0,
-            Value::Map(vec![(Value::BulkString(Bytes::from_static(b"a")), Value::Int(1))])
+            Value::Map(vec![(
+                Value::BulkString(Bytes::from_static(b"a")),
+                Value::Int(1)
+            )])
         );
     }
 }

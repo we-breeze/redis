@@ -244,7 +244,9 @@ mod tests {
             return;
         };
         let injector = Arc::new(FaultInjector::new(0.001, 5, 0.001, 50).unwrap());
-        let proxy = start_proxy(target.parse().unwrap(), injector).await.unwrap();
+        let proxy = start_proxy(target.parse().unwrap(), injector)
+            .await
+            .unwrap();
 
         // Churn: open, send one command, close — 500 times.
         for _ in 0..500 {
