@@ -1,28 +1,31 @@
-//! Hash and distribution algorithms for client-side backend sharding.
-//!
-//! Faithful port of the breeze mesh's `sharding` crate
-//! (`github.com/examplecom/breeze`, `sharding/src/{hash,distribution}`), so an
-//! SDK accessing backends directly computes **the same shard index as the
-//! mesh** for a given `(hash, distribution)` configuration. Keys are plain
-//! `&[u8]`; logging goes through `tracing`; `enum_dispatch` is replaced by
-//! plain enum dispatch.
-//!
-//! Names come from the resource configuration, e.g. hash `crc32-underscore`,
-//! distribution `modula`, `absmodula`, `ketama`, `range-256`, `modrange`,
-//! `slotmod-1024`, `splitmod-32`, `secmod`.
+// 本目录为 breeze sharding 的原样复制(vendored),风格类告警不参与
+// 主 crate 的 lint 标准。
+#![allow(clippy::all)]
+
+// #[derive(Debug, Clone)]
+// pub struct Sharding {
+//     hash: Hasher,
+//     distribution: Distribute,
+//     num: usize,
+// }
+
+pub mod hash;
+use hash::*;
 
 pub mod distribution;
-pub mod hash;
-
 pub use distribution::Distribute;
-pub use distribution::{DBRange, Padding};
 pub use hash::Hasher;
 
+#[cfg(test)]
+mod tests;
+
+
 /// A resolved client-side sharding plan: hash algorithm + slot distribution.
+/// (SDK 侧补充的薄封装,便于按 key 直接取分片。)
 #[derive(Clone, Debug)]
 pub struct Sharding {
     hasher: Hasher,
-    distribute: Distribute,
+    distribute: distribution::Distribute,
 }
 
 impl Sharding {
@@ -38,12 +41,48 @@ impl Sharding {
     /// The shard index for `key`.
     #[inline]
     pub fn shard_idx(&self, key: &[u8]) -> usize {
-        self.distribute.index(self.hasher.hash(key))
+        self.distribute.index(self.hasher.hash(&key))
     }
 
-    /// The raw hash of `key` (e.g. for `hash_range` membership checks).
+    /// The raw hash of `key`.
     #[inline]
     pub fn hash(&self, key: &[u8]) -> i64 {
-        self.hasher.hash(key)
+        self.hasher.hash(&key)
     }
 }
+
+// use distribution::*;
+
+// use std::ops::Deref;
+
+// impl Sharding {
+// dead code 暂时注释掉
+// pub fn from(hash_alg: &str, distribution: &str, names: Vec<String>) -> Self {
+//     let num = names.len();
+//     let h = Hasher::from(hash_alg);
+//     let d = Distribute::from(distribution, &names);
+//     Self {
+//         hash: h,
+//         distribution: d,
+//         num: num,
+//     }
+// }
+// #[inline]
+// pub fn sharding(&self, key: &[u8]) -> usize {
+//     let hash = self.hash.hash(&key);
+//     let idx = self.distribution.index(hash);
+//     assert!(idx < self.num);
+//     idx
+// }
+// // key: sharding idx
+// // value: 是keys idx列表
+// #[inline]
+// pub fn shardings<K: Deref<Target = [u8]>>(&self, keys: Vec<K>) -> Vec<Vec<usize>> {
+//     let mut shards = vec![Vec::with_capacity(8); self.num];
+//     for (ki, key) in keys.iter().enumerate() {
+//         let idx = self.sharding(key);
+//         unsafe { shards.get_unchecked_mut(idx).push(ki) };
+//     }
+//     shards
+// }
+// }

@@ -1,3 +1,20 @@
+#[derive(Debug, Default, Clone)]
+pub struct Crc64;
+
+/// Crc64 基于u64计算，hash可能为负，distribution需要根据业务需要进行类型转换
+impl super::Hash for Crc64 {
+    fn hash<S: super::HashKey>(&self, key: &S) -> i64 {
+        let mut crc: u64 = CRC64_TABLE[0];
+        for i in 0..key.len() {
+            let c = key.at(i);
+            crc = CRC64_TABLE[((crc ^ c as u64) & 0xff) as usize] ^ (crc >> 8);
+        }
+
+        crc as i64
+    }
+}
+
+/// crc64 算法快查表
 const CRC64_TABLE: [u64; 256] = [
     0x0000000000000000,
     0x7ad870c830358979,
