@@ -17,7 +17,6 @@
 #     ./bench.sh -c 128 -d 60 hmget
 #     MODE=sidecar ./bench.sh --ops 1000000 hget
 #     MODE=shards SHARDS=4 ./bench.sh --ops 1000000 hget
-#     ./bench.sh --replay 127.0.0.1:16379 --ops 100000     # replay 客户端（HGET）
 #
 #   故障注入：
 #     ./bench.sh --ops 1000000 hget --slow-rate 0.0001 --slow-ms 200      # 慢请求

@@ -2,7 +2,7 @@
 //!
 //! Runs a fixed number of operations across `--concurrency` async workers and
 //! reports throughput plus latency percentiles (p50/p95/p99). It drives the
-//! SDK's three client modes:
+//! SDK's client modes:
 //!
 //! - **sidecar mode** (default, `--namespace`): through
 //!   [`SidecarClient`](redis::sidecar::SidecarClient), measuring the full
@@ -11,15 +11,10 @@
 //!   [`DirectClient`](redis::direct::DirectClient), the SDK's direct-backend
 //!   stack (AUTH/SELECT handshake, circuit breaker, retries, DNS watcher)
 //!   straight to a raw redis-server.
-//! - **replay mode** (`--replay host:port`, feature `replay`): through
-//!   [`redis::replay`], the single-persistent-connection replay/comparison
-//!   client. HGET-only; each worker owns its own connection (the replay
-//!   client is `&mut` single-stream by design).
 //!
 //! Usage:
 //!   redis-bench --namespace my_ns --concurrency 64 --ops 100000 get
 //!   redis-bench --direct 127.0.0.1:6379 --concurrency 64 --ops 100000 set
-//!   redis-bench --replay 127.0.0.1:6379 --concurrency 64 --ops 100000
 //!
 //! # Exit code
 //!
@@ -56,11 +51,6 @@ struct Args {
     /// through the SDK's `redis::direct::DirectClient` (no mesh).
     #[arg(long)]
     direct: Option<String>,
-
-    /// Replay mode: connect to a raw `host:port` redis-server through
-    /// `redis::replay` (single persistent connection per worker, HGET-only).
-    #[arg(long)]
-    replay: Option<String>,
 
     /// Shards mode: comma-separated direct backends
     /// (`host:port[:db],host:port[:db],...`), driven through the SDK's
@@ -261,10 +251,6 @@ async fn run(mut args: Args) -> i32 {
         );
     }
 
-    if args.replay.is_some() {
-        return run_replay(args, injector).await;
-    }
-
     let workload: WorkloadKind = args.workload.into();
 
     let client: Arc<dyn ConnectionLike> = match build_client(&args).await {
@@ -424,13 +410,6 @@ async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<
         args.direct = Some(format!("{proxy}{db}"));
         return Ok(());
     }
-    if let Some(addr) = args.replay.clone() {
-        let target = resolve(&addr).await?;
-        let proxy = fault::start_proxy(target, injector).await?;
-        eprintln!("fault proxy: {proxy} -> {target}");
-        args.replay = Some(proxy.to_string());
-        return Ok(());
-    }
     if let Some(ns) = args.namespace.clone() {
         let endpoint = redis::sidecar::discovery::scan_endpoint(
             std::path::Path::new(&args.socket_dir),
@@ -454,7 +433,7 @@ async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<
         args.socket_dir = dir.to_string_lossy().into_owned();
         return Ok(());
     }
-    Err("fault injection requires one of --namespace/--direct/--replay".to_string())
+    Err("fault injection requires one of --namespace/--direct/--shards".to_string())
 }
 
 async fn resolve(host_port: &str) -> Result<std::net::SocketAddr, String> {
@@ -503,7 +482,7 @@ async fn build_client(args: &Args) -> Result<Arc<dyn ConnectionLike>, String> {
     let ns = args
         .namespace
         .clone()
-        .ok_or_else(|| "one of --namespace, --direct, or --replay is required".to_string())?;
+        .ok_or_else(|| "one of --namespace, --direct, or --shards is required".to_string())?;
 
     let mut cfg = MeshConfig::new(ns)
         .with_group(&args.group)
@@ -791,200 +770,4 @@ fn report(summary: &Summary, elapsed: Duration, memory: &MemoryWindow) {
     }
     memory.print();
     println!("=============================");
-}
-
-/// Replay mode (feature `replay`): each worker owns one
-/// [`redis::replay::RedisConnection`] (the client is a `&mut` single-stream
-/// connection by design, mirroring the replay proxy's lane model) and issues
-/// sequential HGETs. Seeding goes through the SDK's direct client, since the
-/// replay client is read-only.
-#[cfg(feature = "replay")]
-async fn run_replay(args: Args, injector: Option<Arc<FaultInjector>>) -> i32 {
-    use redis::replay::RedisConnection;
-
-    let addr = args.replay.clone().unwrap();
-    let Some((host, port)) = addr.rsplit_once(':') else {
-        eprintln!("error: --replay expects host:port, got '{addr}'");
-        return 2;
-    };
-    let Ok(port) = port.parse::<u16>() else {
-        eprintln!("error: invalid port in --replay '{addr}'");
-        return 2;
-    };
-    let host = host.to_string();
-    const FIELD: &str = "f";
-
-    // Textual hash keys (the replay client takes `&str`).
-    let keys: Arc<Vec<String>> = Arc::new((0..args.keys).map(|i| format!("h:bench:{i}")).collect());
-
-    eprintln!(
-        "redis-bench: replay={}:{} keys={} concurrency={}",
-        host,
-        port,
-        keys.len(),
-        args.concurrency
-    );
-
-    // Seed the hashes through the SDK direct client (concurrently).
-    eprintln!("seeding {} hash keys...", keys.len());
-    {
-        let cfg = match redis::direct::ServerConfig::new(&addr) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 2;
-            }
-        };
-        let seeder = match redis::direct::DirectClient::connect(cfg).await {
-            Ok(client) => client,
-            Err(e) => {
-                eprintln!("error: failed to connect for seeding: {e}");
-                return 2;
-            }
-        };
-        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut seed_handles = Vec::new();
-        for _ in 0..8.min(keys.len().max(1)) {
-            let seeder = seeder.clone();
-            let keys = keys.clone();
-            let next = next.clone();
-            seed_handles.push(tokio::spawn(async move {
-                use redis::Commands as _;
-                loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= keys.len() {
-                        return true;
-                    }
-                    let mut ok = false;
-                    for _ in 0..5 {
-                        if seeder.hset::<i64>(&keys[i], FIELD, i as i64).await.is_ok() {
-                            ok = true;
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    if !ok {
-                        return false;
-                    }
-                }
-            }));
-        }
-        for h in seed_handles {
-            match h.await {
-                Ok(true) => {}
-                Ok(false) => {
-                    eprintln!("error: a seed HSET failed");
-                    return 2;
-                }
-                Err(e) => {
-                    eprintln!("error: seed task failed: {e}");
-                    return 2;
-                }
-            }
-        }
-        // Verify the seeded key/value correspondence before measuring.
-        for (i, key) in keys.iter().enumerate() {
-            use redis::Commands as _;
-            match seeder.hget::<String>(key, FIELD).await {
-                Ok(v) if v == i.to_string() => {}
-                other => {
-                    eprintln!("error: seed verification failed at {key}: {other:?}");
-                    return 2;
-                }
-            }
-        }
-        eprintln!("seed data verified: {} keys x 1 field", keys.len());
-    }
-
-    let mode = if args.ops > 0 {
-        RunMode::Count(args.ops)
-    } else {
-        RunMode::Timed(Duration::from_secs(args.duration))
-    };
-    let budget = Arc::new(OpBudget::new(match &mode {
-        RunMode::Count(n) => *n,
-        RunMode::Timed(_) => u64::MAX,
-    }));
-    let deadline = match &mode {
-        RunMode::Timed(d) => Some(Instant::now() + *d),
-        RunMode::Count(_) => None,
-    };
-    let bounded = matches!(mode, RunMode::Count(_));
-
-    eprintln!("running (replay, hget)...");
-    let mem_before = brz_mem::heap();
-    let start = Instant::now();
-
-    let mut handles = Vec::with_capacity(args.concurrency);
-    for w in 0..args.concurrency {
-        let host = host.clone();
-        let keys = keys.clone();
-        let budget = budget.clone();
-        let warmup = args.warmup;
-        let injector = injector.clone();
-        handles.push(tokio::spawn(async move {
-            let mut local = WorkerStats::new();
-            let mut conn = match RedisConnection::connect(&host, port).await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    eprintln!("worker {w}: connect failed: {e}");
-                    local.record_error();
-                    return local;
-                }
-            };
-            let mut op = (w as u64) * 1_000_000;
-            // Warm-up ops prime the connection and are not recorded, nor do
-            // they consume the op budget.
-            for i in 0..warmup {
-                let key = &keys[(w * warmup + i) % keys.len()];
-                let _ = conn.hget(key, FIELD).await;
-            }
-            loop {
-                if let Some(dl) = deadline
-                    && Instant::now() >= dl
-                {
-                    break;
-                }
-                if bounded && !budget.try_claim() {
-                    break;
-                }
-                let key = &keys[(op as usize) % keys.len()];
-                if let Some(injector) = &injector {
-                    injector.maybe_delay().await;
-                }
-                let t = Instant::now();
-                let ok = conn.hget(key, FIELD).await.is_ok();
-                let elapsed = t.elapsed();
-                if ok {
-                    local.record(elapsed);
-                } else {
-                    local.record_error();
-                }
-                op += 1;
-            }
-            local
-        }));
-    }
-
-    let mut summary = Summary::new();
-    for h in handles {
-        if let Ok(local) = h.await {
-            local.add_to(&mut summary);
-        }
-    }
-    if let Some(injector) = &injector {
-        let (slow, timeout, reset, outage) = injector.counts();
-        eprintln!(
-            "fault injection: slow={slow} timeout={timeout} reset={reset} outage={outage} injected"
-        );
-    }
-    finish(&summary, start.elapsed(), mem_before, &args)
-}
-
-/// Stub when the `replay` feature is off.
-#[cfg(not(feature = "replay"))]
-async fn run_replay(_args: Args, _injector: Option<Arc<FaultInjector>>) -> i32 {
-    eprintln!("error: --replay requires the `replay` feature");
-    eprintln!("hint:  cargo run -p redis-bench --features replay -- --replay host:port");
-    2
 }

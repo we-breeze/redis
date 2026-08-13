@@ -132,9 +132,6 @@ pub mod stats;
 pub mod to_args;
 pub mod types;
 
-#[cfg(feature = "direct-tcp")]
-pub mod replay;
-
 // Shared, mode-agnostic API.
 pub use api::{Redis, RedisBytes};
 pub use client::Client;

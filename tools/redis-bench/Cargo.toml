@@ -11,13 +11,10 @@ name = "redis-bench"
 path = "src/main.rs"
 
 [features]
-default = ["memory-stats", "replay"]
+default = ["memory-stats"]
 # Enable brz-mem's heap accounting (per-request allocation tracking). Off
 # removes the bookkeeping overhead from the hot path for pure-throughput runs.
 memory-stats = ["brz-mem/heap-stats"]
-# Enable the --replay mode (drives redis::replay, the replay/comparison
-# direct-TCP client).
-replay = ["redis/direct-tcp"]
 
 [dependencies]
 redis = { path = "../.." }

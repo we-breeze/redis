@@ -42,9 +42,7 @@ compatibility code:
 - `direct::HaServer`: primary/fallback with optional double write;
 - `direct::MsServer`: master/slave read splitting;
 - `direct::Shards<T>`: client-side sharding over another connection form;
-- `Client`: a common enum over sidecar and direct clients; and
-- `replay::RedisConnection`: the `direct-tcp` feature's sequential replay
-  connection.
+- `Client`: a common enum over sidecar and direct clients.
 
 These continue to expose the low-level `Commands`/`ConnectionLike` surface.
 They are not automatically part of the application `Redis` trait; adapters can
@@ -53,7 +51,7 @@ be added when a production consumer actually needs another access form.
 ## Design
 
 - **Sidecar-first application API.** `SidecarRedis` is the first application
-  implementation; direct and replay forms remain explicit lower-level modes.
+  implementation; direct access remains an explicit lower-level mode.
 - **Single mesh, pooled.** One local mesh endpoint per namespace, fronted by a
   pool of **multiplexed** connections: each connection pipelines many
   concurrent commands over one socket, so a small pool sustains high throughput.
