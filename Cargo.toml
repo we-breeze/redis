@@ -37,12 +37,12 @@ direct-tcp = []
 # only other member.
 [workspace]
 members = ["tools/redis-bench"]
-exclude = ["memory", "crates/discovery"]
+exclude = ["memory"]
 resolver = "2"
 
 [workspace.dependencies]
-# External Breeze submodule, kept outside this repository's Cargo workspace.
-brz-discovery = { package = "discovery", path = "crates/discovery" }
+# Shared Breeze checkout managed by the consuming repository.
+brz-discovery = { package = "discovery", path = "../discovery" }
 async-trait = "0.1"
 tempfile = "3"
 # Workspace submodule: the bench harness installs this allocator at its binary
