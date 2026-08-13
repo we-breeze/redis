@@ -2,61 +2,71 @@
 
 ## Overview
 
-breeze 平台的 Rust 异步 Redis SDK,高性能、高可用,单进程可承载近千个
-业务 namespace。提供两种显式分离的访问模式:
+A high-performance, high-availability async Redis SDK for the breeze
+platform, designed to carry ~1000 business namespaces per process. It offers
+two explicitly separated access modes:
 
-- **sidecar 模式**(`src/sidecar/`):通过本地 breeze mesh 访问 Redis。
-  解析 mesh 发布的 sock 配置文件名(`Quadruple` 命名)发现本地
-  endpoint,分片与后端 failover 由 mesh 负责。
-- **direct 模式**(`src/direct/`):直连后端 Redis。含客户端分片
-  (`Shards`,hash/distribution 与 mesh 逐位一致)、HA 布局
-  (`HaServer` 读兜底/双写/setSecond、`MsServer` 主从读写分离)、
-  DNS watcher 与多 IP 负载均衡(对齐 Java clientBalancer)。
+- **Sidecar mode** (`src/sidecar/`): reach Redis through the local breeze
+  mesh agent. The endpoint is discovered by parsing the mesh-published sock
+  config file names (`Quadruple` naming); sharding and backend failover are
+  the mesh's job.
+- **Direct mode** (`src/direct/`): talk to Redis backends directly. Includes
+  client-side sharding (`Shards`, bit-compatible hash/distribution with the
+  mesh), HA layouts (`HaServer` read fallback / double-write / set-second,
+  `MsServer` master/slave read splitting), and DNS watching with per-IP load
+  balancing (aligned with the Java clientBalancer).
 
-另有 `src/replay.rs`(回放比对专用单连接客户端,feature `direct-tcp`)
-与压测工具 `tools/redis-bench`(三模式压测、故障注入代理、正确性校验,
-脚本 `bench_local.sh` / `bench.sh`,`MATRIX=1` 一键全场景)。
+Also included: `src/replay.rs` (single-connection client for
+replay/comparison topologies, feature `direct-tcp`) and the
+`tools/redis-bench` load-test harness (three client modes, fault-injection
+proxy, correctness verification; scripts `bench_local.sh` / `bench.sh`,
+`MATRIX=1` runs the full scenario suite).
 
-共享层:`src/connection/`(单 socket 多路复用 + 驱动 task)、
-`src/pool/`(断路器、证据式 poison、lazy/按需增长连接池)、
-`src/resp/`(RESP2/3 编解码,零拷贝)、`src/commands/`(命令面,
-当前仅启用 hget/hmget + hset/del/ping,其余在块注释中)。
+Shared layers: `src/connection/` (single-socket multiplexing + driver task),
+`src/pool/` (circuit breaker, evidence-based poisoning, lazy/load-grown
+connection pool), `src/resp/` (RESP2/3 codec, zero-copy), `src/commands/`
+(command surface; only hget/hmget + hset/del/ping are currently enabled,
+the rest live in a block comment).
 
 ## Essential Commands
 
 ```bash
 cargo fmt
 cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features   # 要求零告警
+cargo clippy --workspace --all-targets --all-features   # zero warnings required
 ```
 
-压测(本机原生 redis,数字可信):
+Benchmarks (native local redis; trustworthy numbers):
 
 ```bash
 cd tools/redis-bench
-./bench_local.sh --ops 1000000 hget                # direct 基线
-MATRIX=1 ./bench_local.sh                          # 一键全场景矩阵
+./bench_local.sh --ops 1000000 hget                # direct baseline
+MATRIX=1 ./bench_local.sh                          # full scenario matrix
 ```
 
 ## Non-Negotiable Rules
 
-- **每次代码提交之前,必须先 `cargo fmt` 并通过全部测试**
-  (`cargo test --workspace --all-features`),clippy 零告警。未满足的
-  改动不得提交。
-- **commit message 永远使用中文。**
-- `src/direct/sharding/` 是 breeze sharding 的**原样复制(vendored)**:
-  不做风格调整(模块级 clippy 豁免);任何行为改动必须与 mesh 逐位
-  一致,并通过 `tests.rs` 中的向量/随机交叉校验。
-- 两种访问模式的代码必须分包:`sidecar/` 与 `direct/`,共享逻辑放
-  根部模块;crate 根只导出模式无关 API。
-- `Value::BulkString` 是零拷贝的 `Bytes`(非 `Vec<u8>`),改动协议层
-  时保持这一性质。
-- 命令面裁剪是刻意的:启用新命令时,从 `src/commands/mod.rs` 的块
-  注释中挪回条目并标注 `@ro`(只读)属性。
+- **Before every code commit, run `cargo fmt` and pass the full test suite**
+  (`cargo test --workspace --all-features`) with zero clippy warnings.
+  Changes that don't meet this bar must not be committed.
+- **Commit messages are always written in Chinese.**
+- `src/direct/sharding/` is a **verbatim vendored copy** of the breeze
+  sharding crate: no style adjustments (module-level clippy allow); any
+  behavior change must stay bit-compatible with the mesh and pass the
+  vector/randomized cross-checks in `tests.rs`.
+- Keep the two access modes in separate packages: `sidecar/` and `direct/`;
+  shared logic lives in root modules; the crate root only re-exports
+  mode-agnostic API.
+- `Value::BulkString` is zero-copy `Bytes` (not `Vec<u8>`); preserve this
+  when touching the protocol layer.
+- The trimmed command surface is deliberate: when enabling a new command,
+  move its entry out of the block comment in `src/commands/mod.rs` and mark
+  read-only commands with `@ro`.
 
 ## Git Hygiene
 
-提交聚焦单一主题,不夹带无关改动;推送前确认:
+Keep commits focused on a single topic and avoid unrelated local edits.
+Before pushing, confirm:
 
 ```bash
 git status --short
