@@ -1,3 +1,6 @@
 [submodule "memory"]
 	path = memory
 	url = https://github.com/we-breeze/memory.git
+[submodule "crates/discovery"]
+	path = crates/discovery
+	url = https://github.com/we-breeze/discovery.git

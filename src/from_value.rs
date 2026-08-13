@@ -117,6 +117,19 @@ impl FromRedisValue for crate::to_args::Bytes {
     }
 }
 
+impl FromRedisValue for bytes::Bytes {
+    fn from_redis_value(value: &Value) -> RedisResult<Self> {
+        match value {
+            Value::BulkString(bytes) => Ok(bytes.clone()),
+            Value::SimpleString(value) => Ok(bytes::Bytes::copy_from_slice(value.as_bytes())),
+            Value::VerbatimString { text, .. } => {
+                Ok(bytes::Bytes::copy_from_slice(text.as_bytes()))
+            }
+            _ => Err(type_error("expected a string reply")),
+        }
+    }
+}
+
 impl<T: FromRedisValue> FromRedisValue for Option<T> {
     fn from_redis_value(value: &Value) -> RedisResult<Self> {
         match value {

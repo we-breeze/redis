@@ -1,7 +1,7 @@
 //! The Redis command surface, generated from a single declarative list via
 //! [`implement_commands!`](crate::implement_commands).
 //!
-//! Currently enabled: `HGET`/`HMGET` plus the auxiliary commands needed to
+//! Currently enabled: `GET`/`HGET`/`HMGET` plus the auxiliary commands needed to
 //! benchmark and operate them (`PING` health checks, `HSET` seeding, `DEL`
 //! cleanup). The rest of the Java `JedisClient`-mirroring surface is kept
 //! commented out below for easy re-enabling as consumers are validated.
@@ -16,6 +16,10 @@ crate::implement_commands! {
     // ---- keys (cleanup helper) ----
     /// `DEL key [key ...]` — delete keys.
     fn del(keys) => ["DEL"];
+
+    // ---- strings ----
+    /// `GET key`.
+    @ro fn get(key) => ["GET"];
 
     // ---- hashes ----
     /// `HGET key field`.
@@ -68,8 +72,6 @@ crate::implement_commands! {
     @ro fn scan(cursor) => ["SCAN"];
 
     // ---- strings ----
-    /// `GET key`.
-    @ro fn get(key) => ["GET"];
     /// `SET key value`.
     fn set(key, value) => ["SET"];
     /// `SETNX key value` — set only if absent.

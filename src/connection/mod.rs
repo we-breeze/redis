@@ -2,8 +2,8 @@
 //! execution is built on.
 //!
 //! [`multiplexed`] provides [`MultiplexedConnection`], a cheap-`Clone` handle
-//! that pipelines many concurrent requests over a single socket (TCP or unix)
-//! to the mesh.
+//! that pipelines many concurrent requests over a single TCP socket to the
+//! mesh.
 
 pub mod multiplexed;
 

@@ -9,7 +9,7 @@
 //!
 //! - [`SidecarClient`] — the pooled, retrying client
 //!   ([`SidecarClient::connect("namespace")`](SidecarClient::connect));
-//! - [`MeshConfig`] — namespace/group/transport/pool/timeout settings;
+//! - [`MeshConfig`] — namespace/group/pool/timeout settings;
 //! - [`MeshRouting`] — `with_hashkey` / `broadcast` / `at_master` routing
 //!   preambles understood by the mesh.
 //!
@@ -21,6 +21,6 @@ pub mod discovery;
 pub mod routing;
 
 pub use client::SidecarClient;
-pub use config::{MeshConfig, Transport};
+pub use config::MeshConfig;
 pub use discovery::Endpoint;
 pub use routing::{MeshRouting, Prefixed};
