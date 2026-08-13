@@ -15,7 +15,7 @@ use std::fmt::Display;
 ///   8 后续可能会有crc32abs-delimiter，基于point/pound/underscore之前的部分key，先转为i32，然后进行abs操作；
 ///
 
-pub(super) const CRC32TAB: [i64; 256] = [
+pub(super) const CRC32TAB: [u32; 256] = [
     0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA, 0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
     0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988, 0x09B64C2B, 0x7EB17CBD, 0xE7B82D07, 0x90BF1D91,
     0x1DB71064, 0x6AB020F2, 0xF3B97148, 0x84BE41DE, 0x1ADAD47D, 0x6DDDE4EB, 0xF4D4B551, 0x83D385C7,
@@ -51,6 +51,15 @@ pub(super) const CRC32TAB: [i64; 256] = [
 ];
 
 pub(super) const CRC_SEED: i64 = 0xFFFFFFFF;
+
+// u32 版种子与单步函数。与 i64 版逐位等价:循环中 (crc>>8) < 2^24、表项
+// < 2^32,故 & 0x00FFFFFF / & 0xFFFFFFFF 掩码在 u32 下是恒等操作。
+pub(super) const CRC_SEED32: u32 = 0xFFFF_FFFF;
+
+#[inline(always)]
+pub(super) fn crc32_step(crc: u32, c: u8) -> u32 {
+    (crc >> 8) ^ CRC32TAB[((crc ^ c as u32) & 0xff) as usize]
+}
 
 // 用于兼容jdk版本crc32算法
 #[derive(Default, Clone, Debug)]
@@ -98,15 +107,15 @@ pub struct Crc32AbsDelimiter {
 impl super::Hash for Crc32 {
     #[inline]
     fn hash<K: super::HashKey>(&self, key: &K) -> i64 {
-        let mut crc: i64 = CRC_SEED;
+        let mut crc: u32 = CRC_SEED32;
 
         for i in 0..key.len() {
             let c = key.at(i);
-            crc = ((crc >> 8) & 0x00FFFFFF) ^ CRC32TAB[((crc ^ (c as i64)) & 0xff) as usize];
+            crc = crc32_step(crc, c);
         }
 
-        crc ^= CRC_SEED;
-        crc &= CRC_SEED;
+        crc ^= CRC_SEED32;
+        let crc = crc as i64;
         if crc <= 0 {
             // 理论上不会有负数hash
             log::warn!("crc32 - negative hash/{} for key/{:?}", crc, key);
@@ -160,18 +169,18 @@ impl super::Hash for Crc32Num {
     fn hash<S: super::HashKey>(&self, key: &S) -> i64 {
         debug_assert!(self.start_pos < key.len());
 
-        let mut crc: i64 = CRC_SEED;
+        let mut crc: u32 = CRC_SEED32;
         for i in self.start_pos..key.len() {
             let c = key.at(i);
             // 对于用数字类型做hash，则遇到非数字结束
             if !c.is_ascii_digit() {
                 break;
             }
-            crc = ((crc >> 8) & 0x00FFFFFF) ^ CRC32TAB[((crc ^ (c as i64)) & 0xff) as usize];
+            crc = crc32_step(crc, c);
         }
 
-        crc ^= CRC_SEED;
-        crc &= CRC_SEED;
+        crc ^= CRC_SEED32;
+        let crc = crc as i64;
         if crc <= 0 {
             log::debug!(
                 "crc32-num-{} key:{:?}, malform hash:{}",
@@ -231,7 +240,7 @@ impl Crc32Delimiter {
 
 impl super::Hash for Crc32Delimiter {
     fn hash<S: super::HashKey>(&self, key: &S) -> i64 {
-        let mut crc: i64 = CRC_SEED;
+        let mut crc: u32 = CRC_SEED32;
         debug_assert!(self.start_pos < key.len());
 
         // 对于用“.”、“_”、“#”做分割的hash key，遇到分隔符停止
@@ -241,11 +250,11 @@ impl super::Hash for Crc32Delimiter {
             if check_delimiter && (c == self.delimiter) {
                 break;
             }
-            crc = ((crc >> 8) & 0x00FFFFFF) ^ CRC32TAB[((crc ^ (c as i64)) & 0xff) as usize];
+            crc = crc32_step(crc, c);
         }
 
-        crc ^= CRC_SEED;
-        crc &= CRC_SEED;
+        crc ^= CRC_SEED32;
+        let crc = crc as i64;
         if crc <= 0 {
             log::debug!("{:?} - malform hash/{} for key/{:?}", self.name, crc, key);
         }
@@ -264,16 +273,16 @@ impl super::Hash for Crc32SmartNum {
         // 解析出smartnum hashkey的位置
         let (start, end) = parse_smartnum_hashkey(key);
 
-        let mut crc: i64 = CRC_SEED;
+        let mut crc: u32 = CRC_SEED32;
         for i in start..end {
             let c = key.at(i);
             // smartnum hash，理论上必须是全部数字，但非法请求可能包含非数字（或者配置错误）
             //debug_assert!(c.is_ascii_digit(), "malfromed smart key:{:?}", key);
-            crc = ((crc >> 8) & 0x00FFFFFF) ^ CRC32TAB[((crc ^ (c as i64)) & 0xff) as usize];
+            crc = crc32_step(crc, c);
         }
 
-        crc ^= CRC_SEED;
-        crc &= CRC_SEED;
+        crc ^= CRC_SEED32;
+        let crc = crc as i64;
         if crc <= 0 {
             log::warn!("+++ crc32-smartnum key:{:?}, hash:{}", key, crc);
         }
@@ -322,7 +331,7 @@ pub(crate) fn parse_smartnum_hashkey<S: super::HashKey>(key: &S) -> (usize, usiz
 // 将key中非数字分开的所有num合并到一起来计算hash，如abc_123_45_cde6、123_456_xx的hashkey都是: 123456
 impl super::Hash for Crc32MixNum {
     fn hash<S: super::HashKey>(&self, key: &S) -> i64 {
-        let mut crc: i64 = CRC_SEED;
+        let mut crc: u32 = CRC_SEED32;
         // 找出所有num来作为hashkey
         for i in 0..key.len() {
             let c = key.at(i);
@@ -330,12 +339,12 @@ impl super::Hash for Crc32MixNum {
                 log::debug!("+++ crc32-mixnum:{}", c as char);
 
                 // 进行crc32计算
-                crc = ((crc >> 8) & 0x00FFFFFF) ^ CRC32TAB[((crc ^ (c as i64)) & 0xff) as usize];
+                crc = crc32_step(crc, c);
             }
         }
 
-        crc ^= CRC_SEED;
-        crc &= CRC_SEED;
+        crc ^= CRC_SEED32;
+        let crc = crc as i64;
         if crc <= 0 {
             log::warn!("+++ crc32-smartnum key:{:?}, hash:{}", key, crc);
         }
@@ -345,15 +354,15 @@ impl super::Hash for Crc32MixNum {
 
 impl Hash for Crc32Abs {
     fn hash<S: super::HashKey>(&self, key: &S) -> i64 {
-        let mut crc: i64 = CRC_SEED;
+        let mut crc: u32 = CRC_SEED32;
 
         for i in 0..key.len() {
             let c = key.at(i);
-            crc = ((crc >> 8) & 0x00FFFFFF) ^ CRC32TAB[((crc ^ (c as i64)) & 0xff) as usize];
+            crc = crc32_step(crc, c);
         }
 
-        crc ^= CRC_SEED;
-        crc &= CRC_SEED;
+        crc ^= CRC_SEED32;
+        let crc = crc as i64;
 
         let mut crc = crc as i32;
         if crc <= 0 {
@@ -403,7 +412,7 @@ impl Crc32AbsDelimiter {
 
 impl super::Hash for Crc32AbsDelimiter {
     fn hash<S: super::HashKey>(&self, key: &S) -> i64 {
-        let mut crc: i64 = CRC_SEED;
+        let mut crc: u32 = CRC_SEED32;
         debug_assert!(self.start_pos < key.len());
 
         let check_delimiter = self.delimiter != super::KEY_DELIMITER_NONE;
@@ -412,11 +421,11 @@ impl super::Hash for Crc32AbsDelimiter {
             if check_delimiter && (c == self.delimiter) {
                 break;
             }
-            crc = ((crc >> 8) & 0x00FFFFFF) ^ CRC32TAB[((crc ^ (c as i64)) & 0xff) as usize];
+            crc = crc32_step(crc, c);
         }
 
-        crc ^= CRC_SEED;
-        crc &= CRC_SEED;
+        crc ^= CRC_SEED32;
+        let crc = crc as i64;
 
         let mut crc = crc as i32;
         if crc <= 0 {

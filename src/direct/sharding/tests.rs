@@ -74,3 +74,74 @@ fn distributions() {
         assert_eq!(d.index(h), d.db_idx(h) / 2);
     }
 }
+
+/// u32 化改写必须与原版 i64 算法逐位一致。这里内嵌 i64 参照实现
+/// (来自改写前的源码),对随机 key 做交叉验证。
+#[test]
+fn crc32_variants_match_i64_reference() {
+    // 参照表运行时按多项式 0xEDB88320 独立生成(同时校验共享表本身)。
+    let mut ref_tab = [0i64; 256];
+    for (i, entry) in ref_tab.iter_mut().enumerate() {
+        let mut c = i as i64;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xEDB88320i64 ^ (c >> 1) } else { c >> 1 };
+        }
+        *entry = c;
+    }
+    let ref_tab = ref_tab;
+    let ref_crc32 = |key: &[u8], masked: bool| {
+        const SEED: i64 = 0xFFFFFFFF;
+        let mut crc: i64 = SEED;
+        for &c in key {
+            let idx = ((crc ^ (c as i64)) & 0xff) as usize;
+            crc = if masked {
+                ((crc >> 8) & 0x00FFFFFF) ^ ref_tab[idx]
+            } else {
+                (crc >> 8) ^ ref_tab[idx]
+            };
+        }
+        crc ^= SEED;
+        crc & SEED
+    };
+
+    // 确定性伪随机 key 集:覆盖短/长/含分隔符/含二进制字节。
+    let mut x = 0x12345678u64;
+    let mut rand = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for i in 0..2000 {
+        let len = (rand() % 64) as usize + 1;
+        let mut k = Vec::with_capacity(len);
+        for _ in 0..len {
+            k.push((rand() % 256) as u8);
+        }
+        keys.push(k);
+        // 分隔符形态
+        let k2 = format!("pre{i}_suf{}.tail", rand() % 1000);
+        keys.push(k2.into_bytes());
+        // 数字形态
+        keys.push(format!("{}{}", rand() % 100000, rand() % 100).into_bytes());
+    }
+
+    for key in &keys {
+        assert_eq!(
+            hash("crc32", key),
+            ref_crc32(key, true),
+            "crc32 mismatch for {key:?}"
+        );
+        // crc32-short: 先 crc32 再截断
+        assert_eq!(hash("crc32-short", key), (ref_crc32(key, true) >> 16) & 0x7fff);
+        // crc32local: 无掩码循环 + i32 abs(参照原版)
+        let local_ref = ref_crc32(key, false) as i32;
+        let local_ref = if local_ref < 0 { -local_ref as i64 } else { local_ref as i64 };
+        assert_eq!(hash("crc32local", key), local_ref, "crc32local {key:?}");
+        // crc32abs
+        let abs_ref = ref_crc32(key, true) as i32;
+        let abs_ref = if abs_ref < 0 { -abs_ref as i64 } else { abs_ref as i64 };
+        assert_eq!(hash("crc32abs", key), abs_ref, "crc32abs {key:?}");
+    }
+}

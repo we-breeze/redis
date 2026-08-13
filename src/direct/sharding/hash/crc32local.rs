@@ -4,7 +4,7 @@ use std::fmt::Display;
 
 use super::{
     DebugName, Hash,
-    crc32::{self, CRC_SEED, CRC32TAB},
+    crc32::{self, crc32_step, CRC_SEED32},
 };
 
 #[derive(Default, Clone, Debug)]
@@ -12,14 +12,15 @@ pub struct Crc32local {}
 
 impl Hash for Crc32local {
     fn hash<S: super::HashKey>(&self, key: &S) -> i64 {
-        let mut crc: i64 = CRC_SEED;
+        let mut crc: u32 = CRC_SEED32;
 
         for i in 0..key.len() {
             let c = key.at(i);
-            crc = crc >> 8 ^ CRC32TAB[((crc ^ (c as i64)) & 0xff) as usize];
+            crc = crc32_step(crc, c);
         }
 
-        crc ^= CRC_SEED;
+        crc ^= CRC_SEED32;
+        let crc = crc as i64;
         let crc32 = crc as i32;
         crc32.abs() as i64
     }
@@ -70,7 +71,7 @@ impl Crc32localDelimiter {
 
 impl super::Hash for Crc32localDelimiter {
     fn hash<S: super::HashKey>(&self, key: &S) -> i64 {
-        let mut crc: i64 = CRC_SEED;
+        let mut crc: u32 = CRC_SEED32;
         debug_assert!(self.start_pos < key.len());
 
         // 对于用“.”、“_”、“#”做分割的hash key，遇到分隔符停止
@@ -80,10 +81,11 @@ impl super::Hash for Crc32localDelimiter {
             if check_delimiter && (c == self.delimiter) {
                 break;
             }
-            crc = crc >> 8 ^ CRC32TAB[((crc ^ (c as i64)) & 0xff) as usize];
+            crc = crc32_step(crc, c);
         }
 
-        crc ^= CRC_SEED;
+        crc ^= CRC_SEED32;
+        let crc = crc as i64;
         let crc32 = crc as i32;
 
         crc32.abs() as i64
@@ -104,15 +106,16 @@ impl super::Hash for Crc32localSmartNum {
         // 解析出smartnum hashkey的位置
         let (start, end) = crc32::parse_smartnum_hashkey(key);
 
-        let mut crc: i64 = CRC_SEED;
+        let mut crc: u32 = CRC_SEED32;
         for i in start..end {
             let c = key.at(i);
             // smartnum hash，理论上必须是全部数字，但非法请求可能包含非数字（或者配置错误）
             //debug_assert!(c.is_ascii_digit(), "malfromed smart key:{:?}", key);
-            crc = crc >> 8 ^ CRC32TAB[((crc ^ (c as i64)) & 0xff) as usize];
+            crc = crc32_step(crc, c);
         }
 
-        crc ^= CRC_SEED;
+        crc ^= CRC_SEED32;
+        let crc = crc as i64;
         let crc32 = crc as i32;
         crc32.abs() as i64
     }

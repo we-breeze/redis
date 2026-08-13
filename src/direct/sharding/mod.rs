@@ -19,6 +19,9 @@ pub use hash::Hasher;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod bench;
+
 
 /// A resolved client-side sharding plan: hash algorithm + slot distribution.
 /// (SDK 侧补充的薄封装,便于按 key 直接取分片。)

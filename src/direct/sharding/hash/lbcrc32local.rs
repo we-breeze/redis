@@ -4,7 +4,7 @@ use std::fmt::Display;
 
 use super::{
     DebugName,
-    crc32::{CRC_SEED, CRC32TAB},
+    crc32::{crc32_step, CRC_SEED32},
 };
 
 // LBCrc32local算法，需要先转为u64的bytes，然后再计算hash
@@ -33,12 +33,13 @@ impl super::Hash for LBCrc32localDelimiter {
 
         // java 的Longs.toByteArray 用big endian
         let hkey_bytes = hkey.to_be_bytes();
-        let mut crc: i64 = CRC_SEED;
+        let mut crc: u32 = CRC_SEED32;
         for i in 0..hkey_bytes.len() {
             let c = hkey_bytes[i];
-            crc = crc >> 8 ^ CRC32TAB[((crc ^ (c as i64)) & 0xff) as usize];
+            crc = crc32_step(crc, c);
         }
-        crc ^= CRC_SEED;
+        crc ^= CRC_SEED32;
+        let crc = crc as i64;
         let crc32 = crc as i32;
 
         crc32.abs() as i64
