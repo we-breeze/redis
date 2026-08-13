@@ -48,7 +48,6 @@ MATRIX=1 ./bench_local.sh                          # full scenario matrix
 - **Before every code commit, run `cargo fmt` and pass the full test suite**
   (`cargo test --workspace --all-features`) with zero clippy warnings.
   Changes that don't meet this bar must not be committed.
-- **Commit messages are always written in Chinese.**
 - `src/direct/sharding/` is a **verbatim vendored copy** of the breeze
   sharding crate: no style adjustments (module-level clippy allow); any
   behavior change must stay bit-compatible with the mesh and pass the
