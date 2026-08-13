@@ -4,7 +4,7 @@ use std::fmt::Display;
 
 use super::{
     DebugName, Hash,
-    crc32::{self, crc32_step, CRC_SEED32},
+    crc32::{self, CRC_SEED32, crc32_step},
 };
 
 #[derive(Default, Clone, Debug)]

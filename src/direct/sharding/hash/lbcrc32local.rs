@@ -4,7 +4,7 @@ use std::fmt::Display;
 
 use super::{
     DebugName,
-    crc32::{crc32_step, CRC_SEED32},
+    crc32::{CRC_SEED32, crc32_step},
 };
 
 // LBCrc32local算法，需要先转为u64的bytes，然后再计算hash

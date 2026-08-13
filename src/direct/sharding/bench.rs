@@ -60,7 +60,10 @@ fn sharding_perf() {
         let d = Distribute::from(dist, &names);
         let start = Instant::now();
         let mut acc = 0usize;
-        let hashes: Vec<i64> = keys.iter().map(|k| Hasher::from("crc32").hash(&k.as_slice())).collect();
+        let hashes: Vec<i64> = keys
+            .iter()
+            .map(|k| Hasher::from("crc32").hash(&k.as_slice()))
+            .collect();
         for _ in 0..rounds {
             for h in &hashes {
                 acc = acc.wrapping_add(d.index(*h));

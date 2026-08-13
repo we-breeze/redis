@@ -326,10 +326,20 @@ async fn run(mut args: Args) -> i32 {
 
     eprintln!("running...");
     let mem_before = brz_mem::heap();
-    let (summary, elapsed) = measured_run(&client, &runner, args.concurrency, mode, args.cpu_stall_rate, args.cpu_stall_ms).await;
+    let (summary, elapsed) = measured_run(
+        &client,
+        &runner,
+        args.concurrency,
+        mode,
+        args.cpu_stall_rate,
+        args.cpu_stall_ms,
+    )
+    .await;
     if let Some(injector) = &injector {
         let (slow, timeout, reset, outage) = injector.counts();
-        eprintln!("fault injection: slow={slow} timeout={timeout} reset={reset} outage={outage} injected");
+        eprintln!(
+            "fault injection: slow={slow} timeout={timeout} reset={reset} outage={outage} injected"
+        );
     }
     finish(&summary, elapsed, mem_before, &args)
 }
@@ -653,8 +663,7 @@ async fn measured_run(
                     rng = rng.wrapping_mul(0xff51afd7ed558ccd);
                     rng ^= rng >> 33;
                     if (rng >> 40) as f64 / (1u64 << 24) as f64 <= cpu_stall_rate {
-                        let deadline =
-                            Instant::now() + Duration::from_millis(cpu_stall_ms);
+                        let deadline = Instant::now() + Duration::from_millis(cpu_stall_ms);
                         while Instant::now() < deadline {
                             std::hint::spin_loop();
                         }
@@ -720,9 +729,7 @@ async fn verify_seeds(
                     Ok(values)
                         if values.len() == driver::FIELDS.len()
                             && values.iter().zip(driver::FIELDS.iter()).all(
-                                |(value, field)| {
-                                    driver::expected_value_matches(field, key, value)
-                                },
+                                |(value, field)| driver::expected_value_matches(field, key, value),
                             ) => {}
                     Ok(values) => {
                         let prior = mismatches.fetch_add(1, Ordering::Relaxed);
@@ -747,7 +754,10 @@ async fn verify_seeds(
     if bad > 0 {
         return Err(format!("{bad}/{total} keys failed verification"));
     }
-    eprintln!("seed data verified: {total} keys x {} fields", driver::FIELDS.len());
+    eprintln!(
+        "seed data verified: {total} keys x {} fields",
+        driver::FIELDS.len()
+    );
     Ok(())
 }
 
@@ -964,7 +974,9 @@ async fn run_replay(args: Args, injector: Option<Arc<FaultInjector>>) -> i32 {
     }
     if let Some(injector) = &injector {
         let (slow, timeout, reset, outage) = injector.counts();
-        eprintln!("fault injection: slow={slow} timeout={timeout} reset={reset} outage={outage} injected");
+        eprintln!(
+            "fault injection: slow={slow} timeout={timeout} reset={reset} outage={outage} injected"
+        );
     }
     finish(&summary, start.elapsed(), mem_before, &args)
 }

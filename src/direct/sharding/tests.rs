@@ -22,8 +22,14 @@ fn name_parsing() {
         Hasher::Crc32Delimiter(_)
     ));
     assert!(matches!(Hasher::from("crc32-id"), Hasher::Crc32Num(_)));
-    assert!(matches!(Hasher::from("bkdrsub"), Hasher::BkdrsubDelimiter(_)));
-    assert!(matches!(Hasher::from("rawsuffix-pound"), Hasher::RawSuffix(_)));
+    assert!(matches!(
+        Hasher::from("bkdrsub"),
+        Hasher::BkdrsubDelimiter(_)
+    ));
+    assert!(matches!(
+        Hasher::from("rawsuffix-pound"),
+        Hasher::RawSuffix(_)
+    ));
 }
 
 #[test]
@@ -31,16 +37,16 @@ fn known_vectors() {
     assert_eq!(hash("bkdr", b"abc"), 96354);
     assert_eq!(hash("raw", b"12345abc"), 12345);
     assert_eq!(hash("crc32", b"abc"), 891568578);
-    assert_eq!(
-        hash("crc32-underscore", b"abc_def"),
-        hash("crc32", b"abc")
-    );
+    assert_eq!(hash("crc32-underscore", b"abc_def"), hash("crc32", b"abc"));
     assert_eq!(hash("crc32-num-3", b"uid12345x"), hash("crc32", b"12345"));
     assert_eq!(
         hash("crc32-smartnum", b"abc12345678def"),
         hash("crc32", b"12345678")
     );
-    assert_eq!(hash("crc32-mixnum", b"a_123_456_bc"), hash("crc32", b"123456"));
+    assert_eq!(
+        hash("crc32-mixnum", b"a_123_456_bc"),
+        hash("crc32", b"123456")
+    );
     assert_eq!(hash("rawsuffix-point", b"abc.789"), 789);
     assert_eq!(hash("bkdrsub", b"abc#123_456"), 847490);
     assert_eq!(hash("rawcrc32local", b"12345_xx"), 12345);
@@ -84,7 +90,11 @@ fn crc32_variants_match_i64_reference() {
     for (i, entry) in ref_tab.iter_mut().enumerate() {
         let mut c = i as i64;
         for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB88320i64 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB88320i64 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
         *entry = c;
     }
@@ -134,14 +144,25 @@ fn crc32_variants_match_i64_reference() {
             "crc32 mismatch for {key:?}"
         );
         // crc32-short: 先 crc32 再截断
-        assert_eq!(hash("crc32-short", key), (ref_crc32(key, true) >> 16) & 0x7fff);
+        assert_eq!(
+            hash("crc32-short", key),
+            (ref_crc32(key, true) >> 16) & 0x7fff
+        );
         // crc32local: 无掩码循环 + i32 abs(参照原版)
         let local_ref = ref_crc32(key, false) as i32;
-        let local_ref = if local_ref < 0 { -local_ref as i64 } else { local_ref as i64 };
+        let local_ref = if local_ref < 0 {
+            -local_ref as i64
+        } else {
+            local_ref as i64
+        };
         assert_eq!(hash("crc32local", key), local_ref, "crc32local {key:?}");
         // crc32abs
         let abs_ref = ref_crc32(key, true) as i32;
-        let abs_ref = if abs_ref < 0 { -abs_ref as i64 } else { abs_ref as i64 };
+        let abs_ref = if abs_ref < 0 {
+            -abs_ref as i64
+        } else {
+            abs_ref as i64
+        };
         assert_eq!(hash("crc32abs", key), abs_ref, "crc32abs {key:?}");
     }
 }

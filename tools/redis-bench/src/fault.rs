@@ -144,8 +144,10 @@ impl FaultInjector {
             // fine for fault injection.
             let new_until = now + self.outage.as_millis() as u64;
             self.outage_until_ms.store(new_until, Ordering::Release);
-            self.outage_next_ms
-                .store(now + self.outage_interval.as_millis() as u64, Ordering::Release);
+            self.outage_next_ms.store(
+                now + self.outage_interval.as_millis() as u64,
+                Ordering::Release,
+            );
             return Some(self.outage);
         }
         None
