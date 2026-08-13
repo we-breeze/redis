@@ -3,13 +3,14 @@
 //! A high-performance, high-availability async Redis client for the breeze
 //! platform, with **two explicitly separated access modes**:
 //!
-//! ## Application API — [`Redis`] and [`SidecarRedis`]
+//! ## Application API — [`Redis`], [`SidecarRedis`], and [`DirectRedis`]
 //!
 //! Application code should depend on the small [`Redis`] contract. Its first
 //! version contains only the `GET`, `HGET`, and `HMGET` operations used by
 //! abtest. [`SidecarRedis`] discovers an exact group/namespace through the
-//! local breeze sidecar while keeping pools and command machinery out of the
-//! application boundary.
+//! local breeze sidecar, while [`DirectRedis`] connects to one explicit
+//! endpoint for tests and validation. Both keep pools and command machinery
+//! out of the application boundary.
 //!
 //! ```no_run
 //! use redis::{Redis, SidecarRedis};
@@ -118,6 +119,7 @@ pub mod cmd;
 pub mod commands;
 pub mod connection;
 pub mod direct;
+mod direct_redis;
 pub mod error;
 pub mod from_value;
 pub mod pipeline;
@@ -139,6 +141,7 @@ pub use client::Client;
 pub use cmd::{Cmd, cmd, pipe};
 pub use commands::Commands;
 pub use connection::{ConnectionLike, Handshake, MultiplexedConnection};
+pub use direct_redis::DirectRedis;
 pub use error::{ErrorKind, RedisError, RedisResult};
 pub use from_value::FromRedisValue;
 pub use pipeline::Pipeline;
