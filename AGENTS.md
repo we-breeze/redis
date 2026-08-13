@@ -16,11 +16,10 @@ two explicitly separated access modes:
   `MsServer` master/slave read splitting), and DNS watching with per-IP load
   balancing (aligned with the Java clientBalancer).
 
-Also included: `src/replay.rs` (single-connection client for
-replay/comparison topologies, feature `direct-tcp`) and the
-`tools/redis-bench` load-test harness (three client modes, fault-injection
-proxy, correctness verification; scripts `bench_local.sh` / `bench.sh`,
-`MATRIX=1` runs the full scenario suite).
+Also included: the `tools/redis-bench` load-test harness (sidecar, direct,
+and sharded client modes, fault-injection proxy, correctness verification;
+scripts `bench_local.sh` / `bench.sh`, `MATRIX=1` runs the full scenario
+suite).
 
 Shared layers: `src/connection/` (single-socket multiplexing + driver task),
 `src/pool/` (circuit breaker, evidence-based poisoning, lazy/load-grown
