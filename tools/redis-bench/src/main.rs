@@ -36,7 +36,7 @@ use clap::Parser;
 use driver::{Workload, WorkloadKind};
 use fault::FaultInjector;
 use redis::connection::ConnectionLike;
-use redis::sidecar::{MeshConfig, SidecarClient, Transport};
+use redis::sidecar::{MeshConfig, SidecarClient};
 use stats::{MemoryWindow, OpBudget, Summary, WorkerStats};
 
 // Install mimalloc (with per-request heap accounting under the `memory-stats`
@@ -81,16 +81,12 @@ struct Args {
     #[arg(long)]
     fault_shard: Option<usize>,
 
-    /// Use a unix socket for the mesh transport (ignored with --direct).
-    #[arg(long)]
-    unix: bool,
-
     /// Deployment group segment of the mesh sock-file name.
     #[arg(long, default_value = "default")]
     group: String,
 
     /// Directory the mesh publishes sock files into.
-    #[arg(long, default_value = "/tmp/breeze/socks")]
+    #[arg(long, default_value = "/data1/breeze/socks")]
     socket_dir: String,
 
     /// Minimum live pooled connections kept warm (0 = fully lazy start).
@@ -426,19 +422,14 @@ async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<
         return Ok(());
     }
     if let Some(ns) = args.namespace.clone() {
-        let endpoints = redis::sidecar::discovery::scan_endpoints(
+        let endpoint = redis::sidecar::discovery::scan_endpoint(
             std::path::Path::new(&args.socket_dir),
             &args.group,
             &ns,
-            args.unix,
-        );
-        let target = endpoints
-            .into_iter()
-            .find_map(|e| match e {
-                redis::sidecar::Endpoint::Tcp(addr) => Some(addr),
-                redis::sidecar::Endpoint::Unix(_) => None,
-            })
-            .ok_or("no TCP mesh endpoint to proxy (unix endpoints unsupported)")?;
+        )
+        .ok_or("no TCP mesh endpoint to proxy")?;
+        let redis::sidecar::Endpoint { host, port } = endpoint;
+        let target = resolve(&format!("{host}:{port}")).await?;
         let proxy = fault::start_proxy(target, injector).await?;
         let dir = std::env::temp_dir().join(format!("redis-bench-fault-{}", std::process::id()));
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -451,7 +442,6 @@ async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<
         std::fs::File::create(&sock).map_err(|e| e.to_string())?;
         eprintln!("fault proxy: {proxy} -> {target} (sock {})", sock.display());
         args.socket_dir = dir.to_string_lossy().into_owned();
-        args.unix = false;
         return Ok(());
     }
     Err("fault injection requires one of --namespace/--direct/--replay".to_string())
@@ -511,9 +501,6 @@ async fn build_client(args: &Args) -> Result<Arc<dyn ConnectionLike>, String> {
         .with_min_connections(args.min_conns)
         .with_max_connections(args.max_conns)
         .with_max_inflight(args.max_inflight);
-    if args.unix {
-        cfg = cfg.with_transport(Transport::Unix);
-    }
     cfg.op_timeout = Duration::from_millis(args.op_timeout_ms);
 
     let client = SidecarClient::from_config(cfg)

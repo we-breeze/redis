@@ -3,6 +3,27 @@
 //! A high-performance, high-availability async Redis client for the breeze
 //! platform, with **two explicitly separated access modes**:
 //!
+//! ## Application API — [`Redis`] and [`SidecarRedis`]
+//!
+//! Application code should depend on the small [`Redis`] contract. Its first
+//! version contains only the `GET`, `HGET`, and `HMGET` operations used by
+//! abtest. [`SidecarRedis`] discovers an exact group/namespace through the
+//! local breeze sidecar while keeping pools and command machinery out of the
+//! application boundary.
+//!
+//! ```no_run
+//! use redis::{Redis, SidecarRedis};
+//!
+//! # async fn demo() -> redis::RedisResult<()> {
+//! let redis = SidecarRedis::new("feed", "auto_translate_llm").await?;
+//! let profile = redis.get("u:42").await?;
+//! let version = redis.hget("document:42", "version").await?;
+//! let values = redis.hmget("document:42", &["value", "compress", "hash"]).await?;
+//! # let _ = (profile, version, values);
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! ## Mesh mode — [`sidecar`]
 //!
 //! The SDK talks to the **local breeze mesh agent**, discovered by parsing
@@ -91,6 +112,7 @@
 //!   breaker, maintenance probe, and (for hostname backends) DNS watching
 //!   with per-IP load balancing.
 
+mod api;
 pub mod client;
 pub mod cmd;
 pub mod commands;
@@ -103,6 +125,7 @@ pub mod pool;
 pub mod resp;
 pub mod script;
 pub mod sidecar;
+mod sidecar_redis;
 pub mod stats;
 pub mod to_args;
 pub mod types;
@@ -111,6 +134,7 @@ pub mod types;
 pub mod replay;
 
 // Shared, mode-agnostic API.
+pub use api::{Redis, RedisBytes};
 pub use client::Client;
 pub use cmd::{Cmd, cmd, pipe};
 pub use commands::Commands;
@@ -120,5 +144,6 @@ pub use from_value::FromRedisValue;
 pub use pipeline::Pipeline;
 pub use pool::Pool;
 pub use script::Script;
+pub use sidecar_redis::SidecarRedis;
 pub use to_args::{Bytes, RedisWrite, ToRedisArgs, ToSingleRedisArg};
 pub use types::Value;

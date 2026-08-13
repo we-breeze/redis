@@ -1,7 +1,7 @@
 //! A multiplexed async connection to the mesh.
 //!
 //! [`MultiplexedConnection`] is a cheap-`Clone` handle over an mpsc channel to a
-//! single background driver task that owns the socket (TCP or unix). Many
+//! single background driver task that owns the TCP socket. Many
 //! callers issue commands concurrently; the driver writes them to the socket
 //! and matches replies back to waiters in FIFO order. This gives automatic
 //! pipelining and lets one socket serve high concurrency without a lock or a
@@ -106,31 +106,17 @@ impl MultiplexedConnection {
         let alive = Arc::new(AtomicBool::new(true));
         let last_reply_ms = Arc::new(AtomicU64::new(0));
         let max_inflight = max_inflight.max(1);
-        let addr = match endpoint {
-            Endpoint::Tcp(addr) => {
-                let stream = tokio::net::TcpStream::connect(addr).await?;
-                stream.set_nodelay(true).ok();
-                tokio::spawn(drive(
-                    stream,
-                    rx,
-                    alive.clone(),
-                    last_reply_ms.clone(),
-                    max_inflight,
-                ));
-                Some(*addr)
-            }
-            Endpoint::Unix(path) => {
-                let stream = tokio::net::UnixStream::connect(path).await?;
-                tokio::spawn(drive(
-                    stream,
-                    rx,
-                    alive.clone(),
-                    last_reply_ms.clone(),
-                    max_inflight,
-                ));
-                None
-            }
-        };
+        let stream =
+            tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
+        stream.set_nodelay(true).ok();
+        let addr = stream.peer_addr().ok();
+        tokio::spawn(drive(
+            stream,
+            rx,
+            alive.clone(),
+            last_reply_ms.clone(),
+            max_inflight,
+        ));
         let conn = MultiplexedConnection {
             tx,
             alive,
@@ -593,10 +579,17 @@ mod tests {
         (addr, task)
     }
 
+    fn endpoint(addr: SocketAddr) -> Endpoint {
+        Endpoint {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        }
+    }
+
     #[tokio::test]
     async fn fails_fast_when_inflight_budget_exhausted() {
         let (addr, _mesh) = silent_mesh().await;
-        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr), 2)
+        let conn = MultiplexedConnection::connect(&endpoint(addr), 2)
             .await
             .unwrap();
 
@@ -621,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn poisoned_connection_refuses_new_requests() {
         let (addr, _mesh) = silent_mesh().await;
-        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr), 16)
+        let conn = MultiplexedConnection::connect(&endpoint(addr), 16)
             .await
             .unwrap();
         assert!(conn.is_alive());
@@ -670,7 +663,7 @@ mod tests {
 
         // Replies still flowing around the slow request: responsive.
         let (addr, _mesh) = slow_marker_mesh().await;
-        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr), 16)
+        let conn = MultiplexedConnection::connect(&endpoint(addr), 16)
             .await
             .unwrap();
         conn.req_command(&cmd("GET")).await.unwrap();
@@ -685,7 +678,7 @@ mod tests {
 
         // A fully silent connection: not responsive, would be poisoned.
         let (addr, _mesh) = silent_mesh().await;
-        let conn = MultiplexedConnection::connect(&Endpoint::Tcp(addr), 16)
+        let conn = MultiplexedConnection::connect(&endpoint(addr), 16)
             .await
             .unwrap();
         assert!(!conn.responsive_within(Duration::from_millis(150)));

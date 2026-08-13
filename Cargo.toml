@@ -20,9 +20,12 @@ rand = "0.8"
 memchr = "2"
 log = "0.4"
 enum_dispatch = "0.3"
+brz-discovery = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tempfile = { workspace = true }
 
 [features]
 # Integration tests that require a live redis-server are gated behind this.
@@ -34,10 +37,14 @@ direct-tcp = []
 # only other member.
 [workspace]
 members = ["tools/redis-bench"]
-exclude = ["memory"]
+exclude = ["memory", "crates/discovery"]
 resolver = "2"
 
 [workspace.dependencies]
+# External Breeze submodule, kept outside this repository's Cargo workspace.
+brz-discovery = { package = "discovery", path = "crates/discovery" }
+async-trait = "0.1"
+tempfile = "3"
 # Workspace submodule: the bench harness installs this allocator at its binary
 # composition root to get mimalloc + per-request allocation accounting. The SDK
 # itself stays allocator-agnostic.

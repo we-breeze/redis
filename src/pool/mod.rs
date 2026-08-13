@@ -77,6 +77,13 @@ pub struct Pool {
 /// (backend migration/failover) are picked up without waiting for failures.
 const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+fn tcp_endpoint(addr: SocketAddr) -> Endpoint {
+    Endpoint {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+    }
+}
+
 impl Pool {
     /// Discover the mesh endpoint, warm up the pool, and start maintenance.
     pub async fn connect(config: MeshConfig) -> RedisResult<Arc<Self>> {
@@ -109,7 +116,7 @@ impl Pool {
         // Shuffle like clientBalancer, so sibling processes don't all pick
         // the same first IP.
         addrs.shuffle(&mut rand::thread_rng());
-        let endpoint = Endpoint::Tcp(addrs[0]);
+        let endpoint = tcp_endpoint(addrs[0]);
         Self::start(endpoint, addrs, handshake, false, resolver, config).await
     }
 
@@ -321,7 +328,7 @@ impl Pool {
             return self.endpoint();
         }
         let idx = self.ip_cursor.fetch_add(1, Ordering::Relaxed);
-        Endpoint::Tcp(ips[idx % ips.len()])
+        tcp_endpoint(ips[idx % ips.len()])
     }
 
     fn evict_dead(&self) {
