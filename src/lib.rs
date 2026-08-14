@@ -3,14 +3,17 @@
 //! A high-performance, high-availability async Redis client for the breeze
 //! platform, with **two explicitly separated access modes**:
 //!
-//! ## Application API — [`Redis`], [`SidecarRedis`], and [`MsRedis`]
+//! ## Application API — [`Redis`], [`SidecarRedis`], [`MsRedis`], and
+//! [`ShardedMsRedis`]
 //!
 //! Application code should depend on the small [`Redis`] contract. Its first
 //! version contains only the `GET`, `HGET`, and `HMGET` operations used by
 //! abtest. [`SidecarRedis`] discovers an exact group/namespace through the
 //! local breeze sidecar, while [`MsRedis`] connects to one master and one or
-//! more slave endpoints with read/write splitting. These facades keep pools
-//! and command machinery out of the application boundary. `DirectRedis` is
+//! more slave endpoints with read/write splitting. [`ShardedMsRedis`] first
+//! routes by key across multiple master/slave groups, then applies the same
+//! read splitting within the selected group. These facades keep pools and
+//! command machinery out of the application boundary. `DirectRedis` is
 //! available only with the `direct-mock` feature.
 //!
 //! ```no_run
@@ -118,6 +121,7 @@ pub mod pipeline;
 pub mod pool;
 pub mod resp;
 pub mod script;
+mod sharded_ms_redis;
 pub mod sidecar;
 mod sidecar_redis;
 pub mod stats;
@@ -134,10 +138,11 @@ pub use connection::{ConnectionLike, Handshake, MultiplexedConnection};
 pub use direct_redis::DirectRedis;
 pub use error::{ErrorKind, RedisError, RedisResult};
 pub use from_value::FromRedisValue;
-pub use ms_redis::{MSRedis, MsRedis};
+pub use ms_redis::MsRedis;
 pub use pipeline::Pipeline;
 pub use pool::Pool;
 pub use script::Script;
+pub use sharded_ms_redis::ShardedMsRedis;
 pub use sidecar_redis::SidecarRedis;
 pub use to_args::{Bytes, RedisWrite, ToRedisArgs, ToSingleRedisArg};
 pub use types::Value;
