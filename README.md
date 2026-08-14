@@ -34,15 +34,39 @@ Both methods return binary-safe `RedisBytes`; missing values are represented
 as `None`. The concrete facade keeps pools and the low-level command API out of
 the application boundary.
 
-The repository also contains lower-level access forms for infrastructure and
-compatibility code:
+For direct master/slave access, construct `MsRedis` with one writable master
+and at least one slave. Endpoints use `host:port[:db]`. The application
+`Redis` reads are spread across healthy slaves, while the lower-level
+`Commands` write operations always use the master:
 
-- `sidecar::SidecarClient`: pooled Breeze sidecar access;
+```rust
+use redis::{Commands, MsRedis, Redis};
+
+# async fn demo() -> redis::RedisResult<()> {
+let redis = MsRedis::new(
+    "redis-master.example:6379",
+    ["redis-slave-a.example:6379", "redis-slave-b.example:6379"],
+)
+.await?;
+let value = Redis::hget(&redis, "key", "field").await?;
+let _: i64 = redis.hset("key", "field", "value").await?;
+# let _ = value;
+# Ok(())
+# }
+```
+
+With the default feature set, direct-backend implementation types remain
+internal. Enable `direct-mock` only for tests, validation tools, or benchmarks
+that need to construct direct clients. That feature exposes:
+
 - `direct::DirectClient`: one direct Redis backend;
 - `direct::HaServer`: primary/fallback with optional double write;
 - `direct::MsServer`: master/slave read splitting;
 - `direct::Shards<T>`: client-side sharding over another connection form;
-- `Client`: a common enum over sidecar and direct clients.
+- the `Client::Direct` variant and `DirectRedis` facade.
+
+`sidecar::SidecarClient`, `MsRedis` (`MSRedis` alias), and the sidecar `Client`
+variant remain available with default features.
 
 These continue to expose the low-level `Commands`/`ConnectionLike` surface.
 They are not automatically part of the application `Redis` trait; adapters can

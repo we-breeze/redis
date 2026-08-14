@@ -67,7 +67,7 @@ impl SidecarClient {
     }
 
     /// Wrap an already-connected pool. Used by the direct-backend access
-    /// ([`crate::direct`]), where the pool is built from a static endpoint
+    /// (exposed by the `direct-mock` feature), where the pool is built from a static endpoint
     /// instead of mesh discovery.
     pub(crate) fn from_pool(
         pool: Arc<Pool>,
