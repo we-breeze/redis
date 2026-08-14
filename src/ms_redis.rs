@@ -117,7 +117,7 @@ impl MsRedis {
     }
 }
 
-fn validate_topology(master_label: &str, slave_labels: &[String]) -> RedisResult<()> {
+pub(crate) fn validate_topology(master_label: &str, slave_labels: &[String]) -> RedisResult<()> {
     if slave_labels.is_empty() {
         return Err(RedisError::new(
             ErrorKind::ClientError,
@@ -192,10 +192,6 @@ impl Redis for MsRedis {
         crate::api::hmget(self, key, fields).await
     }
 }
-
-/// Compatibility spelling for callers that use the all-caps `MS` acronym.
-#[allow(clippy::upper_case_acronyms)]
-pub type MSRedis = MsRedis;
 
 #[cfg(test)]
 mod tests {

@@ -65,12 +65,40 @@ that need to construct direct clients. That feature exposes:
 - `direct::Shards<T>`: client-side sharding over another connection form;
 - the `Client::Direct` variant and `DirectRedis` facade.
 
-`sidecar::SidecarClient`, `MsRedis` (`MSRedis` alias), and the sidecar `Client`
+`sidecar::SidecarClient`, `MsRedis`, `ShardedMsRedis`, and the sidecar `Client`
 variant remain available with default features.
 
-These continue to expose the low-level `Commands`/`ConnectionLike` surface.
-They are not automatically part of the application `Redis` trait; adapters can
-be added when a production consumer actually needs another access form.
+For several master/slave groups, `ShardedMsRedis` hashes each Redis key first
+and then delegates the operation to the selected `MsRedis`. The distribution
+is `modula`, so group order is part of the routing contract:
+
+```rust
+use redis::{Redis, ShardedMsRedis};
+
+# async fn demo() -> redis::RedisResult<()> {
+let redis = ShardedMsRedis::new(
+    "crc32",
+    vec![
+        (
+            "redis-a-master.example:6379",
+            vec!["redis-a-slave-1.example:6379", "redis-a-slave-2.example:6379"],
+        ),
+        (
+            "redis-b-master.example:6379",
+            vec!["redis-b-slave-1.example:6379", "redis-b-slave-2.example:6379"],
+        ),
+    ],
+)
+.await?;
+let value = Redis::hget(&redis, "user:42", "name").await?;
+# let _ = value;
+# Ok(())
+# }
+```
+
+`MsRedis` also exposes the low-level `Commands`/`ConnectionLike` surface.
+`ShardedMsRedis` deliberately exposes only the application `Redis` contract,
+so routing always uses the explicit key supplied to `get`, `hget`, or `hmget`.
 
 ## Design
 
