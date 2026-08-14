@@ -13,7 +13,7 @@
 //! - [`MeshRouting`] — `with_hashkey` / `broadcast` / `at_master` routing
 //!   preambles understood by the mesh.
 //!
-//! For direct backend access (no mesh), see [`crate::direct`].
+//! Direct backend access is exposed only by the `direct-mock` feature.
 
 pub mod client;
 pub mod config;

@@ -3,14 +3,15 @@
 //! A high-performance, high-availability async Redis client for the breeze
 //! platform, with **two explicitly separated access modes**:
 //!
-//! ## Application API — [`Redis`], [`SidecarRedis`], and [`DirectRedis`]
+//! ## Application API — [`Redis`], [`SidecarRedis`], and [`MsRedis`]
 //!
 //! Application code should depend on the small [`Redis`] contract. Its first
 //! version contains only the `GET`, `HGET`, and `HMGET` operations used by
 //! abtest. [`SidecarRedis`] discovers an exact group/namespace through the
-//! local breeze sidecar, while [`DirectRedis`] connects to one explicit
-//! endpoint for tests and validation. Both keep pools and command machinery
-//! out of the application boundary.
+//! local breeze sidecar, while [`MsRedis`] connects to one master and one or
+//! more slave endpoints with read/write splitting. These facades keep pools
+//! and command machinery out of the application boundary. `DirectRedis` is
+//! available only with the `direct-mock` feature.
 //!
 //! ```no_run
 //! use redis::{Redis, SidecarRedis};
@@ -48,17 +49,15 @@
 //! # }
 //! ```
 //!
-//! ## Direct backend mode — [`direct`]
+//! ## Direct backend mode (`direct-mock` feature)
 //!
-//! The SDK connects to the Redis backends directly (no mesh), with
-//! client-side sharding ([`direct::Shards`], the `shardingSupport`
-//! pattern) using the same hash/distribution algorithms as the mesh
-//! ([`direct::sharding`]), and HA layouts ported from the Java client:
-//! [`direct::DirectClient`] (one `host:port[:db]` server),
-//! [`direct::HaServer`] (read fallback + double-write/set-second), and
-//! [`direct::MsServer`] (master/slave read splitting).
+//! Direct-backend types are public only when `direct-mock` is enabled. The
+//! internal implementation remains available to higher-level clients such as
+//! [`MsRedis`]. The feature exposes `direct::DirectClient`, `direct::Shards`,
+//! `direct::HaServer`, and `direct::MsServer` for tests, validation tools, and
+//! benchmarks.
 //!
-//! ```no_run
+//! ```ignore
 //! use redis::direct::{DirectClient, ServerConfig, Shards};
 //! use redis::Commands;
 //!
@@ -80,23 +79,9 @@
 //!
 //! ## Unified proxy — [`Client`]
 //!
-//! [`Client`] is a mode-agnostic enum over both clients, implementing
-//! [`ConnectionLike`] so the whole [`Commands`] surface works regardless of
-//! the resource's access mode:
-//!
-//! ```no_run
-//! use redis::{Client, Commands};
-//! use redis::sidecar::SidecarClient;
-//!
-//! # async fn demo(direct: redis::direct::DirectClient) -> redis::RedisResult<()> {
-//! let sidecar = SidecarClient::connect("my_ns").await?;
-//! let clients: Vec<Client> = vec![sidecar.into(), direct.into()];
-//! for client in &clients {
-//!     let _: Option<String> = client.hget("key", "f").await?;
-//! }
-//! # Ok(())
-//! # }
-//! ```
+//! [`Client`] wraps the sidecar client by default and additionally exposes its
+//! direct variant when `direct-mock` is enabled. It implements
+//! [`ConnectionLike`] so the whole [`Commands`] surface remains uniform.
 //!
 //! ## Shared layers (both modes)
 //!
@@ -118,10 +103,17 @@ pub mod client;
 pub mod cmd;
 pub mod commands;
 pub mod connection;
+#[cfg(any(feature = "direct-mock", doctest))]
 pub mod direct;
+#[cfg(all(not(feature = "direct-mock"), not(doctest)))]
+#[allow(dead_code, unused_imports)]
+#[doc(hidden)]
+mod direct;
+#[cfg(feature = "direct-mock")]
 mod direct_redis;
 pub mod error;
 pub mod from_value;
+mod ms_redis;
 pub mod pipeline;
 pub mod pool;
 pub mod resp;
@@ -138,9 +130,11 @@ pub use client::Client;
 pub use cmd::{Cmd, cmd, pipe};
 pub use commands::Commands;
 pub use connection::{ConnectionLike, Handshake, MultiplexedConnection};
+#[cfg(feature = "direct-mock")]
 pub use direct_redis::DirectRedis;
 pub use error::{ErrorKind, RedisError, RedisResult};
 pub use from_value::FromRedisValue;
+pub use ms_redis::{MSRedis, MsRedis};
 pub use pipeline::Pipeline;
 pub use pool::Pool;
 pub use script::Script;

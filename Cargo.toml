@@ -28,6 +28,10 @@ tokio = { version = "1", features = ["full"] }
 tempfile = { workspace = true }
 
 [features]
+default = []
+# Expose direct-backend types for tests, mocks, validation, and benchmarks.
+# Direct internals remain compiled for higher-level clients such as MsRedis.
+direct-mock = []
 # Integration tests that require a live redis-server are gated behind this.
 integration-tests = []
 
