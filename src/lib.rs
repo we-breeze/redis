@@ -3,18 +3,21 @@
 //! A high-performance, high-availability async Redis client for the breeze
 //! platform, with **two explicitly separated access modes**:
 //!
-//! ## Application API — [`Redis`], [`SidecarRedis`], [`MsRedis`], and
-//! [`ShardedMsRedis`]
+//! ## Application API — [`Redis`], [`SidecarRedis`], [`MsRedis`],
+//! [`ShardedMsRedis`], and [`RedisService`]
 //!
 //! Application code should depend on the small [`Redis`] contract. Its first
-//! version contains only the `GET`, `HGET`, and `HMGET` operations used by
+//! version contains only the `GET`, binary-safe `SET`, `HGET`, and `HMGET`
+//! operations used by
 //! abtest. [`SidecarRedis`] discovers an exact group/namespace through the
 //! local breeze sidecar, while [`MsRedis`] connects to one master and one or
 //! more slave endpoints with read/write splitting. [`ShardedMsRedis`] first
 //! routes by key across multiple master/slave groups, then applies the same
-//! read splitting within the selected group. These facades keep pools and
-//! command machinery out of the application boundary. `DirectRedis` is
-//! available only with the `direct-mock` feature.
+//! read splitting within the selected group. [`RedisService`] adds explicit
+//! routing keys, range-style distributions, atomically replaceable topology,
+//! and per-shard reusable pools without coupling to a configuration source.
+//! These facades keep pools and command machinery out of the application
+//! boundary. `DirectRedis` is available only with the `direct-mock` feature.
 //!
 //! ```no_run
 //! use redis::{Redis, SidecarRedis};
@@ -119,6 +122,7 @@ pub mod from_value;
 mod ms_redis;
 pub mod pipeline;
 pub mod pool;
+mod redis_service;
 pub mod resp;
 pub mod script;
 mod sharded_ms_redis;
@@ -141,6 +145,7 @@ pub use from_value::FromRedisValue;
 pub use ms_redis::MsRedis;
 pub use pipeline::Pipeline;
 pub use pool::Pool;
+pub use redis_service::{RedisService, RedisServiceOptions, ShardRouting};
 pub use script::Script;
 pub use sharded_ms_redis::ShardedMsRedis;
 pub use sidecar_redis::SidecarRedis;

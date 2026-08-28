@@ -51,6 +51,21 @@ impl MsRedis {
                 .collect::<Vec<_>>(),
         )?;
 
+        Self::from_server_configs(master_config, slave_configs).await
+    }
+
+    pub(crate) async fn from_server_configs(
+        master_config: ServerConfig,
+        slave_configs: Vec<ServerConfig>,
+    ) -> RedisResult<Self> {
+        validate_topology(
+            &master_config.label(),
+            &slave_configs
+                .iter()
+                .map(ServerConfig::label)
+                .collect::<Vec<_>>(),
+        )?;
+
         let master_label = master_config.label();
         let master = DirectClient::connect(master_config)
             .await
@@ -182,6 +197,10 @@ impl ConnectionLike for MsRedis {
 impl Redis for MsRedis {
     async fn get(&self, key: &str) -> RedisResult<Option<RedisBytes>> {
         crate::api::get(self, key).await
+    }
+
+    async fn set(&self, key: &str, value: &[u8]) -> RedisResult<()> {
+        crate::api::set(self, key, value).await
     }
 
     async fn hget(&self, key: &str, field: &str) -> RedisResult<Option<RedisBytes>> {
