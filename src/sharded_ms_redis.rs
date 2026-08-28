@@ -107,7 +107,7 @@ where
                 .iter()
                 .map(|slave| ServerConfig::new(slave).map(|config| config.label()))
                 .collect::<RedisResult<Vec<_>>>()?;
-            validate_topology(&master_label, &slave_labels)?;
+            validate_topology(&slave_labels)?;
 
             Ok(TopologyGroup {
                 master,

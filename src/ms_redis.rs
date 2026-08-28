@@ -44,7 +44,6 @@ impl MsRedis {
             .map(|endpoint| ServerConfig::new(endpoint.as_ref()))
             .collect::<RedisResult<Vec<_>>>()?;
         validate_topology(
-            &master_config.label(),
             &slave_configs
                 .iter()
                 .map(ServerConfig::label)
@@ -59,7 +58,6 @@ impl MsRedis {
         slave_configs: Vec<ServerConfig>,
     ) -> RedisResult<Self> {
         validate_topology(
-            &master_config.label(),
             &slave_configs
                 .iter()
                 .map(ServerConfig::label)
@@ -132,7 +130,7 @@ impl MsRedis {
     }
 }
 
-pub(crate) fn validate_topology(master_label: &str, slave_labels: &[String]) -> RedisResult<()> {
+pub(crate) fn validate_topology(slave_labels: &[String]) -> RedisResult<()> {
     if slave_labels.is_empty() {
         return Err(RedisError::new(
             ErrorKind::ClientError,
@@ -142,12 +140,6 @@ pub(crate) fn validate_topology(master_label: &str, slave_labels: &[String]) -> 
 
     let mut unique = HashSet::with_capacity(slave_labels.len());
     for label in slave_labels {
-        if label == master_label {
-            return Err(RedisError::new(
-                ErrorKind::ClientError,
-                format!("slave backend {label} is also configured as master"),
-            ));
-        }
         if !unique.insert(label.as_str()) {
             return Err(RedisError::new(
                 ErrorKind::ClientError,
@@ -318,15 +310,25 @@ mod tests {
             .unwrap();
         assert_eq!(error.kind(), ErrorKind::ClientError);
 
-        let error = validate_topology(
-            "master:6379:0",
-            &["slave:6379:0".to_string(), "slave:6379:0".to_string()],
-        )
-        .unwrap_err();
+        let error = validate_topology(&["slave:6379:0".to_string(), "slave:6379:0".to_string()])
+            .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ClientError);
 
-        let error = validate_topology("master:6379:0", &["master:6379:0".to_string()]).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::ClientError);
+        validate_topology(&["master:6379:0".to_string()]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_the_same_endpoint_for_master_and_slave() {
+        let server = FakeRedis::start("same-backend").await;
+        let redis = MsRedis::new(&server.endpoint, [&server.endpoint])
+            .await
+            .unwrap();
+
+        let value = Redis::get(&redis, "key").await.unwrap();
+        assert_eq!(value.as_deref(), Some(b"same-backend".as_slice()));
+        Redis::set(&redis, "key", b"value").await.unwrap();
+        assert!(server.saw("GET"));
+        assert!(server.saw("SET"));
     }
 
     #[tokio::test]
