@@ -35,6 +35,10 @@ impl Redis for DirectRedis {
         crate::api::get(&self.client, key).await
     }
 
+    async fn set(&self, key: &str, value: &[u8]) -> RedisResult<()> {
+        crate::api::set(&self.client, key, value).await
+    }
+
     async fn hget(&self, key: &str, field: &str) -> RedisResult<Option<RedisBytes>> {
         crate::api::hget(&self.client, key, field).await
     }

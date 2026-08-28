@@ -68,6 +68,10 @@ impl ShardedMsRedis {
     fn shard_for_key(&self, key: &str) -> &MsRedis {
         self.shards.for_key(key.as_bytes())
     }
+
+    fn shard_for_route(&self, routing_key: &[u8]) -> &MsRedis {
+        self.shards.for_key(routing_key)
+    }
 }
 
 fn validate_groups<M, S>(groups: Vec<(M, Vec<S>)>) -> RedisResult<Vec<TopologyGroup>>
@@ -118,6 +122,18 @@ where
 impl Redis for ShardedMsRedis {
     async fn get(&self, key: &str) -> RedisResult<Option<RedisBytes>> {
         Redis::get(self.shard_for_key(key), key).await
+    }
+
+    async fn set(&self, key: &str, value: &[u8]) -> RedisResult<()> {
+        Redis::set(self.shard_for_key(key), key, value).await
+    }
+
+    async fn get_routed(&self, routing_key: &[u8], key: &str) -> RedisResult<Option<RedisBytes>> {
+        Redis::get(self.shard_for_route(routing_key), key).await
+    }
+
+    async fn set_routed(&self, routing_key: &[u8], key: &str, value: &[u8]) -> RedisResult<()> {
+        Redis::set(self.shard_for_route(routing_key), key, value).await
     }
 
     async fn hget(&self, key: &str, field: &str) -> RedisResult<Option<RedisBytes>> {

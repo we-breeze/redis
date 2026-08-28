@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 
-use crate::sidecar::{MeshConfig, SidecarClient};
+use crate::sidecar::{MeshConfig, MeshRouting, SidecarClient};
 use crate::{Redis, RedisBytes, RedisResult};
 
 /// A [`Redis`] implementation routed through the local Breeze sidecar.
@@ -39,6 +39,18 @@ impl SidecarRedis {
 impl Redis for SidecarRedis {
     async fn get(&self, key: &str) -> RedisResult<Option<RedisBytes>> {
         crate::api::get(&self.client, key).await
+    }
+
+    async fn set(&self, key: &str, value: &[u8]) -> RedisResult<()> {
+        crate::api::set(&self.client, key, value).await
+    }
+
+    async fn get_routed(&self, routing_key: &[u8], key: &str) -> RedisResult<Option<RedisBytes>> {
+        crate::api::get(&self.client.with_hashkey(routing_key), key).await
+    }
+
+    async fn set_routed(&self, routing_key: &[u8], key: &str, value: &[u8]) -> RedisResult<()> {
+        crate::api::set(&self.client.with_hashkey(routing_key), key, value).await
     }
 
     async fn hget(&self, key: &str, field: &str) -> RedisResult<Option<RedisBytes>> {

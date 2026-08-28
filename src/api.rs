@@ -23,6 +23,26 @@ pub trait Redis: Send + Sync {
     /// `GET key`; a missing key is `Ok(None)`.
     async fn get(&self, key: &str) -> RedisResult<Option<RedisBytes>>;
 
+    /// `SET key value`; both the command encoder and this boundary preserve
+    /// arbitrary binary values.
+    async fn set(&self, key: &str, value: &[u8]) -> RedisResult<()>;
+
+    /// `GET key` while selecting a shard from an explicit routing key.
+    ///
+    /// Unsharded implementations may ignore `routing_key`. Sharded
+    /// implementations must route with it rather than with `key`, matching
+    /// Java's `getClient(routingKey).get(key)` call shape.
+    async fn get_routed(&self, routing_key: &[u8], key: &str) -> RedisResult<Option<RedisBytes>> {
+        let _ = routing_key;
+        self.get(key).await
+    }
+
+    /// `SET key value` while selecting a shard from an explicit routing key.
+    async fn set_routed(&self, routing_key: &[u8], key: &str, value: &[u8]) -> RedisResult<()> {
+        let _ = routing_key;
+        self.set(key, value).await
+    }
+
     /// `HGET key field`; a missing key or field is `Ok(None)`.
     async fn hget(&self, key: &str, field: &str) -> RedisResult<Option<RedisBytes>>;
 
@@ -40,6 +60,16 @@ pub(crate) async fn get(
     let mut command = cmd("GET");
     command.mark_readonly();
     command.arg(key);
+    query(connection, &command).await
+}
+
+pub(crate) async fn set(
+    connection: &(impl ConnectionLike + ?Sized),
+    key: &str,
+    value: &[u8],
+) -> RedisResult<()> {
+    let mut command = cmd("SET");
+    command.arg(key).arg(value);
     query(connection, &command).await
 }
 
@@ -142,6 +172,23 @@ mod tests {
         assert_eq!(
             connection.command(),
             [b"GET".as_slice(), b"u:42".as_slice()].map(<[u8]>::to_vec)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_preserves_binary_value_bytes() {
+        let connection = Stub::new(Value::Okay);
+
+        set(&connection, "u:42", b"\x00\x7f\x80\xff").await.unwrap();
+
+        assert_eq!(
+            connection.command(),
+            [
+                b"SET".as_slice(),
+                b"u:42".as_slice(),
+                b"\x00\x7f\x80\xff".as_slice(),
+            ]
+            .map(<[u8]>::to_vec)
         );
     }
 
