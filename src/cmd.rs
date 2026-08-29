@@ -5,6 +5,7 @@ use crate::error::RedisResult;
 use crate::from_value::FromRedisValue;
 use crate::pipeline::Pipeline;
 use crate::to_args::ToRedisArgs;
+use crate::{EncodeRedisArg, ErrorKind, RedisArgSink, RedisArgsSink, RedisError};
 use bytes::BufMut;
 
 /// A single Redis command: a command name plus its already-serialized
@@ -25,6 +26,16 @@ pub struct Cmd {
 struct ArgSink<'a> {
     buf: &'a mut Vec<u8>,
     spans: &'a mut Vec<(u32, u32)>,
+}
+
+struct EncodedArgSink<'a> {
+    buf: &'a mut Vec<u8>,
+}
+
+impl RedisArgSink for EncodedArgSink<'_> {
+    fn write(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
 }
 
 impl crate::to_args::RedisWrite for ArgSink<'_> {
@@ -84,6 +95,39 @@ impl Cmd {
         self.buf.extend_from_slice(bytes);
         self.spans.push((start, bytes.len() as u32));
         self
+    }
+
+    /// Append one argument through the allocation-free generic encoder.
+    pub fn arg_encoded<A: EncodeRedisArg>(&mut self, arg: A) -> RedisResult<&mut Self> {
+        let start = self.buf.len();
+        let expected = arg.encoded_len();
+        let Some(end) = start.checked_add(expected) else {
+            return Err(RedisError::new(
+                ErrorKind::ClientError,
+                "Redis argument length overflow",
+            ));
+        };
+        if end > u32::MAX as usize {
+            return Err(RedisError::new(
+                ErrorKind::ClientError,
+                "Redis command exceeds its 4 GiB argument storage limit",
+            ));
+        }
+
+        self.buf.reserve(expected);
+        if let Err(error) = arg.encode(&mut EncodedArgSink { buf: &mut self.buf }) {
+            self.buf.truncate(start);
+            return Err(error);
+        }
+        if self.buf.len() != end {
+            self.buf.truncate(start);
+            return Err(RedisError::new(
+                ErrorKind::ClientError,
+                "Redis argument encoder wrote a length different from encoded_len",
+            ));
+        }
+        self.spans.push((start as u32, expected as u32));
+        Ok(self)
     }
 
     /// Number of RESP arguments.
@@ -158,6 +202,13 @@ impl Cmd {
         C: ConnectionLike + ?Sized,
     {
         con.req_command(self).await?.into_result()?;
+        Ok(())
+    }
+}
+
+impl RedisArgsSink for Cmd {
+    fn write_arg<A: EncodeRedisArg + ?Sized>(&mut self, arg: &A) -> RedisResult<()> {
+        self.arg_encoded(arg)?;
         Ok(())
     }
 }
