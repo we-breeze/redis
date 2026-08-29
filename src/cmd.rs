@@ -5,6 +5,7 @@ use crate::error::RedisResult;
 use crate::from_value::FromRedisValue;
 use crate::pipeline::Pipeline;
 use crate::to_args::ToRedisArgs;
+use bytes::BufMut;
 
 /// A single Redis command: a command name plus its already-serialized
 /// arguments, stored as one flat byte buffer plus span indices — two
@@ -128,6 +129,17 @@ impl Cmd {
             &mut out,
         );
         out
+    }
+
+    /// Append this command directly to an existing connection write buffer.
+    pub(crate) fn encode_into(&self, out: &mut impl BufMut) {
+        crate::resp::encoder::encode_command_slices(
+            self.spans
+                .iter()
+                .map(|&(start, len)| &self.buf[start as usize..start as usize + len as usize]),
+            self.spans.len(),
+            out,
+        );
     }
 
     /// Send the command and convert its reply into `RV`.

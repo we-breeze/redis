@@ -15,9 +15,11 @@
 //! routes by key across multiple master/slave groups, then applies the same
 //! read splitting within the selected group. [`RedisService`] adds explicit
 //! routing keys, range-style distributions, atomically replaceable topology,
-//! and per-shard reusable pools without coupling to a configuration source.
-//! These facades keep pools and command machinery out of the application
-//! boundary. `DirectRedis` is available only with the `direct-mock` feature.
+//! one multiplexed TCP session per physical IPv4 node, quota-based replica
+//! balancing, and shared IPv4 DNS refresh without coupling to a configuration
+//! source. These facades keep transport and command machinery out of the
+//! application boundary. `DirectRedis` is available only with the
+//! `direct-mock` feature.
 //!
 //! ```no_run
 //! use redis::{Redis, SidecarRedis};
@@ -120,6 +122,7 @@ mod direct_redis;
 pub mod error;
 pub mod from_value;
 mod ms_redis;
+mod net_transport;
 pub mod pipeline;
 pub mod pool;
 mod redis_service;

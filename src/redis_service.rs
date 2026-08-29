@@ -1,15 +1,27 @@
-//! Configuration-source-independent direct sharded Redis service.
+//! Configuration-source-independent sharded Redis service on `brz-net`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use brz_net::{
+    DnsOptions, DnsSource, EndpointSet, EndpointSource, NetError, Node, NodeOptions,
+    QuotaBalancerOptions, ReplicaSet, ShardRouter, Sharded,
+};
 use futures_util::future::try_join_all;
+use tokio::time::{Instant, MissedTickBehavior, sleep};
 
-use crate::direct::{ServerConfig, Shards};
-use crate::{ErrorKind, MsRedis, Redis, RedisBytes, RedisError, RedisResult};
+use crate::direct::sharding::Sharding;
+use crate::net_transport::{RedisProtocol, map_session_error};
+use crate::{
+    Cmd, ErrorKind, FromRedisValue, Redis, RedisBytes, RedisError, RedisResult, Value, cmd,
+};
+
+const DNS_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Hash and distribution names understood by Breeze's direct sharding layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,47 +59,29 @@ impl ShardRouting {
     }
 }
 
-/// Connection-pool settings used while building every shard.
+/// Transport settings used while building every shard.
 #[derive(Clone, Debug)]
 pub struct RedisServiceOptions {
-    min_connections: usize,
-    max_connections: usize,
-    max_inflight: usize,
     master_timeout: Duration,
     slave_timeout: Duration,
+    connect_timeout: Duration,
+    dns_refresh_interval: Duration,
+    replica_balance: QuotaBalancerOptions,
 }
 
 impl Default for RedisServiceOptions {
     fn default() -> Self {
         Self {
-            min_connections: 2,
-            max_connections: 16,
-            max_inflight: 4096,
             master_timeout: Duration::from_millis(500),
             slave_timeout: Duration::from_millis(500),
+            connect_timeout: Duration::from_secs(2),
+            dns_refresh_interval: Duration::from_secs(30),
+            replica_balance: QuotaBalancerOptions::default(),
         }
     }
 }
 
 impl RedisServiceOptions {
-    #[must_use]
-    pub fn with_min_connections(mut self, value: usize) -> Self {
-        self.min_connections = value;
-        self
-    }
-
-    #[must_use]
-    pub fn with_max_connections(mut self, value: usize) -> Self {
-        self.max_connections = value;
-        self
-    }
-
-    #[must_use]
-    pub fn with_max_inflight(mut self, value: usize) -> Self {
-        self.max_inflight = value;
-        self
-    }
-
     #[must_use]
     pub fn with_master_timeout(mut self, value: Duration) -> Self {
         self.master_timeout = value;
@@ -99,15 +93,176 @@ impl RedisServiceOptions {
         self.slave_timeout = value;
         self
     }
+
+    #[must_use]
+    pub fn with_connect_timeout(mut self, value: Duration) -> Self {
+        self.connect_timeout = value;
+        self
+    }
+
+    #[must_use]
+    pub fn with_dns_refresh_interval(mut self, value: Duration) -> Self {
+        self.dns_refresh_interval = value;
+        self
+    }
+
+    #[must_use]
+    pub fn with_replica_quota(mut self, value: Duration) -> Self {
+        self.replica_balance.quota = value;
+        self
+    }
+
+    #[must_use]
+    pub fn with_failure_penalty(mut self, value: Duration) -> Self {
+        self.replica_balance.failure_penalty = value;
+        self
+    }
+}
+
+struct RedisShard {
+    // A hostname may resolve to more than one equivalent IPv4 address.
+    master: ReplicaSet<Node<RedisProtocol>>,
+    slaves: ReplicaSet<Node<RedisProtocol>>,
+}
+
+#[derive(Clone, Debug)]
+struct RedisRouter {
+    sharding: Sharding,
+}
+
+impl ShardRouter<[u8]> for RedisRouter {
+    #[inline]
+    fn route(&self, key: &[u8], shard_count: usize) -> usize {
+        let index = self.sharding.shard_idx(key);
+        debug_assert!(index < shard_count);
+        index
+    }
+}
+
+struct RedisTopology {
+    shards: Sharded<RedisShard, RedisRouter>,
+    discovery: Arc<RedisDiscovery>,
+    resolved: ResolvedTopology,
+    nodes: HashMap<NodeKey, Node<RedisProtocol>>,
 }
 
 struct RedisServiceInner {
-    topology: ArcSwap<Shards<MsRedis>>,
+    topology: ArcSwap<RedisTopology>,
     routing: ShardRouting,
     options: RedisServiceOptions,
 }
 
-/// A pooled direct Redis implementation with client-side sharding.
+#[derive(Clone)]
+struct RedisEndpointConfig {
+    host: String,
+    port: u16,
+    db: i64,
+    auth: Option<String>,
+}
+
+impl RedisEndpointConfig {
+    fn label(&self) -> String {
+        format!("{}:{}:{}", self.host, self.port, self.db)
+    }
+}
+
+#[derive(Clone)]
+struct RedisEndpointSource {
+    config: RedisEndpointConfig,
+    endpoints: EndpointSet,
+}
+
+struct RedisShardSources {
+    master: RedisEndpointSource,
+    slaves: Vec<RedisEndpointSource>,
+}
+
+struct RedisDiscovery {
+    shards: Vec<RedisShardSources>,
+    router: RedisRouter,
+    // Keeping the registrations alive keeps the shared DNS resolver watching
+    // every logical endpoint. The data used below is the cloned EndpointSet.
+    _dns_registrations: Vec<DnsSource>,
+}
+
+#[derive(Clone)]
+struct ResolvedEndpoint {
+    config: RedisEndpointConfig,
+    addresses: Arc<[SocketAddr]>,
+}
+
+#[derive(Clone)]
+struct ResolvedShard {
+    master: ResolvedEndpoint,
+    slaves: Vec<ResolvedEndpoint>,
+}
+
+#[derive(Clone)]
+struct ResolvedTopology {
+    shards: Vec<ResolvedShard>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct NodeKey {
+    endpoint: SocketAddr,
+    db: i64,
+    auth: Option<String>,
+    request_timeout: Duration,
+}
+
+impl Hash for NodeKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.endpoint.hash(state);
+        self.db.hash(state);
+        self.auth.hash(state);
+        self.request_timeout.hash(state);
+    }
+}
+
+impl RedisDiscovery {
+    fn resolve(&self) -> ResolvedTopology {
+        ResolvedTopology {
+            shards: self
+                .shards
+                .iter()
+                .map(|shard| ResolvedShard {
+                    master: resolve_source(&shard.master),
+                    slaves: shard.slaves.iter().map(resolve_source).collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl RedisTopology {
+    fn dns_changed(&self) -> bool {
+        self.discovery
+            .shards
+            .iter()
+            .zip(&self.resolved.shards)
+            .any(|(sources, resolved)| {
+                !Arc::ptr_eq(
+                    &sources.master.endpoints.snapshot(),
+                    &resolved.master.addresses,
+                ) || sources
+                    .slaves
+                    .iter()
+                    .zip(&resolved.slaves)
+                    .any(|(source, endpoint)| {
+                        !Arc::ptr_eq(&source.endpoints.snapshot(), &endpoint.addresses)
+                    })
+            })
+    }
+}
+
+fn resolve_source(source: &RedisEndpointSource) -> ResolvedEndpoint {
+    ResolvedEndpoint {
+        config: source.config.clone(),
+        addresses: source.endpoints.snapshot(),
+    }
+}
+
+/// A single-session direct Redis implementation with client-side sharding.
 ///
 /// This type does not know where configuration came from. Callers resolve
 /// properties, Vintage, or another source into `(master, slaves)` values
@@ -118,7 +273,7 @@ pub struct RedisService {
 }
 
 impl RedisService {
-    /// Builds a direct sharded service using the SDK's pool defaults.
+    /// Builds a direct sharded service using the SDK's transport defaults.
     pub async fn sharded(
         shards: Vec<(String, Vec<String>)>,
         routing: ShardRouting,
@@ -126,133 +281,426 @@ impl RedisService {
         Self::sharded_with_options(shards, routing, RedisServiceOptions::default()).await
     }
 
-    /// Builds a direct sharded service with explicit pool settings.
+    /// Builds a direct sharded service with explicit transport settings.
     pub async fn sharded_with_options(
         shards: Vec<(String, Vec<String>)>,
         routing: ShardRouting,
         options: RedisServiceOptions,
     ) -> RedisResult<Self> {
         validate_options(&options)?;
-        let topology = build_topology(shards, &routing, &options).await?;
-        Ok(Self {
+        let discovery = build_discovery(shards, &routing, &options).await?;
+        let topology = build_topology(discovery, &options, None).await?;
+        let service = Self {
             inner: Arc::new(RedisServiceInner {
                 topology: ArcSwap::from_pointee(topology),
                 routing,
                 options,
             }),
-        })
+        };
+        spawn_dns_reconciler(&service.inner);
+        Ok(service)
     }
 
-    /// Rebuilds all pools and atomically publishes the new shard list.
+    /// Rebuilds all sessions and atomically publishes the new shard list.
     ///
     /// A failed build leaves the previous topology serving traffic.
     pub async fn update_shards(&self, shards: Vec<(String, Vec<String>)>) -> RedisResult<()> {
-        let topology = build_topology(shards, &self.inner.routing, &self.inner.options).await?;
+        let discovery = build_discovery(shards, &self.inner.routing, &self.inner.options).await?;
+        let previous = self.inner.topology.load_full();
+        let topology = build_topology(discovery, &self.inner.options, Some(&previous)).await?;
         self.inner.topology.store(Arc::new(topology));
         Ok(())
     }
 
-    fn shard_for(&self, routing_key: &[u8]) -> MsRedis {
-        self.inner.topology.load().for_key(routing_key).clone()
+    async fn execute(&self, routing_key: &[u8], command: Cmd) -> RedisResult<Value> {
+        // Keep the immutable topology alive until the admitted request
+        // completes. A concurrent update can publish a new topology without
+        // dropping this request's Node sender underneath it.
+        let topology = self.inner.topology.load_full();
+        let shard = topology.shards.get(routing_key).map_err(map_net_error)?;
+
+        let response = if command.is_readonly() {
+            shard
+                .slaves
+                .request(command)
+                .map_err(map_session_error)?
+                .await
+                .map_err(map_session_error)?
+        } else {
+            shard
+                .master
+                .request(command)
+                .map_err(map_session_error)?
+                .await
+                .map_err(map_session_error)?
+        };
+        response.into_result()
     }
+
+    async fn query<T: FromRedisValue>(&self, routing_key: &[u8], command: Cmd) -> RedisResult<T> {
+        let value = self.execute(routing_key, command).await?;
+        T::from_redis_value(&value)
+    }
+}
+
+fn spawn_dns_reconciler(inner: &Arc<RedisServiceInner>) {
+    let inner = Arc::downgrade(inner);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval_at(
+            Instant::now() + DNS_RECONCILE_INTERVAL,
+            DNS_RECONCILE_INTERVAL,
+        );
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            if let Err(error) = reconcile_dns_once(&inner).await {
+                tracing::warn!(%error, "failed to apply changed Redis DNS endpoints");
+            }
+        }
+    });
+}
+
+async fn reconcile_dns_once(inner: &RedisServiceInner) -> RedisResult<bool> {
+    let previous = inner.topology.load_full();
+    if !previous.dns_changed() {
+        return Ok(false);
+    }
+
+    let topology = build_topology(
+        Arc::clone(&previous.discovery),
+        &inner.options,
+        Some(&previous),
+    )
+    .await?;
+    let replaced = inner
+        .topology
+        .compare_and_swap(&previous, Arc::new(topology));
+    Ok(Arc::ptr_eq(&replaced, &previous))
 }
 
 #[async_trait]
 impl Redis for RedisService {
     async fn get(&self, key: &str) -> RedisResult<Option<RedisBytes>> {
-        Redis::get(&self.shard_for(key.as_bytes()), key).await
+        let mut command = cmd("GET");
+        command.mark_readonly();
+        command.arg(key);
+        self.query(key.as_bytes(), command).await
     }
 
     async fn set(&self, key: &str, value: &[u8]) -> RedisResult<()> {
-        Redis::set(&self.shard_for(key.as_bytes()), key, value).await
+        let mut command = cmd("SET");
+        command.arg(key).arg(value);
+        self.query(key.as_bytes(), command).await
     }
 
     async fn get_routed(&self, routing_key: &[u8], key: &str) -> RedisResult<Option<RedisBytes>> {
-        Redis::get(&self.shard_for(routing_key), key).await
+        let mut command = cmd("GET");
+        command.mark_readonly();
+        command.arg(key);
+        self.query(routing_key, command).await
     }
 
     async fn set_routed(&self, routing_key: &[u8], key: &str, value: &[u8]) -> RedisResult<()> {
-        Redis::set(&self.shard_for(routing_key), key, value).await
+        let mut command = cmd("SET");
+        command.arg(key).arg(value);
+        self.query(routing_key, command).await
     }
 
     async fn hget(&self, key: &str, field: &str) -> RedisResult<Option<RedisBytes>> {
-        Redis::hget(&self.shard_for(key.as_bytes()), key, field).await
+        let mut command = cmd("HGET");
+        command.mark_readonly();
+        command.arg(key).arg(field);
+        self.query(key.as_bytes(), command).await
     }
 
     async fn hmget(&self, key: &str, fields: &[&str]) -> RedisResult<Vec<Option<RedisBytes>>> {
-        Redis::hmget(&self.shard_for(key.as_bytes()), key, fields).await
+        let mut command = cmd("HMGET");
+        command.mark_readonly();
+        command.arg(key);
+        for field in fields {
+            command.arg(*field);
+        }
+        self.query(key.as_bytes(), command).await
     }
 }
 
-async fn build_topology(
+async fn build_discovery(
     shards: Vec<(String, Vec<String>)>,
     routing: &ShardRouting,
     options: &RedisServiceOptions,
-) -> RedisResult<Shards<MsRedis>> {
+) -> RedisResult<Arc<RedisDiscovery>> {
     validate_routing(routing, shards.len())?;
     let mut master_labels = HashSet::with_capacity(shards.len());
     let mut builds = Vec::with_capacity(shards.len());
     let mut names = Vec::with_capacity(shards.len());
 
     for (master_endpoint, slave_endpoints) in shards {
-        let mut master = configured_server(&master_endpoint, options, options.master_timeout)?;
+        let master = configured_server(&master_endpoint)?;
         let master_label = master.label();
         if !master_labels.insert(master_label.clone()) {
             return Err(client_error(format!(
                 "duplicate shard master backend {master_label}"
             )));
         }
-        master.read_only = false;
         let slaves = slave_endpoints
             .iter()
-            .map(|endpoint| {
-                let mut server = configured_server(endpoint, options, options.slave_timeout)?;
-                server.read_only = true;
-                Ok(server)
-            })
+            .map(|endpoint| configured_server(endpoint))
             .collect::<RedisResult<Vec<_>>>()?;
+        validate_slave_configs(&slaves)?;
         names.push(master_label);
-        builds.push(MsRedis::from_server_configs(master, slaves));
+        builds.push(build_shard_sources(master, slaves, options));
     }
 
-    let clients = try_join_all(builds).await?;
-    Ok(Shards::new(
-        routing.hash_algorithm(),
-        routing.distribution(),
-        names,
-        clients,
+    let built = try_join_all(builds).await?;
+    let mut registrations = Vec::new();
+    let mut shards = Vec::with_capacity(built.len());
+    for (shard, mut shard_registrations) in built {
+        shards.push(shard);
+        registrations.append(&mut shard_registrations);
+    }
+    let router = RedisRouter {
+        sharding: Sharding::new(routing.hash_algorithm(), routing.distribution(), &names),
+    };
+    Ok(Arc::new(RedisDiscovery {
+        shards,
+        router,
+        _dns_registrations: registrations,
+    }))
+}
+
+async fn build_shard_sources(
+    master: RedisEndpointConfig,
+    slaves: Vec<RedisEndpointConfig>,
+    options: &RedisServiceOptions,
+) -> RedisResult<(RedisShardSources, Vec<DnsSource>)> {
+    let (master, slaves) = tokio::try_join!(
+        build_endpoint_source(master, options.dns_refresh_interval),
+        try_join_all(
+            slaves
+                .into_iter()
+                .map(|config| build_endpoint_source(config, options.dns_refresh_interval))
+        ),
+    )?;
+
+    let (master, master_registration) = master;
+    let mut registrations = Vec::with_capacity(slaves.len() + 1);
+    registrations.push(master_registration);
+    let mut slave_sources = Vec::with_capacity(slaves.len());
+    for (source, registration) in slaves {
+        slave_sources.push(source);
+        registrations.push(registration);
+    }
+    Ok((
+        RedisShardSources {
+            master,
+            slaves: slave_sources,
+        },
+        registrations,
     ))
 }
 
-fn configured_server(
-    endpoint: &str,
+async fn build_endpoint_source(
+    config: RedisEndpointConfig,
+    refresh_interval: Duration,
+) -> RedisResult<(RedisEndpointSource, DnsSource)> {
+    let authority = format!("{}:{}", config.host, config.port);
+    let registration = DnsSource::new([authority], DnsOptions { refresh_interval })
+        .await
+        .map_err(map_net_error)?;
+    let endpoints = registration.endpoint_set().clone();
+    Ok((RedisEndpointSource { config, endpoints }, registration))
+}
+
+async fn build_topology(
+    discovery: Arc<RedisDiscovery>,
     options: &RedisServiceOptions,
-    timeout: Duration,
-) -> RedisResult<ServerConfig> {
-    let mut config = ServerConfig::new(endpoint.trim())?;
-    config.min_connections = options.min_connections;
-    config.max_connections = options.max_connections;
-    config.max_inflight = options.max_inflight;
-    config.op_timeout = timeout;
-    Ok(config)
+    previous: Option<&RedisTopology>,
+) -> RedisResult<RedisTopology> {
+    let resolved = discovery.resolve();
+    let built = try_join_all(
+        resolved
+            .shards
+            .iter()
+            .map(|shard| build_resolved_shard(shard, options, previous)),
+    )
+    .await?;
+    let mut nodes = HashMap::new();
+    let mut shards = Vec::with_capacity(built.len());
+    for (shard, shard_nodes) in built {
+        shards.push(shard);
+        nodes.extend(shard_nodes);
+    }
+
+    Ok(RedisTopology {
+        shards: Sharded::new(discovery.router.clone(), shards).map_err(map_net_error)?,
+        discovery,
+        resolved,
+        nodes,
+    })
+}
+
+async fn build_resolved_shard(
+    shard: &ResolvedShard,
+    options: &RedisServiceOptions,
+    previous: Option<&RedisTopology>,
+) -> RedisResult<(RedisShard, HashMap<NodeKey, Node<RedisProtocol>>)> {
+    let (master, slaves) = tokio::try_join!(
+        build_replicas(
+            std::slice::from_ref(&shard.master),
+            options.master_timeout,
+            options,
+            previous,
+        ),
+        build_replicas(&shard.slaves, options.slave_timeout, options, previous),
+    )?;
+    let mut nodes = master.1;
+    nodes.extend(slaves.1);
+    Ok((
+        RedisShard {
+            master: master.0,
+            slaves: slaves.0,
+        },
+        nodes,
+    ))
+}
+
+async fn build_replicas(
+    configs: &[ResolvedEndpoint],
+    request_timeout: Duration,
+    options: &RedisServiceOptions,
+    previous: Option<&RedisTopology>,
+) -> RedisResult<(
+    ReplicaSet<Node<RedisProtocol>>,
+    HashMap<NodeKey, Node<RedisProtocol>>,
+)> {
+    let mut endpoints = HashSet::new();
+    let mut node_cache = HashMap::new();
+    let mut nodes = Vec::new();
+    for resolved in configs {
+        for &address in resolved.addresses.iter() {
+            let key = NodeKey {
+                endpoint: address,
+                db: resolved.config.db,
+                auth: resolved.config.auth.clone(),
+                request_timeout,
+            };
+            if !endpoints.insert(key.clone()) {
+                continue;
+            }
+            let node = if let Some(node) = previous.and_then(|topology| topology.nodes.get(&key)) {
+                node.clone()
+            } else {
+                Node::new(
+                    address,
+                    RedisProtocol::new(resolved.config.auth.clone(), resolved.config.db),
+                    NodeOptions {
+                        request_timeout,
+                        connect_timeout: options.connect_timeout,
+                        ..NodeOptions::default()
+                    },
+                )
+                .map_err(map_net_error)?
+            };
+            node_cache.insert(key, node.clone());
+            nodes.push(node);
+        }
+    }
+
+    wait_until_connected(&nodes, options.connect_timeout).await?;
+    let replicas =
+        ReplicaSet::with_options(nodes, options.replica_balance).map_err(map_net_error)?;
+    Ok((replicas, node_cache))
+}
+
+async fn wait_until_connected(
+    nodes: &[Node<RedisProtocol>],
+    connect_timeout: Duration,
+) -> RedisResult<()> {
+    let deadline = Instant::now()
+        + connect_timeout
+            .saturating_mul(2)
+            .saturating_add(Duration::from_millis(100));
+    while nodes.iter().any(|node| !node.is_connected()) {
+        if Instant::now() >= deadline {
+            let endpoints = nodes
+                .iter()
+                .filter(|node| !node.is_connected())
+                .map(|node| node.endpoint().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(RedisError::new(
+                ErrorKind::NoConnection,
+                format!("Redis sessions did not become ready: {endpoints}"),
+            ));
+        }
+        sleep(Duration::from_millis(1)).await;
+    }
+    Ok(())
+}
+
+fn configured_server(endpoint: &str) -> RedisResult<RedisEndpointConfig> {
+    let endpoint = endpoint.trim();
+    let parts = endpoint.split(':').collect::<Vec<_>>();
+    if !(2..=3).contains(&parts.len()) || parts[0].is_empty() {
+        return Err(client_error(format!(
+            "invalid Redis endpoint {endpoint:?}, expected host:port[:db]"
+        )));
+    }
+    let port = parts[1]
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| client_error(format!("invalid port in Redis endpoint {endpoint:?}")))?;
+    let db = parts.get(2).map_or(Ok(0), |db| {
+        db.parse::<i64>()
+            .map_err(|_| client_error(format!("invalid db in Redis endpoint {endpoint:?}")))
+    })?;
+    Ok(RedisEndpointConfig {
+        host: parts[0].to_owned(),
+        port,
+        db,
+        auth: None,
+    })
+}
+
+fn validate_slave_configs(configs: &[RedisEndpointConfig]) -> RedisResult<()> {
+    if configs.is_empty() {
+        return Err(client_error("at least one slave backend is required"));
+    }
+    let mut labels = HashSet::with_capacity(configs.len());
+    for config in configs {
+        let label = config.label();
+        if !labels.insert(label.clone()) {
+            return Err(client_error(format!("duplicate slave backend {label}")));
+        }
+    }
+    Ok(())
 }
 
 fn validate_options(options: &RedisServiceOptions) -> RedisResult<()> {
-    if options.max_connections == 0 {
-        return Err(client_error("max_connections must be greater than zero"));
-    }
-    if options.min_connections > options.max_connections {
+    if options.master_timeout.is_zero()
+        || options.slave_timeout.is_zero()
+        || options.connect_timeout.is_zero()
+        || options.dns_refresh_interval.is_zero()
+    {
         return Err(client_error(
-            "min_connections must not exceed max_connections",
+            "Redis transport and DNS intervals must be non-zero",
         ));
     }
-    if options.max_inflight == 0 {
-        return Err(client_error("max_inflight must be greater than zero"));
-    }
-    if options.master_timeout.is_zero() || options.slave_timeout.is_zero() {
-        return Err(client_error("Redis operation timeouts must be non-zero"));
+    if options.replica_balance.quota.is_zero() || options.replica_balance.failure_penalty.is_zero()
+    {
+        return Err(client_error(
+            "Redis replica quota settings must be non-zero",
+        ));
     }
     Ok(())
+}
+
+fn map_net_error(error: NetError) -> RedisError {
+    RedisError::new(ErrorKind::ClientError, error.to_string())
 }
 
 fn validate_routing(routing: &ShardRouting, shard_count: usize) -> RedisResult<()> {
@@ -313,13 +761,18 @@ fn client_error(message: impl Into<String>) -> RedisError {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
+    use bytes::BytesMut;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::task::{JoinHandle, JoinSet};
+    use tokio::time::{Instant, sleep};
 
     use crate::direct::sharding::Sharding;
     use crate::direct::sharding::hash::{Hash, Hasher};
+    use crate::resp::parser::{ParseResult, parse_reply};
+    use crate::{ErrorKind, Value};
 
     use super::{RedisService, RedisServiceOptions, ShardRouting};
 
@@ -332,6 +785,10 @@ mod tests {
 
     impl FakeRedis {
         async fn start(read_value: &'static str) -> Self {
+            Self::start_with_delay(read_value, Duration::ZERO).await
+        }
+
+        async fn start_with_delay(read_value: &'static str, delay: Duration) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = listener.local_addr().unwrap().to_string();
             let accepted = Arc::new(AtomicUsize::new(0));
@@ -349,25 +806,42 @@ mod tests {
                             server_accepted.fetch_add(1, Ordering::Relaxed);
                             let seen = Arc::clone(&server_seen);
                             connections.spawn(async move {
-                                let mut buffer = [0_u8; 4096];
+                                let mut read_buffer = BytesMut::with_capacity(4096);
                                 loop {
-                                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                                    let read = socket.read_buf(&mut read_buffer).await.unwrap_or(0);
                                     if read == 0 {
                                         break;
                                     }
-                                    let command = String::from_utf8_lossy(&buffer[..read])
-                                        .to_uppercase();
-                                    seen.lock().unwrap().push(command.clone());
-                                    let response = if command.contains("\r\nGET\r\n") {
-                                        format!("${}\r\n{read_value}\r\n", read_value.len())
-                                    } else if command.contains("\r\nSET\r\n") {
-                                        "+OK\r\n".to_owned()
-                                    } else if command.contains("PING") {
-                                        "+PONG\r\n".to_owned()
-                                    } else {
-                                        ":1\r\n".to_owned()
-                                    };
-                                    if socket.write_all(response.as_bytes()).await.is_err() {
+                                    let snapshot = read_buffer.split().freeze();
+                                    let mut position = 0;
+                                    let mut responses = BytesMut::new();
+                                    loop {
+                                        match parse_reply(&snapshot.slice(position..)).unwrap() {
+                                            ParseResult::Complete { value, consumed } => {
+                                                position += consumed;
+                                                let command = command_name(&value);
+                                                seen.lock().unwrap().push(command.clone());
+                                                if !delay.is_zero() {
+                                                    tokio::time::sleep(delay).await;
+                                                }
+                                                match command.as_str() {
+                                                    "GET" | "HGET" => responses.extend_from_slice(
+                                                        format!("${}\r\n{read_value}\r\n", read_value.len()).as_bytes()
+                                                    ),
+                                                    "SET" | "AUTH" | "SELECT" => responses.extend_from_slice(b"+OK\r\n"),
+                                                    "PING" => responses.extend_from_slice(b"+PONG\r\n"),
+                                                    _ => responses.extend_from_slice(b":1\r\n"),
+                                                }
+                                            }
+                                            ParseResult::Incomplete => {
+                                                read_buffer.extend_from_slice(&snapshot[position..]);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if !responses.is_empty()
+                                        && socket.write_all(&responses).await.is_err()
+                                    {
                                         break;
                                     }
                                 }
@@ -390,11 +864,7 @@ mod tests {
         }
 
         fn saw(&self, command: &str) -> bool {
-            self.seen
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|seen| seen.contains(command))
+            self.seen.lock().unwrap().iter().any(|seen| seen == command)
         }
     }
 
@@ -402,6 +872,65 @@ mod tests {
         fn drop(&mut self) {
             self.task.abort();
         }
+    }
+
+    struct RecoveringRedis {
+        endpoint: String,
+        accepted: Arc<AtomicUsize>,
+        task: JoinHandle<()>,
+    }
+
+    impl RecoveringRedis {
+        async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = listener.local_addr().unwrap().to_string();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let server_accepted = accepted.clone();
+            let task = tokio::spawn(async move {
+                let (mut stalled, _) = listener.accept().await.unwrap();
+                server_accepted.fetch_add(1, Ordering::Relaxed);
+                let mut buffer = [0_u8; 4096];
+                let _ = stalled.read(&mut buffer).await;
+                while stalled.read(&mut buffer).await.unwrap_or(0) != 0 {}
+
+                let (mut recovered, _) = listener.accept().await.unwrap();
+                server_accepted.fetch_add(1, Ordering::Relaxed);
+                loop {
+                    let length = recovered.read(&mut buffer).await.unwrap_or(0);
+                    if length == 0 {
+                        return;
+                    }
+                    if recovered.write_all(b"$9\r\nrecovered\r\n").await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Self {
+                endpoint,
+                accepted,
+                task,
+            }
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for RecoveringRedis {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn command_name(value: &Value) -> String {
+        let Value::Array(arguments) = value else {
+            return String::new();
+        };
+        let Some(Value::BulkString(command)) = arguments.first() else {
+            return String::new();
+        };
+        String::from_utf8_lossy(command).to_ascii_uppercase()
     }
 
     #[test]
@@ -477,15 +1006,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reuses_pooled_connections_and_splits_reads_from_writes() {
+    async fn reuses_one_connection_and_splits_reads_from_writes() {
         let master = FakeRedis::start("master").await;
         let slave = FakeRedis::start("slave").await;
         let redis = RedisService::sharded_with_options(
             vec![(master.endpoint.clone(), vec![slave.endpoint.clone()])],
             ShardRouting::range("crc32", 256),
-            RedisServiceOptions::default()
-                .with_min_connections(1)
-                .with_max_connections(1),
+            RedisServiceOptions::default(),
         )
         .await
         .unwrap();
@@ -507,12 +1034,170 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(slave.saw("\r\nGET\r\n"));
-        assert!(!master.saw("\r\nGET\r\n"));
-        assert!(master.saw("\r\nSET\r\n"));
-        assert!(!slave.saw("\r\nSET\r\n"));
+        assert!(slave.saw("GET"));
+        assert!(!master.saw("GET"));
+        assert!(master.saw("SET"));
+        assert!(!slave.saw("SET"));
         assert_eq!(master.accepted(), initial_master_connections);
         assert_eq!(slave.accepted(), initial_slave_connections);
+    }
+
+    #[tokio::test]
+    async fn concurrent_reads_share_one_physical_slave_connection() {
+        let master = FakeRedis::start("master").await;
+        let slave = FakeRedis::start("slave").await;
+        let redis = RedisService::sharded(
+            vec![(master.endpoint.clone(), vec![slave.endpoint.clone()])],
+            ShardRouting::range("crc32", 256),
+        )
+        .await
+        .unwrap();
+
+        let mut requests = JoinSet::new();
+        for index in 0..128 {
+            let redis = redis.clone();
+            requests.spawn(async move {
+                crate::Redis::get(&redis, &format!("key-{index}"))
+                    .await
+                    .unwrap()
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            assert_eq!(result.unwrap().as_deref(), Some(b"slave".as_slice()));
+        }
+
+        assert_eq!(master.accepted(), 1);
+        assert_eq!(slave.accepted(), 1);
+    }
+
+    #[tokio::test]
+    async fn slave_selection_rotates_after_consuming_time_quota() {
+        let master = FakeRedis::start("master").await;
+        let slave_a = FakeRedis::start_with_delay("a", Duration::from_millis(3)).await;
+        let slave_b = FakeRedis::start_with_delay("b", Duration::from_millis(3)).await;
+        let redis = RedisService::sharded_with_options(
+            vec![(
+                master.endpoint.clone(),
+                vec![slave_a.endpoint.clone(), slave_b.endpoint.clone()],
+            )],
+            ShardRouting::range("crc32", 256),
+            RedisServiceOptions::default().with_replica_quota(Duration::from_millis(1)),
+        )
+        .await
+        .unwrap();
+
+        let first = crate::Redis::get(&redis, "key").await.unwrap().unwrap();
+        let second = crate::Redis::get(&redis, "key").await.unwrap().unwrap();
+        assert_ne!(first, second);
+        assert!(slave_a.saw("GET"));
+        assert!(slave_b.saw("GET"));
+    }
+
+    #[tokio::test]
+    async fn update_shards_atomically_publishes_new_sessions() {
+        let old_master = FakeRedis::start("old-master").await;
+        let old_slave = FakeRedis::start("old-slave").await;
+        let new_master = FakeRedis::start("new-master").await;
+        let new_slave = FakeRedis::start("new-slave").await;
+        let redis = RedisService::sharded(
+            vec![(
+                old_master.endpoint.clone(),
+                vec![old_slave.endpoint.clone()],
+            )],
+            ShardRouting::range("crc32", 256),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            crate::Redis::get(&redis, "key").await.unwrap().as_deref(),
+            Some(b"old-slave".as_slice())
+        );
+        redis
+            .update_shards(vec![(
+                new_master.endpoint.clone(),
+                vec![new_slave.endpoint.clone()],
+            )])
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::Redis::get(&redis, "key").await.unwrap().as_deref(),
+            Some(b"new-slave".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_dns_snapshot_is_applied_automatically_and_reuses_nodes() {
+        let master = FakeRedis::start("master").await;
+        let old_slave = FakeRedis::start("old-slave").await;
+        let new_slave = FakeRedis::start("new-slave").await;
+        let redis = RedisService::sharded(
+            vec![(master.endpoint.clone(), vec![old_slave.endpoint.clone()])],
+            ShardRouting::range("crc32", 256),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            crate::Redis::get(&redis, "key").await.unwrap().as_deref(),
+            Some(b"old-slave".as_slice())
+        );
+        let topology = redis.inner.topology.load_full();
+        assert!(
+            topology.discovery.shards[0].slaves[0]
+                .endpoints
+                .replace([new_slave.endpoint.parse().unwrap()])
+        );
+        drop(topology);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let value = crate::Redis::get(&redis, "key").await.unwrap();
+            if value.as_deref() == Some(b"new-slave".as_slice()) {
+                break;
+            }
+            assert_eq!(value.as_deref(), Some(b"old-slave".as_slice()));
+            assert!(Instant::now() < deadline);
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(master.accepted(), 1, "unchanged master Node must be reused");
+        assert_eq!(old_slave.accepted(), 1);
+        assert_eq!(new_slave.accepted(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_timeout_closes_the_session_and_reconnects() {
+        let master = FakeRedis::start("master").await;
+        let slave = RecoveringRedis::start().await;
+        let redis = RedisService::sharded_with_options(
+            vec![(master.endpoint.clone(), vec![slave.endpoint.clone()])],
+            ShardRouting::range("crc32", 256),
+            RedisServiceOptions::default().with_slave_timeout(Duration::from_millis(30)),
+        )
+        .await
+        .unwrap();
+
+        let error = crate::Redis::get(&redis, "key").await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while slave.accepted() < 2 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        loop {
+            match crate::Redis::get(&redis, "key").await {
+                Ok(value) => {
+                    assert_eq!(value.as_deref(), Some(b"recovered".as_slice()));
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::NoConnection => {
+                    assert!(tokio::time::Instant::now() < deadline);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Err(error) => panic!("unexpected retry failure: {error}"),
+            }
+        }
     }
 
     fn java_crc32(bytes: &[u8]) -> u32 {

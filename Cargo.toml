@@ -21,6 +21,7 @@ memchr = "2"
 log = "0.4"
 enum_dispatch = "0.3"
 brz-discovery = { workspace = true }
+brz-net = { package = "net", path = "../net" }
 async-trait = { workspace = true }
 arc-swap = "1"
 

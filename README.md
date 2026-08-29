@@ -55,6 +55,33 @@ let _: i64 = redis.hset("key", "field", "value").await?;
 # }
 ```
 
+For the `brz-net` direct transport, use `RedisService`. Each physical IPv4
+node owns one persistent multiplexed TCP connection; replicas are selected by
+consumed-time quota. DNS lookup is IPv4-only and process-shared, and changed
+address snapshots are applied outside the request path with copy-on-write
+topology publication. There are no pool min/max connection settings:
+
+```rust
+use redis::{Redis, RedisService, ShardRouting};
+
+# async fn demo() -> redis::RedisResult<()> {
+let redis = RedisService::sharded(
+    vec![(
+        "redis-master.example:6379".to_owned(),
+        vec![
+            "redis-slave-a.example:6379".to_owned(),
+            "redis-slave-b.example:6379".to_owned(),
+        ],
+    )],
+    ShardRouting::range("crc32", 256),
+)
+.await?;
+let value = redis.get_routed(b"1821155363", "u:1821155363").await?;
+# let _ = value;
+# Ok(())
+# }
+```
+
 With the default feature set, direct-backend implementation types remain
 internal. Enable `direct-mock` only for tests, validation tools, or benchmarks
 that need to construct direct clients. That feature exposes:
