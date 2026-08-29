@@ -12,17 +12,18 @@ reimplemented in Rust.
 
 ## Application API
 
-Application code should depend on the root `Redis` trait. Its first version
-contains only the `GET`, `HGET`, and `HMGET` commands currently used by abtest:
+Application code should depend on the generic root `Redis` trait. Keys,
+fields, values, and bulk responses are converted through small encoding and
+decoding traits rather than fixed application types:
 
 ```rust
 use redis::{Redis, SidecarRedis};
 
 # async fn demo() -> redis::RedisResult<()> {
 let redis = SidecarRedis::new("feed", "auto_translate_llm").await?;
-let profile = redis.get("u:42").await?;
-let version = redis.hget("document:42", "version").await?;
-let fields = redis
+let profile: Option<redis::RedisBytes> = redis.get(("u:", 42_u64)).await?;
+let version: Option<i64> = redis.hget("document:42", "version").await?;
+let fields: redis::RedisValues<redis::RedisBytes> = redis
     .hmget("document:42", &["value", "compress", "hash"])
     .await?;
 # let _ = (profile, version, fields);
@@ -30,26 +31,79 @@ let fields = redis
 # }
 ```
 
-Both methods return binary-safe `RedisBytes`; missing values are represented
-as `None`. The concrete facade keeps pools and the low-level command API out of
-the application boundary.
+`EncodeRedisArg` supports strings, bytes, integers encoded as decimal text, and
+two- or three-element tuples concatenated into one argument. For example,
+`("u:", 12345_u64, ".suffix")` is encoded directly as `u:12345.suffix` without
+first building a temporary `String`. `FromRedisBulk` selects the response type;
+missing values are represented as `None`. The concrete facade keeps transport
+and the low-level command API out of the application boundary.
 
-For direct master/slave access, construct `MsRedis` with one writable master
-and at least one slave. Endpoints use `host:port[:db]`. The application
-`Redis` reads are spread across healthy slaves, while the lower-level
-`Commands` write operations always use the master:
+For one direct endpoint, use `RedisService::single(addr)`. Reads and writes use
+two independent physical connections to the same address, keeping their queues
+and timeout state isolated.
+
+For direct master/slave access, construct an unsharded `RedisService` with one
+writable master and at least one slave. Endpoints use `host:port[:db]`. Reads
+use the slave replica set and writes use the master:
 
 ```rust
-use redis::{Commands, MsRedis, Redis};
+use redis::{Redis, RedisService};
 
 # async fn demo() -> redis::RedisResult<()> {
-let redis = MsRedis::new(
+let redis = RedisService::noshard(
     "redis-master.example:6379",
     ["redis-slave-a.example:6379", "redis-slave-b.example:6379"],
 )
 .await?;
-let value = Redis::hget(&redis, "key", "field").await?;
-let _: i64 = redis.hset("key", "field", "value").await?;
+let value: Option<redis::RedisBytes> = redis.hget("key", "field").await?;
+redis.set("key", "value").await?;
+# let _ = value;
+# Ok(())
+# }
+```
+
+Each physical IPv4 node owns one persistent multiplexed TCP connection;
+replicas are selected by consumed-time quota. DNS lookup is IPv4-only and
+process-shared, and changed address snapshots are applied outside the request
+path with copy-on-write topology publication. There are no pool min/max
+connection settings. An unsharded service directly selects its only shard and
+does not encode or hash the key for routing.
+
+`RedisService` encodes borrowed command arguments directly into the `brz-net`
+process-wide dual-chunk ephemeral arena after the selected node has admitted the request.
+The resulting owned RESP frame is written by `brz-net` without another
+userspace buffer copy and is released as soon as the socket consumes it. The
+default arena is 64 MiB per chunk (128 MiB total); applications may call
+`redis::init_global_request_arena(chunk_size)` once before constructing clients.
+
+Responses use `brz-net`'s per-connection dynamically resized ring buffer. The
+driver drains a readable socket to `WouldBlock`, lets RESP parsing consume every
+complete response, and reserves the remaining bulk length before reading again.
+GET/HGET/HMGET replies are decoded directly into their application result shape
+instead of first constructing the generic `Value` tree. A contiguous response
+backs returned `Bytes` without a payload copy; only a response crossing the ring
+boundary is copied. RESP tail bytes and subsequent pipelined responses remain in
+the same logical ring cursor.
+
+```rust
+use redis::{Redis, RedisService, ShardRouting};
+
+# async fn demo() -> redis::RedisResult<()> {
+let redis = RedisService::sharded(
+    vec![
+        (
+            "redis-a-master.example:6379".to_owned(),
+            vec!["redis-a-slave.example:6379".to_owned()],
+        ),
+        (
+            "redis-b-master.example:6379".to_owned(),
+            vec!["redis-b-slave.example:6379".to_owned()],
+        ),
+    ],
+    ShardRouting::range("crc32", 256),
+)
+.await?;
+let value = redis.get_routed(b"1821155363", "u:1821155363").await?;
 # let _ = value;
 # Ok(())
 # }
@@ -63,42 +117,12 @@ that need to construct direct clients. That feature exposes:
 - `direct::HaServer`: primary/fallback with optional double write;
 - `direct::MsServer`: master/slave read splitting;
 - `direct::Shards<T>`: client-side sharding over another connection form;
-- the `Client::Direct` variant and `DirectRedis` facade.
+- the low-level `Client::Direct` variant.
 
-`sidecar::SidecarClient`, `MsRedis`, `ShardedMsRedis`, and the sidecar `Client`
-variant remain available with default features.
-
-For several master/slave groups, `ShardedMsRedis` hashes each Redis key first
-and then delegates the operation to the selected `MsRedis`. The distribution
-is `modula`, so group order is part of the routing contract:
-
-```rust
-use redis::{Redis, ShardedMsRedis};
-
-# async fn demo() -> redis::RedisResult<()> {
-let redis = ShardedMsRedis::new(
-    "crc32",
-    vec![
-        (
-            "redis-a-master.example:6379",
-            vec!["redis-a-slave-1.example:6379", "redis-a-slave-2.example:6379"],
-        ),
-        (
-            "redis-b-master.example:6379",
-            vec!["redis-b-slave-1.example:6379", "redis-b-slave-2.example:6379"],
-        ),
-    ],
-)
-.await?;
-let value = Redis::hget(&redis, "user:42", "name").await?;
-# let _ = value;
-# Ok(())
-# }
-```
-
-`MsRedis` also exposes the low-level `Commands`/`ConnectionLike` surface.
-`ShardedMsRedis` deliberately exposes only the application `Redis` contract,
-so routing always uses the explicit key supplied to `get`, `hget`, or `hmget`.
+`sidecar::SidecarClient` and the sidecar `Client` variant remain available with
+default features. Direct master/slave application access is uniformly exposed
+through `RedisService::single`, `RedisService::noshard`, and
+`RedisService::sharded`.
 
 ## Design
 

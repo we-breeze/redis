@@ -4,9 +4,11 @@
 //! is understood by every Redis server regardless of the negotiated protocol
 //! version, so encoding never needs to branch on RESP2 vs RESP3.
 
+use bytes::BufMut;
+
 /// Encode a single command (a list of already-serialized argument byte slices)
 /// into a RESP multibulk frame, appending to `out`.
-pub fn encode_command(args: &[Vec<u8>], out: &mut Vec<u8>) {
+pub fn encode_command(args: &[Vec<u8>], out: &mut impl BufMut) {
     write_array_header(args.len(), out);
     for arg in args {
         write_bulk_string(arg, out);
@@ -18,7 +20,7 @@ pub fn encode_command(args: &[Vec<u8>], out: &mut Vec<u8>) {
 pub fn encode_command_slices<'a>(
     args: impl Iterator<Item = &'a [u8]>,
     count: usize,
-    out: &mut Vec<u8>,
+    out: &mut impl BufMut,
 ) {
     write_array_header(count, out);
     for arg in args {
@@ -27,29 +29,29 @@ pub fn encode_command_slices<'a>(
 }
 
 /// Encode a pipeline of commands back-to-back into a single buffer.
-pub fn encode_pipeline(commands: &[Vec<Vec<u8>>], out: &mut Vec<u8>) {
+pub fn encode_pipeline(commands: &[Vec<Vec<u8>>], out: &mut impl BufMut) {
     for args in commands {
         encode_command(args, out);
     }
 }
 
-fn write_array_header(len: usize, out: &mut Vec<u8>) {
-    out.push(b'*');
+fn write_array_header(len: usize, out: &mut impl BufMut) {
+    out.put_u8(b'*');
     write_usize(len, out);
-    out.extend_from_slice(b"\r\n");
+    out.put_slice(b"\r\n");
 }
 
-fn write_bulk_string(data: &[u8], out: &mut Vec<u8>) {
-    out.push(b'$');
+fn write_bulk_string(data: &[u8], out: &mut impl BufMut) {
+    out.put_u8(b'$');
     write_usize(data.len(), out);
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(data);
-    out.extend_from_slice(b"\r\n");
+    out.put_slice(b"\r\n");
+    out.put_slice(data);
+    out.put_slice(b"\r\n");
 }
 
-fn write_usize(value: usize, out: &mut Vec<u8>) {
+fn write_usize(value: usize, out: &mut impl BufMut) {
     let mut buf = itoa::Buffer::new();
-    out.extend_from_slice(buf.format(value).as_bytes());
+    out.put_slice(buf.format(value).as_bytes());
 }
 
 #[cfg(test)]

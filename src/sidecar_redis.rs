@@ -1,9 +1,7 @@
 //! Application-facing Redis access through the local Breeze sidecar.
 
-use async_trait::async_trait;
-
 use crate::sidecar::{MeshConfig, MeshRouting, SidecarClient};
-use crate::{Redis, RedisBytes, RedisResult};
+use crate::{EncodeRedisArg, EncodeRedisArgs, FromRedisBulk, Redis, RedisResult, RedisValues};
 
 /// A [`Redis`] implementation routed through the local Breeze sidecar.
 ///
@@ -35,29 +33,60 @@ impl SidecarRedis {
     }
 }
 
-#[async_trait]
 impl Redis for SidecarRedis {
-    async fn get(&self, key: &str) -> RedisResult<Option<RedisBytes>> {
+    async fn get<K, R>(&self, key: K) -> RedisResult<Option<R>>
+    where
+        K: EncodeRedisArg + Send,
+        R: FromRedisBulk + Send,
+    {
         crate::api::get(&self.client, key).await
     }
 
-    async fn set(&self, key: &str, value: &[u8]) -> RedisResult<()> {
+    async fn set<K, V>(&self, key: K, value: V) -> RedisResult<()>
+    where
+        K: EncodeRedisArg + Send,
+        V: EncodeRedisArg + Send,
+    {
         crate::api::set(&self.client, key, value).await
     }
 
-    async fn get_routed(&self, routing_key: &[u8], key: &str) -> RedisResult<Option<RedisBytes>> {
-        crate::api::get(&self.client.with_hashkey(routing_key), key).await
+    async fn get_routed<H, K, R>(&self, routing_key: H, key: K) -> RedisResult<Option<R>>
+    where
+        H: EncodeRedisArg + Send,
+        K: EncodeRedisArg + Send,
+        R: FromRedisBulk + Send,
+    {
+        let routing_key = crate::arg::encode_arg_contiguous(&routing_key)?;
+        let routed = self.client.with_hashkey(routing_key.as_ref());
+        crate::api::get(&routed, key).await
     }
 
-    async fn set_routed(&self, routing_key: &[u8], key: &str, value: &[u8]) -> RedisResult<()> {
-        crate::api::set(&self.client.with_hashkey(routing_key), key, value).await
+    async fn set_routed<H, K, V>(&self, routing_key: H, key: K, value: V) -> RedisResult<()>
+    where
+        H: EncodeRedisArg + Send,
+        K: EncodeRedisArg + Send,
+        V: EncodeRedisArg + Send,
+    {
+        let routing_key = crate::arg::encode_arg_contiguous(&routing_key)?;
+        let routed = self.client.with_hashkey(routing_key.as_ref());
+        crate::api::set(&routed, key, value).await
     }
 
-    async fn hget(&self, key: &str, field: &str) -> RedisResult<Option<RedisBytes>> {
+    async fn hget<K, F, R>(&self, key: K, field: F) -> RedisResult<Option<R>>
+    where
+        K: EncodeRedisArg + Send,
+        F: EncodeRedisArg + Send,
+        R: FromRedisBulk + Send,
+    {
         crate::api::hget(&self.client, key, field).await
     }
 
-    async fn hmget(&self, key: &str, fields: &[&str]) -> RedisResult<Vec<Option<RedisBytes>>> {
+    async fn hmget<K, F, R>(&self, key: K, fields: F) -> RedisResult<RedisValues<R>>
+    where
+        K: EncodeRedisArg + Send,
+        F: EncodeRedisArgs + Send,
+        R: FromRedisBulk + Send,
+    {
         crate::api::hmget(&self.client, key, fields).await
     }
 }

@@ -21,7 +21,7 @@ memchr = "2"
 log = "0.4"
 enum_dispatch = "0.3"
 brz-discovery = { workspace = true }
-async-trait = { workspace = true }
+brz-net = { package = "net", path = "../net" }
 arc-swap = "1"
 
 [dev-dependencies]
@@ -31,8 +31,6 @@ tempfile = { workspace = true }
 [features]
 default = []
 # Expose direct-backend types for tests, mocks, validation, and benchmarks.
-# Direct internals remain compiled for higher-level clients such as MsRedis and
-# ShardedMsRedis.
 direct-mock = []
 # Integration tests that require a live redis-server are gated behind this.
 integration-tests = []
@@ -48,7 +46,6 @@ resolver = "2"
 [workspace.dependencies]
 # Shared Breeze checkout managed by the consuming repository.
 brz-discovery = { package = "discovery", path = "../discovery" }
-async-trait = "0.1"
 tempfile = "3"
 # Workspace submodule: the bench harness installs this allocator at its binary
 # composition root to get mimalloc + per-request allocation accounting. The SDK

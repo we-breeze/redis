@@ -3,30 +3,28 @@
 //! A high-performance, high-availability async Redis client for the breeze
 //! platform, with **two explicitly separated access modes**:
 //!
-//! ## Application API — [`Redis`], [`SidecarRedis`], [`MsRedis`],
-//! [`ShardedMsRedis`], and [`RedisService`]
+//! ## Application API — [`Redis`], [`SidecarRedis`], and [`RedisService`]
 //!
-//! Application code should depend on the small [`Redis`] contract. Its first
-//! version contains only the `GET`, binary-safe `SET`, `HGET`, and `HMGET`
-//! operations used by
-//! abtest. [`SidecarRedis`] discovers an exact group/namespace through the
-//! local breeze sidecar, while [`MsRedis`] connects to one master and one or
-//! more slave endpoints with read/write splitting. [`ShardedMsRedis`] first
-//! routes by key across multiple master/slave groups, then applies the same
-//! read splitting within the selected group. [`RedisService`] adds explicit
-//! routing keys, range-style distributions, atomically replaceable topology,
-//! and per-shard reusable pools without coupling to a configuration source.
-//! These facades keep pools and command machinery out of the application
-//! boundary. `DirectRedis` is available only with the `direct-mock` feature.
+//! Application code should depend on the generic [`Redis`] contract. Its first
+//! version contains `GET`, binary-safe `SET`, `HGET`, and `HMGET` operations
+//! without coupling keys, fields, or return values to application types.
+//! [`SidecarRedis`] discovers an exact group/namespace through the local breeze
+//! sidecar. [`RedisService::single`] connects one endpoint with independent
+//! read/write connections, [`RedisService::noshard`] connects one master/slave
+//! group, and [`RedisService::sharded`] routes across multiple groups first.
+//! The service keeps its logical shard layout fixed after construction and
+//! atomically applies IPv4 DNS changes. Each physical node and role owns one
+//! multiplexed TCP session, with quota-based replica balancing.
 //!
 //! ```no_run
 //! use redis::{Redis, SidecarRedis};
 //!
 //! # async fn demo() -> redis::RedisResult<()> {
 //! let redis = SidecarRedis::new("feed", "auto_translate_llm").await?;
-//! let profile = redis.get("u:42").await?;
-//! let version = redis.hget("document:42", "version").await?;
-//! let values = redis.hmget("document:42", &["value", "compress", "hash"]).await?;
+//! let profile: Option<redis::RedisBytes> = redis.get("u:42").await?;
+//! let version: Option<i64> = redis.hget("document:42", "version").await?;
+//! let values: redis::RedisValues<redis::RedisBytes> =
+//!     redis.hmget("document:42", &["value", "compress", "hash"]).await?;
 //! # let _ = (profile, version, values);
 //! # Ok(())
 //! # }
@@ -58,10 +56,8 @@
 //! ## Direct backend mode (`direct-mock` feature)
 //!
 //! Direct-backend types are public only when `direct-mock` is enabled. The
-//! internal implementation remains available to higher-level clients such as
-//! [`MsRedis`]. The feature exposes `direct::DirectClient`, `direct::Shards`,
-//! `direct::HaServer`, and `direct::MsServer` for tests, validation tools, and
-//! benchmarks.
+//! feature exposes `direct::DirectClient`, `direct::Shards`, `direct::HaServer`,
+//! and `direct::MsServer` for tests, validation tools, and benchmarks.
 //!
 //! ```ignore
 //! use redis::direct::{DirectClient, ServerConfig, Shards};
@@ -105,6 +101,8 @@
 //!   with per-IP load balancing.
 
 mod api;
+mod arg;
+mod bulk;
 pub mod client;
 pub mod cmd;
 pub mod commands;
@@ -115,17 +113,14 @@ pub mod direct;
 #[allow(dead_code, unused_imports)]
 #[doc(hidden)]
 mod direct;
-#[cfg(feature = "direct-mock")]
-mod direct_redis;
 pub mod error;
 pub mod from_value;
-mod ms_redis;
+mod net_transport;
 pub mod pipeline;
 pub mod pool;
 mod redis_service;
 pub mod resp;
 pub mod script;
-mod sharded_ms_redis;
 pub mod sidecar;
 mod sidecar_redis;
 pub mod stats;
@@ -133,21 +128,22 @@ pub mod to_args;
 pub mod types;
 
 // Shared, mode-agnostic API.
-pub use api::{Redis, RedisBytes};
+pub use api::Redis;
+pub use arg::{EncodeRedisArg, EncodeRedisArgs, RedisArgSink, RedisArgsSink, RedisKey2, RedisKey3};
+pub use brz_net::{
+    DEFAULT_REQUEST_ARENA_CHUNK_SIZE, global_request_arena, init_global_request_arena,
+};
+pub use bulk::{FromRedisBulk, RedisBytes, RedisValues};
 pub use client::Client;
 pub use cmd::{Cmd, cmd, pipe};
 pub use commands::Commands;
 pub use connection::{ConnectionLike, Handshake, MultiplexedConnection};
-#[cfg(feature = "direct-mock")]
-pub use direct_redis::DirectRedis;
 pub use error::{ErrorKind, RedisError, RedisResult};
 pub use from_value::FromRedisValue;
-pub use ms_redis::MsRedis;
 pub use pipeline::Pipeline;
 pub use pool::Pool;
 pub use redis_service::{RedisService, RedisServiceOptions, ShardRouting};
 pub use script::Script;
-pub use sharded_ms_redis::ShardedMsRedis;
 pub use sidecar_redis::SidecarRedis;
 pub use to_args::{Bytes, RedisWrite, ToRedisArgs, ToSingleRedisArg};
 pub use types::Value;

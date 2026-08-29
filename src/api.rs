@@ -1,109 +1,180 @@
 //! Application-facing Redis contract and its command adapters.
 
-use async_trait::async_trait;
+use bytes::Bytes;
 
 use crate::cmd::cmd;
 use crate::connection::ConnectionLike;
-use crate::{FromRedisValue, RedisResult};
+use crate::{
+    EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, FromRedisValue, RedisBytes,
+    RedisError, RedisResult, RedisValues, Value,
+};
 
-/// Binary-safe bytes returned by the application-facing [`Redis`] API.
+/// The typed Redis contract consumed by application code.
 ///
-/// Bulk-string replies share the RESP read buffer instead of copying their
-/// payload. Callers that need UTF-8 or a structured format decode it at their
-/// own application boundary.
-pub type RedisBytes = bytes::Bytes;
-
-/// The small Redis contract consumed by application code.
-///
-/// The initial surface follows the commands observed in abtest. Add commands
-/// only when a real consumer needs them rather than exposing the SDK's entire
-/// low-level command builder through this boundary.
-#[async_trait]
+/// Keys, fields, values, and bulk responses remain application-defined types;
+/// the SDK only requires their encoding or decoding traits.
+#[allow(async_fn_in_trait)]
 pub trait Redis: Send + Sync {
     /// `GET key`; a missing key is `Ok(None)`.
-    async fn get(&self, key: &str) -> RedisResult<Option<RedisBytes>>;
+    async fn get<K, R>(&self, key: K) -> RedisResult<Option<R>>
+    where
+        K: EncodeRedisArg + Send,
+        R: FromRedisBulk + Send;
 
-    /// `SET key value`; both the command encoder and this boundary preserve
-    /// arbitrary binary values.
-    async fn set(&self, key: &str, value: &[u8]) -> RedisResult<()>;
+    /// `SET key value`; both arguments are encoded directly into the command.
+    async fn set<K, V>(&self, key: K, value: V) -> RedisResult<()>
+    where
+        K: EncodeRedisArg + Send,
+        V: EncodeRedisArg + Send;
 
     /// `GET key` while selecting a shard from an explicit routing key.
     ///
     /// Unsharded implementations may ignore `routing_key`. Sharded
     /// implementations must route with it rather than with `key`, matching
     /// Java's `getClient(routingKey).get(key)` call shape.
-    async fn get_routed(&self, routing_key: &[u8], key: &str) -> RedisResult<Option<RedisBytes>> {
+    async fn get_routed<H, K, R>(&self, routing_key: H, key: K) -> RedisResult<Option<R>>
+    where
+        H: EncodeRedisArg + Send,
+        K: EncodeRedisArg + Send,
+        R: FromRedisBulk + Send,
+    {
         let _ = routing_key;
         self.get(key).await
     }
 
     /// `SET key value` while selecting a shard from an explicit routing key.
-    async fn set_routed(&self, routing_key: &[u8], key: &str, value: &[u8]) -> RedisResult<()> {
+    async fn set_routed<H, K, V>(&self, routing_key: H, key: K, value: V) -> RedisResult<()>
+    where
+        H: EncodeRedisArg + Send,
+        K: EncodeRedisArg + Send,
+        V: EncodeRedisArg + Send,
+    {
         let _ = routing_key;
         self.set(key, value).await
     }
 
     /// `HGET key field`; a missing key or field is `Ok(None)`.
-    async fn hget(&self, key: &str, field: &str) -> RedisResult<Option<RedisBytes>>;
+    async fn hget<K, F, R>(&self, key: K, field: F) -> RedisResult<Option<R>>
+    where
+        K: EncodeRedisArg + Send,
+        F: EncodeRedisArg + Send,
+        R: FromRedisBulk + Send;
 
     /// `HMGET key field [field ...]` in input order.
     ///
-    /// Missing fields remain `None`, so the returned vector has the same
+    /// Missing fields remain `None`, so the returned iterator has the same
     /// length and ordering as `fields` when Redis returns a valid response.
-    async fn hmget(&self, key: &str, fields: &[&str]) -> RedisResult<Vec<Option<RedisBytes>>>;
+    async fn hmget<K, F, R>(&self, key: K, fields: F) -> RedisResult<RedisValues<R>>
+    where
+        K: EncodeRedisArg + Send,
+        F: EncodeRedisArgs + Send,
+        R: FromRedisBulk + Send;
 }
 
-pub(crate) async fn get(
+pub(crate) async fn get<K, R>(
     connection: &(impl ConnectionLike + ?Sized),
-    key: &str,
-) -> RedisResult<Option<RedisBytes>> {
+    key: K,
+) -> RedisResult<Option<R>>
+where
+    K: EncodeRedisArg,
+    R: FromRedisBulk,
+{
     let mut command = cmd("GET");
     command.mark_readonly();
-    command.arg(key);
-    query(connection, &command).await
+    command.arg_encoded(key)?;
+    query_bulk(connection, &command).await
 }
 
-pub(crate) async fn set(
+pub(crate) async fn set<K, V>(
     connection: &(impl ConnectionLike + ?Sized),
-    key: &str,
-    value: &[u8],
-) -> RedisResult<()> {
+    key: K,
+    value: V,
+) -> RedisResult<()>
+where
+    K: EncodeRedisArg,
+    V: EncodeRedisArg,
+{
     let mut command = cmd("SET");
-    command.arg(key).arg(value);
-    query(connection, &command).await
+    command.arg_encoded(key)?.arg_encoded(value)?;
+    query_unit(connection, &command).await
 }
 
-pub(crate) async fn hget(
+pub(crate) async fn hget<K, F, R>(
     connection: &(impl ConnectionLike + ?Sized),
-    key: &str,
-    field: &str,
-) -> RedisResult<Option<RedisBytes>> {
+    key: K,
+    field: F,
+) -> RedisResult<Option<R>>
+where
+    K: EncodeRedisArg,
+    F: EncodeRedisArg,
+    R: FromRedisBulk,
+{
     let mut command = cmd("HGET");
     command.mark_readonly();
-    command.arg(key).arg(field);
-    query(connection, &command).await
+    command.arg_encoded(key)?.arg_encoded(field)?;
+    query_bulk(connection, &command).await
 }
 
-pub(crate) async fn hmget(
+pub(crate) async fn hmget<K, F, R>(
     connection: &(impl ConnectionLike + ?Sized),
-    key: &str,
-    fields: &[&str],
-) -> RedisResult<Vec<Option<RedisBytes>>> {
+    key: K,
+    fields: F,
+) -> RedisResult<RedisValues<R>>
+where
+    K: EncodeRedisArg,
+    F: EncodeRedisArgs,
+    R: FromRedisBulk,
+{
     let mut command = cmd("HMGET");
     command.mark_readonly();
-    command.arg(key);
-    for field in fields {
-        command.arg(*field);
-    }
-    query(connection, &command).await
+    command.arg_encoded(key)?;
+    fields.encode_args(&mut command)?;
+    query_multi_bulk(connection, &command).await
 }
 
-async fn query<T: FromRedisValue>(
+async fn query_unit(
     connection: &(impl ConnectionLike + ?Sized),
     command: &crate::Cmd,
-) -> RedisResult<T> {
+) -> RedisResult<()> {
     let value = connection.req_command(command).await?.into_result()?;
-    T::from_redis_value(&value)
+    <()>::from_redis_value(&value)
+}
+
+async fn query_bulk<R: FromRedisBulk>(
+    connection: &(impl ConnectionLike + ?Sized),
+    command: &crate::Cmd,
+) -> RedisResult<Option<R>> {
+    let value = connection.req_command(command).await?.into_result()?;
+    value_into_bulk(value)?.map(R::from_redis_bulk).transpose()
+}
+
+async fn query_multi_bulk<R: FromRedisBulk>(
+    connection: &(impl ConnectionLike + ?Sized),
+    command: &crate::Cmd,
+) -> RedisResult<RedisValues<R>> {
+    let value = connection.req_command(command).await?.into_result()?;
+    let Value::Array(values) = value else {
+        return Err(type_error("expected an array reply"));
+    };
+    let values = values
+        .into_iter()
+        .map(value_into_bulk)
+        .collect::<RedisResult<Vec<_>>>()?;
+    Ok(RedisValues::materialized(values))
+}
+
+fn value_into_bulk(value: Value) -> RedisResult<Option<RedisBytes>> {
+    match value {
+        Value::Nil => Ok(None),
+        Value::BulkString(value) => Ok(Some(value)),
+        Value::SimpleString(value) => Ok(Some(Bytes::from(value))),
+        Value::VerbatimString { text, .. } => Ok(Some(Bytes::from(text))),
+        _ => Err(type_error("expected a bulk string reply")),
+    }
+}
+
+fn type_error(message: &'static str) -> RedisError {
+    RedisError::new(ErrorKind::TypeError, message)
 }
 
 #[cfg(test)]
@@ -154,24 +225,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn redis_trait_is_object_safe() {
-        fn accepts_trait_object(_: &dyn Redis) {}
-        let _ = accepts_trait_object;
-    }
-
     #[tokio::test]
     async fn get_returns_binary_safe_bytes() {
         let bytes = Bytes::from_static(b"\x00profile\xff");
         let connection = Stub::new(Value::BulkString(bytes.clone()));
 
-        let result = get(&connection, "u:42").await.unwrap();
+        let result: Option<Bytes> = get(&connection, "u:42").await.unwrap();
 
         assert_eq!(result.as_ref().unwrap().as_ptr(), bytes.as_ptr());
         assert_eq!(result, Some(bytes));
         assert_eq!(
             connection.command(),
             [b"GET".as_slice(), b"u:42".as_slice()].map(<[u8]>::to_vec)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_encodes_a_redis_key_as_one_composite_key() {
+        let connection = Stub::new(Value::Nil);
+
+        let result: Option<Bytes> = get(&connection, crate::RedisKey3("u:", 12345_u64, ".suffix"))
+            .await
+            .unwrap();
+
+        assert_eq!(result, None);
+        assert_eq!(
+            connection.command(),
+            [b"GET".as_slice(), b"u:12345.suffix".as_slice()].map(<[u8]>::to_vec)
         );
     }
 
@@ -196,7 +276,7 @@ mod tests {
     async fn hget_preserves_nil_and_builds_a_read_command() {
         let connection = Stub::new(Value::Nil);
 
-        let result = hget(&connection, "document:42", "version").await.unwrap();
+        let result: Option<Bytes> = hget(&connection, "document:42", "version").await.unwrap();
 
         assert_eq!(result, None);
         assert_eq!(
@@ -219,9 +299,12 @@ mod tests {
             Value::BulkString(Bytes::from_static(b"digest")),
         ]));
 
-        let values = hmget(&connection, "document:42", &["value", "compress", "hash"])
-            .await
-            .unwrap();
+        let values =
+            hmget::<_, _, Bytes>(&connection, "document:42", &["value", "compress", "hash"])
+                .await
+                .unwrap()
+                .collect::<RedisResult<Vec<_>>>()
+                .unwrap();
 
         assert_eq!(values[0].as_ref().unwrap().as_ptr(), first.as_ptr());
         assert_eq!(values[0], Some(first));
