@@ -280,7 +280,7 @@ fn parse_line_i64(buf: &[u8], pos: &mut usize) -> Option<i64> {
 mod tests {
     use super::*;
 
-    /// End-to-end: SDK direct client -> proxy (no faults) -> real redis.
+    /// End-to-end: RedisService -> proxy (no faults) -> real redis.
     /// Requires REDIS_BENCH_PROXY_TEST_ADDR=host:port of a live redis.
     #[tokio::test]
     async fn proxy_forwards_end_to_end() {
@@ -292,12 +292,13 @@ mod tests {
         let target_addr: std::net::SocketAddr = target.parse().unwrap();
         let proxy = start_proxy(target_addr, injector).await.unwrap();
 
-        let cfg = redis::direct::ServerConfig::new(&proxy.to_string()).unwrap();
-        let client = redis::direct::DirectClient::connect(cfg).await.unwrap();
-        use redis::Commands;
-        client.hset::<i64>("proxy:it", "f", "v").await.unwrap();
-        let v: String = client.hget("proxy:it", "f").await.unwrap();
-        assert_eq!(v, "v");
+        let client = redis::RedisService::single(proxy.to_string())
+            .await
+            .unwrap();
+        use redis::Redis;
+        client.hset("proxy:it", "f", "v").await.unwrap();
+        let value: Option<redis::RedisBytes> = client.hget("proxy:it", "f").await.unwrap();
+        assert_eq!(value.as_deref(), Some(b"v".as_slice()));
 
         // Concurrent burst: exercises multi-frame reads through the proxy.
         let mut handles = Vec::new();
@@ -306,7 +307,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 for i in 0..200 {
                     client
-                        .hset::<i64>("proxy:it:burst", format!("f{w}"), i)
+                        .hset("proxy:it:burst", format!("f{w}"), i)
                         .await
                         .unwrap();
                 }

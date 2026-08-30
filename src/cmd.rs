@@ -1,11 +1,8 @@
 //! The [`Cmd`] command builder.
 
-use crate::connection::ConnectionLike;
 use crate::error::RedisResult;
-use crate::from_value::FromRedisValue;
-use crate::pipeline::Pipeline;
 use crate::to_args::ToRedisArgs;
-use crate::{EncodeRedisArg, ErrorKind, RedisArgSink, RedisArgsSink, RedisError};
+use crate::{EncodeRedisArg, EncodeRedisArgs, ErrorKind, RedisArgSink, RedisArgsSink, RedisError};
 use bytes::BufMut;
 
 /// A single Redis command: a command name plus its already-serialized
@@ -51,11 +48,6 @@ pub fn cmd(name: &str) -> Cmd {
     let mut c = Cmd::new();
     c.arg(name);
     c
-}
-
-/// Start building a [`Pipeline`].
-pub fn pipe() -> Pipeline {
-    Pipeline::new()
 }
 
 impl Cmd {
@@ -185,30 +177,28 @@ impl Cmd {
             out,
         );
     }
-
-    /// Send the command and convert its reply into `RV`.
-    pub async fn query_async<RV, C>(&self, con: &C) -> RedisResult<RV>
-    where
-        RV: FromRedisValue,
-        C: ConnectionLike + ?Sized,
-    {
-        let value = con.req_command(self).await?.into_result()?;
-        RV::from_redis_value(&value)
-    }
-
-    /// Send the command and discard its reply, surfacing only errors.
-    pub async fn exec_async<C>(&self, con: &C) -> RedisResult<()>
-    where
-        C: ConnectionLike + ?Sized,
-    {
-        con.req_command(self).await?.into_result()?;
-        Ok(())
-    }
 }
 
 impl RedisArgsSink for Cmd {
     fn write_arg<A: EncodeRedisArg + ?Sized>(&mut self, arg: &A) -> RedisResult<()> {
         self.arg_encoded(arg)?;
+        Ok(())
+    }
+}
+
+impl EncodeRedisArgs for Cmd {
+    #[inline]
+    fn num_args(&self) -> usize {
+        self.arg_count()
+    }
+
+    fn encode_args<S: RedisArgsSink + ?Sized>(&self, sink: &mut S) -> RedisResult<()> {
+        for index in 0..self.arg_count() {
+            sink.write_arg(
+                self.arg_at(index)
+                    .expect("command argument index is within arg_count"),
+            )?;
+        }
         Ok(())
     }
 }

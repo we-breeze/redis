@@ -1,10 +1,7 @@
 //! Workload generation against a pre-generated key/value pool.
 //!
-//! Workloads are written against the [`Commands`] trait, which is implemented
-//! for every [`ConnectionLike`]. The harness holds the active connection as a
-//! trait object (`Arc<dyn ConnectionLike>`) so the same workload code drives
-//! both the mesh [`Client`](redis::sidecar::SidecarClient) and the harness's direct
-//! client.
+//! Every mode builds the same [`redis::RedisService`]; only its construction
+//! source (mesh, one endpoint, or an explicit sharded topology) differs.
 //!
 //! To keep the per-op allocation count honest (so it reflects the *SDK's*
 //! allocations, not the benchmark's), keys and values are pre-generated once
@@ -15,9 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use redis::Commands;
-use redis::connection::ConnectionLike;
-use redis::types::Value;
+use redis::{Redis, RedisBytes, RedisService, RedisValues};
 
 /// A boxed, `Send` future returned by a workload.
 pub type WorkFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
@@ -47,17 +42,10 @@ pub const FIELDS: [&str; 4] = ["f1", "f2", "f3", "f4"];
 /// optionally padded to a size distribution), so replies can be checked for
 /// request/response mixups whenever `--verify` is on.
 /// Returns true if `value` carries that prefix.
-pub fn expected_value_matches(field: &str, key: &[u8], value: &Value) -> bool {
-    match value {
-        Value::BulkString(bytes) => {
-            bytes.len() >= field.len() + key.len()
-                && bytes.starts_with(field.as_bytes())
-                && &bytes[field.len()..field.len() + key.len()] == key
-        }
-        // Nil (missing key/field) also counts as corruption: everything was
-        // seeded, so a miss means routing/storage went wrong.
-        _ => false,
-    }
+pub fn expected_value_matches(field: &str, key: &[u8], value: &[u8]) -> bool {
+    value.len() >= field.len() + key.len()
+        && value.starts_with(field.as_bytes())
+        && &value[field.len()..field.len() + key.len()] == key
 }
 
 /// Build the seed value for (key, field): `field || key`, padded with the
@@ -75,7 +63,7 @@ pub fn seeded_value(field: &str, key: &[u8], fill: &[u8]) -> Vec<u8> {
 
 /// One logical operation against a connection.
 pub trait Workload: Send + Sync {
-    fn run<'a>(&'a self, client: &'a dyn ConnectionLike, op: u64) -> WorkFuture<'a>;
+    fn run<'a>(&'a self, client: &'a RedisService, op: u64) -> WorkFuture<'a>;
 }
 
 /// Pre-generated keys (fixed 32-byte) and values (sizes cycling through
@@ -185,10 +173,10 @@ struct HgetPing {
     verify: bool,
 }
 impl Workload for HgetPing {
-    fn run<'a>(&'a self, client: &'a dyn ConnectionLike, op: u64) -> WorkFuture<'a> {
+    fn run<'a>(&'a self, client: &'a RedisService, op: u64) -> WorkFuture<'a> {
         let key = self.pool.key(op as usize);
         Box::pin(async move {
-            let result: redis::RedisResult<Option<Value>> = client.hget(key, FIELDS[0]).await;
+            let result: redis::RedisResult<Option<RedisBytes>> = client.hget(key, FIELDS[0]).await;
             match result {
                 Ok(Some(value)) => {
                     let ok = !self.verify || expected_value_matches(FIELDS[0], key, &value);
@@ -214,20 +202,25 @@ struct HmgetPing {
     verify: bool,
 }
 impl Workload for HmgetPing {
-    fn run<'a>(&'a self, client: &'a dyn ConnectionLike, op: u64) -> WorkFuture<'a> {
+    fn run<'a>(&'a self, client: &'a RedisService, op: u64) -> WorkFuture<'a> {
         let key = self.pool.key(op as usize);
         Box::pin(async move {
-            let result: redis::RedisResult<Vec<Value>> = client.hmget(key, FIELDS).await;
+            let result: redis::RedisResult<RedisValues<RedisBytes>> =
+                client.hmget(key, FIELDS).await;
             match result {
                 Ok(values) => {
+                    let Ok(values) = values.collect::<redis::RedisResult<Vec<_>>>() else {
+                        return false;
+                    };
                     if !self.verify {
                         return true;
                     }
                     values.len() == FIELDS.len()
-                        && values
-                            .iter()
-                            .zip(FIELDS.iter())
-                            .all(|(value, field)| expected_value_matches(field, key, value))
+                        && values.iter().zip(FIELDS.iter()).all(|(value, field)| {
+                            value
+                                .as_deref()
+                                .is_some_and(|value| expected_value_matches(field, key, value))
+                        })
                 }
                 Err(_) => false,
             }

@@ -17,7 +17,8 @@ default = ["memory-stats"]
 memory-stats = ["brz-mem/heap-stats"]
 
 [dependencies]
-redis = { path = "../..", features = ["direct-mock"] }
+redis = { path = "../.." }
+brz-discovery.workspace = true
 brz-mem.workspace = true
 tokio = { version = "1", features = ["full"] }
 bytes = "1"

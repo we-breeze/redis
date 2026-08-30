@@ -4,16 +4,16 @@
 # 结束后自动清理。没有容器端口转发和平台模拟开销，数字反映 SDK 真实水平。
 #
 # 模式（MODE 环境变量）：
-#   direct   （默认）SDK direct::DirectClient 直连 redis
-#   sidecar  用假 sock 文件模拟 mesh 发布，走完整 sidecar 链路
-#   shards   N 个原生 redis 当分片，走 direct::Shards 客户端路由
+#   direct   （默认）SDK RedisService::single 直连 redis
+#   mesh  用假 sock 文件模拟 mesh 发布，走完整 mesh 链路
+#   shards   N 个原生 redis 当分片，走 RedisService::sharded 客户端路由
 #
 # 用法示例：
 #
 #   基本：
 #     ./bench_local.sh --ops 1000000 hget                     # direct 模式
 #     ./bench_local.sh -c 64 -d 60 hmget                      # 60 秒时长模式，4 字段 HMGET
-#     MODE=sidecar ./bench_local.sh --ops 1000000 hget        # sidecar（假 sock 文件）
+#     MODE=mesh ./bench_local.sh --ops 1000000 hget        # mesh（假 sock 文件）
 #     MODE=shards SHARDS=4 ./bench_local.sh --ops 1000000 hget  # N 个本机 redis 分片
 #
 #   故障注入（本地代理按帧注入）：
@@ -42,7 +42,7 @@
 #     MATRIX=1 MODE=shards SHARDS=4 ./bench_local.sh
 #
 # 环境变量：
-#   MODE      direct | sidecar | shards（默认 direct）
+#   MODE      direct | mesh | shards（默认 direct）
 #   MATRIX    1 = 跑完整压测矩阵（默认关）
 #   PORT      redis 端口（默认 16399；shards 模式占用 PORT..PORT+SHARDS-1）
 #   SHARDS    分片数（默认 4）
@@ -57,7 +57,7 @@
 # 也可以自己起 redis，脚本会复用 PORT 上已在监听的实例。
 #
 # 压测后查看 key（需 KEEP_REDIS=1）：
-#   redis-cli -p 16399 --no-raw --scan | head        # direct/sidecar 的 key
+#   redis-cli -p 16399 --no-raw --scan | head        # direct/mesh 的 key
 
 set -euo pipefail
 
@@ -115,13 +115,13 @@ prepare() {
       ensure_redis "$PORT"
       TARGET_ARGS=(--direct "127.0.0.1:$PORT")
       ;;
-    sidecar)
+    mesh)
       ensure_redis "$PORT"
       # 模拟 mesh 发布 sock 配置文件：
       #   <以 + 分隔的服务路径>@redis:<port>@rs，尾部是 +<group>+<namespace>
       local sock="$SOCK_DIR/static.config.api.example.com+3+config+cloud+redis+${GROUP}+${NAMESPACE}@redis:${PORT}@rs"
       touch "$sock"
-      echo "sidecar 模式: 已发布 sock 文件 $(basename "$sock")"
+      echo "mesh 模式: 已发布 sock 文件 $(basename "$sock")"
       TARGET_ARGS=(--namespace "$NAMESPACE" --group "$GROUP" --socket-dir "$SOCK_DIR")
       ;;
     shards)
@@ -135,7 +135,7 @@ prepare() {
       TARGET_ARGS=(--shards "$addrs")
       ;;
     *)
-      echo "error: 未知 MODE '$MODE'（direct | sidecar | shards）" >&2
+      echo "error: 未知 MODE '$MODE'（direct | mesh | shards）" >&2
       exit 2
       ;;
   esac

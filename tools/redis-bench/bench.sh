@@ -6,16 +6,16 @@
 # 只适合功能验证；要真实性能数字请用 bench_local.sh（原生 redis）。
 #
 # 模式（MODE 环境变量）：
-#   direct   （默认）SDK direct::DirectClient 直连 redis 容器
-#   sidecar  用假 sock 文件模拟 mesh 发布，走完整 sidecar 链路
-#   shards   N 个容器当分片，走 direct::Shards 客户端路由
+#   direct   （默认）SDK RedisService::single 直连 redis 容器
+#   mesh  用假 sock 文件模拟 mesh 发布，走完整 mesh 链路
+#   shards   N 个容器当分片，走 RedisService::sharded 客户端路由
 #
 # 用法示例（更多故障注入示例见 bench_local.sh 头部注释，参数完全一致）：
 #
 #   基本：
 #     ./bench.sh --concurrency 64 --ops 1000000 hget
 #     ./bench.sh -c 128 -d 60 hmget
-#     MODE=sidecar ./bench.sh --ops 1000000 hget
+#     MODE=mesh ./bench.sh --ops 1000000 hget
 #     MODE=shards SHARDS=4 ./bench.sh --ops 1000000 hget
 #
 #   故障注入：
@@ -35,7 +35,7 @@
 #     MATRIX=1 ./bench.sh
 #
 # 环境变量：
-#   MODE    direct | sidecar | shards（默认 direct）
+#   MODE    direct | mesh | shards（默认 direct）
 #   MATRIX  1 = 跑完整压测矩阵（默认关）
 #   IMAGE   redis 镜像（默认 redis:7；
 #           Apple Silicon 建议 IMAGE=redis:7 用 arm64 原生镜像）
@@ -102,13 +102,13 @@ prepare() {
       start_redis "$PORT" "$NAME"
       TARGET_ARGS=(--direct "127.0.0.1:$PORT")
       ;;
-    sidecar)
+    mesh)
       start_redis "$PORT" "$NAME"
       # 模拟 mesh 发布 sock 配置文件：
       #   <以 + 分隔的服务路径>@redis:<port>@rs，尾部是 +<group>+<namespace>
       local sock="$SOCK_DIR/static.config.api.example.com+3+config+cloud+redis+${GROUP}+${NAMESPACE}@redis:${PORT}@rs"
       touch "$sock"
-      echo "sidecar 模式: 已发布 sock 文件 $(basename "$sock")"
+      echo "mesh 模式: 已发布 sock 文件 $(basename "$sock")"
       echo
       TARGET_ARGS=(--namespace "$NAMESPACE" --group "$GROUP" --socket-dir "$SOCK_DIR")
       ;;
@@ -123,7 +123,7 @@ prepare() {
       TARGET_ARGS=(--shards "$addrs")
       ;;
     *)
-      echo "error: 未知 MODE '$MODE'（direct | sidecar | shards）" >&2
+      echo "error: 未知 MODE '$MODE'（direct | mesh | shards）" >&2
       exit 2
       ;;
   esac
