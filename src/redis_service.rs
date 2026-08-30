@@ -401,7 +401,7 @@ impl RedisService {
     ) -> RedisResult<RedisResponse>
     where
         H: EncodeRedisArg + ?Sized,
-        F: FnOnce(&EphemeralBytesArena) -> RedisRequest,
+        F: FnMut(&EphemeralBytesArena) -> RedisRequest,
     {
         // Keep the immutable topology alive until the admitted request
         // completes. A concurrent update can publish a new topology without
@@ -417,22 +417,39 @@ impl RedisService {
                 .map_err(map_net_error)?
         };
 
+        let mut build = build;
         let response = if readonly {
-            shard
+            let response = shard
                 .slaves
-                .request_with(|| build(&self.inner.request_arena))
-                .map_err(map_session_error)?
-                .await
-                .map_err(map_session_error)?
+                .request_with_failover(1, || build(&self.inner.request_arena))
+                .await;
+            if shard.slaves.len() == 1
+                && response
+                    .as_ref()
+                    .is_err_and(|error| error.is_retryable_transport())
+            {
+                // Match reference-client: when there is only one slave, the one
+                // bounded read retry falls back to the master replica group.
+                match shard
+                    .master
+                    .request_with(|| build(&self.inner.request_arena))
+                {
+                    Ok(response) => response.await,
+                    Err(error) => Err(error),
+                }
+            } else {
+                response
+            }
         } else {
-            shard
+            match shard
                 .master
                 .request_with(|| build(&self.inner.request_arena))
-                .map_err(map_session_error)?
-                .await
-                .map_err(map_session_error)?
+            {
+                Ok(response) => response.await,
+                Err(error) => Err(error),
+            }
         };
-        Ok(response)
+        response.map_err(map_session_error)
     }
 
     fn validate_pipe(pipe: &RedisPipe) -> RedisResult<()> {
@@ -1614,7 +1631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_timeout_closes_the_session_and_reconnects() {
+    async fn response_timeout_retries_master_then_reconnects_the_slave() {
         let master = FakeRedis::start("master").await;
         let slave = RecoveringRedis::start().await;
         let redis = RedisService::noshard_with_options(
@@ -1625,10 +1642,10 @@ mod tests {
         .await
         .unwrap();
 
-        let error = crate::Redis::get::<_, crate::RedisBytes>(&redis, "key")
+        let value = crate::Redis::get::<_, crate::RedisBytes>(&redis, "key")
             .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Timeout);
+            .unwrap();
+        assert_eq!(value.as_deref(), Some(b"master".as_slice()));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while slave.accepted() < 2 {
