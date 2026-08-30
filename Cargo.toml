@@ -12,9 +12,6 @@ futures-util = "0.3"
 tracing = "0.1"
 itoa = "1"
 ryu = "1"
-sha1_smol = "1"
-url = "2"
-thiserror = "2"
 md5 = "0.7"
 rand = "0.8"
 memchr = "2"
@@ -30,8 +27,6 @@ tempfile = { workspace = true }
 
 [features]
 default = []
-# Expose direct-backend types for tests, mocks, validation, and benchmarks.
-direct-mock = []
 # Integration tests that require a live redis-server are gated behind this.
 integration-tests = []
 
@@ -40,14 +35,13 @@ integration-tests = []
 # only other member.
 [workspace]
 members = ["tools/redis-bench"]
-exclude = ["memory"]
 resolver = "2"
 
 [workspace.dependencies]
 # Shared Breeze checkout managed by the consuming repository.
 brz-discovery = { package = "discovery", path = "../discovery" }
 tempfile = "3"
-# Workspace submodule: the bench harness installs this allocator at its binary
+# Shared sibling crate: the bench harness installs this allocator at its binary
 # composition root to get mimalloc + per-request allocation accounting. The SDK
 # itself stays allocator-agnostic.
-brz-mem = { path = "memory", version = "0.1.0", default-features = false }
+brz-mem = { path = "../memory", version = "0.1.0", default-features = false }

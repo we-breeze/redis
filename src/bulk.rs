@@ -80,6 +80,7 @@ pub struct RedisValues<R> {
 
 #[derive(Debug)]
 pub(crate) enum RedisValuesSource {
+    #[cfg(test)]
     Materialized(std::vec::IntoIter<Option<RedisBytes>>),
     Contiguous {
         frame: RedisBytes,
@@ -94,6 +95,7 @@ pub(crate) enum RedisValuesSource {
 }
 
 impl<R> RedisValues<R> {
+    #[cfg(test)]
     pub(crate) fn materialized(values: Vec<Option<RedisBytes>>) -> Self {
         Self::from_source(RedisValuesSource::Materialized(values.into_iter()))
     }
@@ -136,6 +138,7 @@ impl<R: FromRedisBulk> ExactSizeIterator for RedisValues<R> {}
 impl RedisValuesSource {
     fn remaining(&self) -> usize {
         match self {
+            #[cfg(test)]
             Self::Materialized(values) => values.len(),
             Self::Contiguous { remaining, .. } | Self::Wrapped { remaining, .. } => *remaining,
         }
@@ -143,6 +146,7 @@ impl RedisValuesSource {
 
     fn next_bytes(&mut self) -> Option<Option<RedisBytes>> {
         match self {
+            #[cfg(test)]
             Self::Materialized(values) => values.next(),
             Self::Contiguous {
                 frame,

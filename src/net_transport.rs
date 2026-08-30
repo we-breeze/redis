@@ -18,6 +18,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RedisResponseKind {
     Unit,
+    Integer,
     Bulk,
     MultiBulk { expected: usize },
 }
@@ -25,6 +26,7 @@ pub(crate) enum RedisResponseKind {
 #[derive(Debug)]
 pub(crate) enum RedisResponse {
     Unit,
+    Integer(i64),
     Bulk(Option<Bytes>),
     MultiBulk(RedisValuesSource),
     ServerError(ServerError),
@@ -36,6 +38,14 @@ impl RedisResponse {
             Self::Unit => Ok(()),
             Self::ServerError(error) => Err(error.into()),
             other => Err(unexpected_reply("status", &other)),
+        }
+    }
+
+    pub(crate) fn into_integer(self) -> RedisResult<i64> {
+        match self {
+            Self::Integer(value) => Ok(value),
+            Self::ServerError(error) => Err(error.into()),
+            other => Err(unexpected_reply("integer", &other)),
         }
     }
 
@@ -288,6 +298,7 @@ impl SessionProtocol for RedisProtocol {
 #[derive(Debug)]
 enum ResponseLayout {
     Unit,
+    Integer(i64),
     Bulk(Option<Range<usize>>),
     MultiBulk { first: usize, count: usize },
     ServerError(Range<usize>),
@@ -325,6 +336,7 @@ fn scan_response(source: &RxBuffer, expected: RedisResponseKind) -> RedisResult<
 
     match expected {
         RedisResponseKind::Unit => scan_unit(source),
+        RedisResponseKind::Integer => scan_integer(source),
         RedisResponseKind::Bulk => match scan_bulk(source, 0)? {
             Some(layout) => Ok(Scanned::Complete {
                 consumed: layout.consumed,
@@ -336,6 +348,20 @@ fn scan_response(source: &RxBuffer, expected: RedisResponseKind) -> RedisResult<
         },
         RedisResponseKind::MultiBulk { expected } => scan_multi_bulk(source, expected),
     }
+}
+
+fn scan_integer(source: &RxBuffer) -> RedisResult<Scanned> {
+    if source.byte(0) != Some(b':') {
+        return Err(protocol_error("expected Redis integer response"));
+    }
+    let Some((range, consumed)) = line_range(source, 1) else {
+        return Ok(Scanned::Incomplete { reserve: 32 });
+    };
+    let value = parse_length(source, range)?;
+    Ok(Scanned::Complete {
+        layout: ResponseLayout::Integer(value),
+        consumed,
+    })
 }
 
 fn scan_unit(source: &RxBuffer) -> RedisResult<Scanned> {
@@ -475,6 +501,7 @@ fn parse_length(source: &RxBuffer, range: Range<usize>) -> RedisResult<i64> {
 fn materialize(frame: RxFrame, layout: ResponseLayout) -> RedisResponse {
     match layout {
         ResponseLayout::Unit => RedisResponse::Unit,
+        ResponseLayout::Integer(value) => RedisResponse::Integer(value),
         ResponseLayout::ServerError(range) => {
             let line = frame.copy_range(range);
             RedisResponse::ServerError(ServerError::from_line(

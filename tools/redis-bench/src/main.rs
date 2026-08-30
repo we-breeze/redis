@@ -2,15 +2,8 @@
 //!
 //! Runs a fixed number of operations across `--concurrency` async workers and
 //! reports throughput plus latency percentiles (p50/p95/p99). It drives the
-//! SDK's client modes:
-//!
-//! - **sidecar mode** (default, `--namespace`): through
-//!   [`SidecarClient`](redis::sidecar::SidecarClient), measuring the full
-//!   pool/multiplexing/routing/HA stack against the breeze mesh.
-//! - **direct mode** (`--direct host:port[:db]`): through
-//!   [`DirectClient`](redis::direct::DirectClient), the SDK's direct-backend
-//!   stack (AUTH/SELECT handshake, circuit breaker, retries, DNS watcher)
-//!   straight to a raw redis-server.
+//! SDK's unified [`redis::RedisService`] in mesh, single-endpoint, or sharded
+//! construction modes.
 //!
 //! Usage:
 //!   redis-bench --namespace my_ns --concurrency 64 --ops 100000 get
@@ -30,8 +23,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use driver::{Workload, WorkloadKind};
 use fault::FaultInjector;
-use redis::connection::ConnectionLike;
-use redis::sidecar::{MeshConfig, SidecarClient};
+use redis::{MeshConfig, Redis, RedisService, RedisServiceOptions, ShardRouting};
 use stats::{MemoryWindow, OpBudget, Summary, WorkerStats};
 
 // Install mimalloc (with per-request heap accounting under the `memory-stats`
@@ -47,14 +39,13 @@ struct Args {
     #[arg(long, env = "BREEZE_REDIS_NS")]
     namespace: Option<String>,
 
-    /// Direct-backend mode: connect to a raw `host:port[:db]` redis-server
-    /// through the SDK's `redis::direct::DirectClient` (no mesh).
+    /// Connect one RedisService directly to `host:port[:db]` (no mesh).
     #[arg(long)]
     direct: Option<String>,
 
     /// Shards mode: comma-separated direct backends
-    /// (`host:port[:db],host:port[:db],...`), driven through the SDK's
-    /// `direct::Shards` client-side router.
+    /// (`host:port[:db],host:port[:db],...`), driven through RedisService's
+    /// client-side router.
     #[arg(long, value_delimiter = ',')]
     shards: Option<Vec<String>>,
 
@@ -78,18 +69,6 @@ struct Args {
     /// Directory the mesh publishes sock files into.
     #[arg(long, default_value = "/data1/breeze/socks")]
     socket_dir: String,
-
-    /// Minimum live pooled connections kept warm (0 = fully lazy start).
-    #[arg(long, default_value_t = 2)]
-    min_conns: usize,
-
-    /// Maximum live pooled connections (mesh client or direct).
-    #[arg(long, default_value_t = 16)]
-    max_conns: usize,
-
-    /// Per-connection in-flight request budget.
-    #[arg(long, default_value_t = 4096)]
-    max_inflight: usize,
 
     /// Per-command operation timeout, in milliseconds.
     #[arg(long, default_value_t = 1000)]
@@ -253,7 +232,7 @@ async fn run(mut args: Args) -> i32 {
 
     let workload: WorkloadKind = args.workload.into();
 
-    let client: Arc<dyn ConnectionLike> = match build_client(&args).await {
+    let client = match build_client(&args).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: failed to connect: {e}");
@@ -273,15 +252,8 @@ async fn run(mut args: Args) -> i32 {
         args.big_value_size,
     ));
     eprintln!(
-        "redis-bench: workload={:?} keys={} key_len={} val_size={} concurrency={} min_conns={} max_conns={} max_inflight={}",
-        workload,
-        args.keys,
-        args.key_len,
-        args.val_size,
-        args.concurrency,
-        args.min_conns,
-        args.max_conns,
-        args.max_inflight
+        "redis-bench: workload={:?} keys={} key_len={} val_size={} concurrency={}",
+        workload, args.keys, args.key_len, args.val_size, args.concurrency
     );
 
     // Seed the keyspace: for GET, the keys must exist first; for SET we
@@ -362,7 +334,7 @@ enum RunMode {
 }
 
 /// Insert the fault-injecting proxy between the bench and the configured
-/// target, rewriting `args` to point at the proxy. Sidecar mode re-publishes
+/// target, rewriting `args` to point at the proxy. Mesh mode re-publishes
 /// a bench-owned sock file (proxy port) in a fresh socket dir.
 async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<(), String> {
     if let Some(shards) = args.shards.clone() {
@@ -411,13 +383,18 @@ async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<
         return Ok(());
     }
     if let Some(ns) = args.namespace.clone() {
-        let endpoint = redis::sidecar::discovery::scan_endpoint(
-            std::path::Path::new(&args.socket_dir),
-            &args.group,
-            &ns,
-        )
-        .ok_or("no TCP mesh endpoint to proxy")?;
-        let redis::sidecar::Endpoint { host, port } = endpoint;
+        let endpoint = brz_discovery::Registry::new(&args.socket_dir)
+            .discover(
+                "redis",
+                brz_discovery::CoordinateLayout::GroupNamespace,
+                &args.group,
+                &ns,
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .ok_or("no TCP mesh endpoint to proxy")?;
+        let brz_discovery::Endpoint { host, port } = endpoint;
         let target = resolve(&format!("{host}:{port}")).await?;
         let proxy = fault::start_proxy(target, injector).await?;
         let dir = std::env::temp_dir().join(format!("redis-bench-fault-{}", std::process::id()));
@@ -444,39 +421,29 @@ async fn resolve(host_port: &str) -> Result<std::net::SocketAddr, String> {
         .ok_or_else(|| format!("resolve {host_port}: no addresses"))
 }
 
-/// Build the connection the harness will drive. Returns it as a trait object
-/// so the rest of the harness is agnostic to mesh-vs-direct.
-async fn build_client(args: &Args) -> Result<Arc<dyn ConnectionLike>, String> {
+/// Build the unified service the harness will drive.
+async fn build_client(args: &Args) -> Result<Arc<RedisService>, String> {
+    let options =
+        RedisServiceOptions::default().with_timeout(Duration::from_millis(args.op_timeout_ms));
     if let Some(shards) = &args.shards {
-        let mut clients = Vec::with_capacity(shards.len());
-        for addr in shards {
-            let mut cfg = redis::direct::ServerConfig::new(addr)
-                .map_err(|e| e.to_string())?
-                .with_min_connections(args.min_conns)
-                .with_max_connections(args.max_conns);
-            cfg.max_inflight = args.max_inflight;
-            cfg.op_timeout = Duration::from_millis(args.op_timeout_ms);
-            clients.push(
-                redis::direct::DirectClient::connect(cfg)
-                    .await
-                    .map_err(|e| format!("shard {addr}: {e}"))?,
-            );
-        }
-        let router =
-            redis::direct::Shards::new(&args.hash, &args.distribution, shards.clone(), clients);
-        return Ok(Arc::new(router));
+        let topology = shards
+            .iter()
+            .map(|address| (address.clone(), vec![address.clone()]))
+            .collect();
+        let service = RedisService::sharded_with_options(
+            topology,
+            ShardRouting::new(&args.hash, &args.distribution),
+            options,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        return Ok(Arc::new(service));
     }
     if let Some(addr) = &args.direct {
-        let mut cfg = redis::direct::ServerConfig::new(addr)
-            .map_err(|e| e.to_string())?
-            .with_min_connections(args.min_conns)
-            .with_max_connections(args.max_conns);
-        cfg.max_inflight = args.max_inflight;
-        cfg.op_timeout = Duration::from_millis(args.op_timeout_ms);
-        let dc = redis::direct::DirectClient::connect(cfg)
+        let service = RedisService::single_with_options(addr, options)
             .await
-            .map_err(|e| e.to_string())?;
-        return Ok(Arc::new(dc));
+            .map_err(|error| error.to_string())?;
+        return Ok(Arc::new(service));
     }
 
     let ns = args
@@ -484,24 +451,17 @@ async fn build_client(args: &Args) -> Result<Arc<dyn ConnectionLike>, String> {
         .clone()
         .ok_or_else(|| "one of --namespace, --direct, or --shards is required".to_string())?;
 
-    let mut cfg = MeshConfig::new(ns)
-        .with_group(&args.group)
-        .with_socket_dir(&args.socket_dir)
-        .with_min_connections(args.min_conns)
-        .with_max_connections(args.max_conns)
-        .with_max_inflight(args.max_inflight);
-    cfg.op_timeout = Duration::from_millis(args.op_timeout_ms);
-
-    let client = SidecarClient::from_config(cfg)
+    let config = MeshConfig::new(&args.group, ns).with_socket_dir(&args.socket_dir);
+    let service = RedisService::mesh_with_config(config, options)
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(Arc::new(client))
+        .map_err(|error| error.to_string())?;
+    Ok(Arc::new(service))
 }
 
 /// Issue throwaway operations to prime the pool and let the server/mesh warm
 /// up; not measured.
 async fn warmup(
-    client: &Arc<dyn ConnectionLike>,
+    client: &Arc<RedisService>,
     runner: &Arc<dyn Workload>,
     concurrency: usize,
     per_worker: usize,
@@ -512,7 +472,7 @@ async fn warmup(
         let runner = runner.clone();
         handles.push(tokio::spawn(async move {
             for i in 0..per_worker {
-                let _ = runner.run(&*client, (w as u64) * 1000 + i as u64).await;
+                let _ = runner.run(&client, (w as u64) * 1000 + i as u64).await;
             }
         }));
     }
@@ -526,10 +486,7 @@ async fn warmup(
 /// existing keys and the SET workload pure-overwrite. Seeding is not the
 /// measured phase, so it runs concurrently across the harness pool to keep it
 /// fast for large key counts.
-async fn seed_keys(
-    client: &Arc<dyn ConnectionLike>,
-    pool: &Arc<driver::Pool>,
-) -> Result<(), String> {
+async fn seed_keys(client: &Arc<RedisService>, pool: &Arc<driver::Pool>) -> Result<(), String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let next = Arc::new(AtomicUsize::new(0));
@@ -548,37 +505,32 @@ async fn seed_keys(
                 }
                 let key: &[u8] = pool.key(i);
                 let value: &[u8] = pool.value(i);
-                // One HSET per key, all workload fields at once. Values are
+                // Seed every hash field through the typed RedisService API. Values are
                 // always self-describing (field || key || padding), so
                 // --verify runs can check replies; the flag only toggles
                 // checking, not the seed format.
-                let mut cmd = redis::cmd("HSET");
-                cmd.arg(key);
                 for field in driver::FIELDS {
-                    // arg_bytes: a Vec<u8> passed to arg() would expand
-                    // variadically (one arg per byte).
-                    cmd.arg(field)
-                        .arg_bytes(&driver::seeded_value(field, key, value));
-                }
-                // Tolerate transient faults (fault injection may hang a
-                // connection; writes don't auto-retry by design).
-                let mut ok = false;
-                for attempt in 0..5 {
-                    match cmd.exec_async(&*client).await {
-                        Ok(()) => {
-                            ok = true;
-                            break;
-                        }
-                        Err(e) if attempt == 4 => {
-                            eprintln!("seed HSET failed at key index {i}: {e}");
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                    let seeded = driver::seeded_value(field, key, value);
+                    // Tolerate transient faults (fault injection may hang a
+                    // connection; writes don't auto-retry by design).
+                    let mut ok = false;
+                    for attempt in 0..5 {
+                        match client.hset(key, field, seeded.as_slice()).await {
+                            Ok(_) => {
+                                ok = true;
+                                break;
+                            }
+                            Err(e) if attempt == 4 => {
+                                eprintln!("seed HSET failed at key index {i}: {e}");
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
                         }
                     }
-                }
-                if !ok {
-                    return false;
+                    if !ok {
+                        return false;
+                    }
                 }
             }
             true
@@ -598,7 +550,7 @@ async fn seed_keys(
 /// or race a deadline (timed mode); each records latency into a local
 /// histogram, merged at the end.
 async fn measured_run(
-    client: &Arc<dyn ConnectionLike>,
+    client: &Arc<RedisService>,
     runner: &Arc<dyn Workload>,
     concurrency: usize,
     mode: RunMode,
@@ -649,7 +601,7 @@ async fn measured_run(
                     }
                 }
                 let t = Instant::now();
-                let ok = runner.run(&*client, op).await;
+                let ok = runner.run(&client, op).await;
                 let elapsed = t.elapsed();
                 if ok {
                     local.record(elapsed);
@@ -678,11 +630,7 @@ async fn measured_run(
 /// Full pre-bench data check: HMGET every key and verify each field's value
 /// carries the expected `field || key` prefix (see [`driver::seeded_value`]).
 /// Any mismatch aborts the run.
-async fn verify_seeds(
-    client: &Arc<dyn ConnectionLike>,
-    pool: &Arc<driver::Pool>,
-) -> Result<(), String> {
-    use redis::Commands;
+async fn verify_seeds(client: &Arc<RedisService>, pool: &Arc<driver::Pool>) -> Result<(), String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let next = Arc::new(AtomicUsize::new(0));
@@ -702,15 +650,25 @@ async fn verify_seeds(
                     break;
                 }
                 let key = pool.key(i);
-                let result: redis::RedisResult<Vec<redis::types::Value>> =
+                let result: redis::RedisResult<redis::RedisValues<redis::RedisBytes>> =
                     client.hmget(key, driver::FIELDS).await;
                 match result {
-                    Ok(values)
-                        if values.len() == driver::FIELDS.len()
-                            && values.iter().zip(driver::FIELDS.iter()).all(
-                                |(value, field)| driver::expected_value_matches(field, key, value),
-                            ) => {}
                     Ok(values) => {
+                        let values = values.collect::<redis::RedisResult<Vec<_>>>();
+                        let valid = values.as_ref().is_ok_and(|values| {
+                            values.len() == driver::FIELDS.len()
+                                && values
+                                    .iter()
+                                    .zip(driver::FIELDS.iter())
+                                    .all(|(value, field)| {
+                                        value.as_deref().is_some_and(|value| {
+                                            driver::expected_value_matches(field, key, value)
+                                        })
+                                    })
+                        });
+                        if valid {
+                            continue;
+                        }
                         let prior = mismatches.fetch_add(1, Ordering::Relaxed);
                         if prior == 0 {
                             eprintln!("seed mismatch at key index {i}: got {values:?}");

@@ -8,19 +8,20 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use brz_net::{
-    DnsOptions, DnsSource, EndpointSet, EndpointSource, EphemeralBytesArena, NetError, Node,
-    NodeOptions, QuotaBalancerOptions, ReplicaSet, ShardRouter, Sharded,
+    DnsOptions, DnsSource, EndpointSet, EndpointSource, EphemeralBytesArena, MAX_IN_FLIGHT,
+    NetError, Node, NodeOptions, QuotaBalancerOptions, ReplicaSet, ShardRouter, Sharded,
 };
 use futures_util::future::try_join_all;
 use tokio::time::{Instant, MissedTickBehavior, sleep};
 
-use crate::direct::sharding::Sharding;
+use crate::mesh::MeshConfig;
 use crate::net_transport::{
     RedisProtocol, RedisRequest, RedisResponse, RedisResponseKind, map_session_error,
 };
+use crate::sharding::Sharding;
 use crate::{
-    EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, Redis, RedisArgsSink, RedisError,
-    RedisResult, RedisValues,
+    EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, PipeResponse, Redis, RedisArgsSink,
+    RedisError, RedisPipe, RedisResult, RedisValues,
 };
 
 const DNS_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
@@ -74,8 +75,8 @@ pub struct RedisServiceOptions {
 impl Default for RedisServiceOptions {
     fn default() -> Self {
         Self {
-            master_timeout: Duration::from_millis(500),
-            slave_timeout: Duration::from_millis(500),
+            master_timeout: Duration::from_millis(200),
+            slave_timeout: Duration::from_millis(200),
             connect_timeout: Duration::from_secs(2),
             dns_refresh_interval: Duration::from_secs(30),
             replica_balance: QuotaBalancerOptions::default(),
@@ -84,6 +85,14 @@ impl Default for RedisServiceOptions {
 }
 
 impl RedisServiceOptions {
+    /// Set the request timeout for both master and slave sessions.
+    #[must_use]
+    pub fn with_timeout(mut self, value: Duration) -> Self {
+        self.master_timeout = value;
+        self.slave_timeout = value;
+        self
+    }
+
     #[must_use]
     pub fn with_master_timeout(mut self, value: Duration) -> Self {
         self.master_timeout = value;
@@ -144,7 +153,7 @@ impl ShardRouter<[u8]> for RedisRouter {
     }
 }
 
-struct RedisTopology {
+pub(crate) struct RedisTopology {
     shards: Sharded<RedisShard, RedisRouter>,
     discovery: Arc<RedisDiscovery>,
     resolved: ResolvedTopology,
@@ -278,6 +287,32 @@ pub struct RedisService {
 }
 
 impl RedisService {
+    /// Discovers one local Breeze mesh TCP endpoint and builds a fixed service.
+    ///
+    /// Registry discovery happens once. The resolved endpoint then has exactly
+    /// the same semantics as [`RedisService::single`].
+    pub async fn mesh(group: impl Into<String>, namespace: impl Into<String>) -> RedisResult<Self> {
+        Self::mesh_with_options(group, namespace, RedisServiceOptions::default()).await
+    }
+
+    /// Discovers one local Breeze mesh endpoint with explicit transport options.
+    pub async fn mesh_with_options(
+        group: impl Into<String>,
+        namespace: impl Into<String>,
+        options: RedisServiceOptions,
+    ) -> RedisResult<Self> {
+        Self::mesh_with_config(MeshConfig::new(group, namespace), options).await
+    }
+
+    /// Builds a fixed service from explicit mesh discovery coordinates.
+    pub async fn mesh_with_config(
+        config: MeshConfig,
+        options: RedisServiceOptions,
+    ) -> RedisResult<Self> {
+        let endpoint = config.resolve()?;
+        Self::single_with_options(format!("{}:{}", endpoint.host, endpoint.port), options).await
+    }
+
     /// Builds one direct endpoint using the transport defaults.
     ///
     /// Internally the same address occupies the master and slave roles, so
@@ -399,6 +434,43 @@ impl RedisService {
         };
         Ok(response)
     }
+
+    fn validate_pipe(pipe: &RedisPipe) -> RedisResult<()> {
+        if pipe.len() > MAX_IN_FLIGHT {
+            return Err(RedisError::new(
+                ErrorKind::ClientError,
+                format!(
+                    "Redis pipeline contains {} commands, maximum is {MAX_IN_FLIGHT}",
+                    pipe.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn execute_pipe(&self, pipe: RedisPipe) -> RedisResult<PipeResponse> {
+        Self::validate_pipe(&pipe)?;
+        let topology = self.inner.topology.load_full();
+        if topology.shards.shard_count() != 1 {
+            return Err(RedisError::new(
+                ErrorKind::ClientError,
+                "Redis pipelines are not supported on multi-shard services",
+            ));
+        }
+        if pipe.is_empty() {
+            return Ok(PipeResponse::ready(Vec::new()));
+        }
+        let readonly = pipe.is_readonly();
+        let shard = topology.shards.get(&[][..]).map_err(map_net_error)?;
+        let requests = pipe.into_requests(&self.inner.request_arena);
+        let responses = if readonly {
+            shard.slaves.request_batch(requests)
+        } else {
+            shard.master.request_batch(requests)
+        }
+        .map_err(map_session_error)?;
+        Ok(PipeResponse::direct(responses, topology))
+    }
 }
 
 struct HmgetArgs<'a, K: ?Sized, F: ?Sized> {
@@ -461,6 +533,10 @@ async fn reconcile_dns_once(inner: &RedisServiceInner) -> RedisResult<bool> {
 }
 
 impl Redis for RedisService {
+    async fn pipe(&self, pipe: RedisPipe) -> RedisResult<PipeResponse> {
+        self.execute_pipe(pipe)
+    }
+
     async fn get<K, R>(&self, key: K) -> RedisResult<Option<R>>
     where
         K: EncodeRedisArg + Send,
@@ -528,6 +604,23 @@ impl Redis for RedisService {
         .into_bulk()?
         .map(R::from_redis_bulk)
         .transpose()
+    }
+
+    async fn hset<K, F, V>(&self, key: K, field: F, value: V) -> RedisResult<i64>
+    where
+        K: EncodeRedisArg + Send,
+        F: EncodeRedisArg + Send,
+        V: EncodeRedisArg + Send,
+    {
+        self.execute(&key, false, |arena| {
+            RedisRequest::encode(
+                arena,
+                &("HSET", &key, &field, &value),
+                RedisResponseKind::Integer,
+            )
+        })
+        .await?
+        .into_integer()
     }
 
     async fn hmget<K, F, R>(&self, key: K, fields: F) -> RedisResult<RedisValues<R>>
@@ -894,10 +987,12 @@ mod tests {
     use tokio::task::{JoinHandle, JoinSet};
     use tokio::time::{Instant, sleep};
 
-    use crate::direct::sharding::Sharding;
-    use crate::direct::sharding::hash::{Hash, Hasher};
     use crate::resp::parser::{ParseResult, parse_reply};
-    use crate::{ErrorKind, Value};
+    use crate::sharding::Sharding;
+    use crate::sharding::hash::{Hash, Hasher};
+    use crate::{
+        ErrorKind, MeshConfig, Redis, RedisBytes, RedisPipe, RedisResult, RedisValues, Value,
+    };
 
     use super::{RedisService, RedisServiceOptions, ShardRouting};
 
@@ -945,6 +1040,7 @@ mod tests {
                                             ParseResult::Complete { value, consumed } => {
                                                 position += consumed;
                                                 let command = command_name(&value);
+                                                let argument_count = command_argument_count(&value);
                                                 seen.lock().unwrap().push(command.clone());
                                                 if !delay.is_zero() {
                                                     tokio::time::sleep(delay).await;
@@ -953,6 +1049,17 @@ mod tests {
                                                     "GET" | "HGET" => responses.extend_from_slice(
                                                         format!("${}\r\n{read_value}\r\n", read_value.len()).as_bytes()
                                                     ),
+                                                    "HMGET" => {
+                                                        let fields = argument_count.saturating_sub(2);
+                                                        responses.extend_from_slice(
+                                                            format!("*{fields}\r\n").as_bytes()
+                                                        );
+                                                        for _ in 0..fields {
+                                                            responses.extend_from_slice(
+                                                                format!("${}\r\n{read_value}\r\n", read_value.len()).as_bytes()
+                                                            );
+                                                        }
+                                                    }
                                                     "SET" | "AUTH" | "SELECT" => responses.extend_from_slice(b"+OK\r\n"),
                                                     "PING" => responses.extend_from_slice(b"+PONG\r\n"),
                                                     _ => responses.extend_from_slice(b":1\r\n"),
@@ -1058,6 +1165,74 @@ mod tests {
         String::from_utf8_lossy(command).to_ascii_uppercase()
     }
 
+    fn command_argument_count(value: &Value) -> usize {
+        match value {
+            Value::Array(arguments) => arguments.len(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn redis_defaults_to_two_hundred_millisecond_request_timeout() {
+        let options = RedisServiceOptions::default();
+
+        assert_eq!(options.master_timeout, Duration::from_millis(200));
+        assert_eq!(options.slave_timeout, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn unified_timeout_updates_both_roles() {
+        let options = RedisServiceOptions::default().with_timeout(Duration::from_secs(3));
+
+        assert_eq!(options.master_timeout, Duration::from_secs(3));
+        assert_eq!(options.slave_timeout, Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn mesh_discovers_once_then_behaves_like_single() {
+        let first = FakeRedis::start("first").await;
+        let second = FakeRedis::start("second").await;
+        let directory = tempfile::tempdir().unwrap();
+        let first_port = first.endpoint.rsplit_once(':').unwrap().1;
+        let second_port = second.endpoint.rsplit_once(':').unwrap().1;
+        let first_record = directory.path().join(format!(
+            "static.config.api.example.com+3+config+cloud+redis+feed+profiles@redis:{first_port}@rs"
+        ));
+        std::fs::write(&first_record, []).unwrap();
+
+        let redis = RedisService::mesh_with_config(
+            MeshConfig::new("feed", "profiles").with_socket_dir(directory.path()),
+            RedisServiceOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Redis::get::<_, RedisBytes>(&redis, "key")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"first".as_slice())
+        );
+
+        std::fs::remove_file(first_record).unwrap();
+        std::fs::write(
+            directory.path().join(format!(
+                "static.config.api.example.com+3+config+cloud+redis+feed+profiles@redis:{second_port}@rs"
+            )),
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            Redis::get::<_, RedisBytes>(&redis, "key")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"first".as_slice())
+        );
+        assert_eq!(second.accepted(), 0);
+    }
+
     #[test]
     fn crc32_java_mapping_keeps_standard_and_short_distinct() {
         let key = b"123456789".as_slice();
@@ -1145,6 +1320,87 @@ mod tests {
         assert!(server.saw("SET"));
 
         assert_eq!(server.accepted(), 2);
+    }
+
+    #[tokio::test]
+    async fn hset_uses_the_master_and_decodes_the_integer_response() {
+        let master = FakeRedis::start("master").await;
+        let slave = FakeRedis::start("slave").await;
+        let redis = RedisService::noshard(master.endpoint.clone(), [slave.endpoint.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            Redis::hset(&redis, "hash", "field", "value").await.unwrap(),
+            1
+        );
+        assert!(master.saw("HSET"));
+        assert!(!slave.saw("HSET"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_submits_to_one_replica_and_takes_typed_responses_in_order() {
+        let master = FakeRedis::start("master").await;
+        let first_slave = FakeRedis::start("first").await;
+        let second_slave = FakeRedis::start("second").await;
+        let redis = RedisService::noshard(
+            master.endpoint.clone(),
+            [first_slave.endpoint.clone(), second_slave.endpoint.clone()],
+        )
+        .await
+        .unwrap();
+
+        let mut pipe = RedisPipe::with_capacity(3);
+        pipe.hget("key", "version").unwrap();
+        pipe.hmget("key", ["value", "hash"]).unwrap();
+        pipe.hget("key", "version").unwrap();
+
+        let mut responses = redis.pipe(pipe).await.unwrap();
+        let first: Option<RedisBytes> = responses.take().await.unwrap();
+        let values: RedisValues<RedisBytes> = responses.take().await.unwrap();
+        let values = values.collect::<RedisResult<Vec<_>>>().unwrap();
+        let last: Option<RedisBytes> = responses.take().await.unwrap();
+
+        assert_eq!(first, last);
+        assert_eq!(values, vec![first.clone(), first]);
+        assert!(responses.is_empty());
+
+        let first_commands = first_slave.seen.lock().unwrap().len();
+        let second_commands = second_slave.seen.lock().unwrap().len();
+        assert!(
+            (first_commands == 3 && second_commands == 0)
+                || (first_commands == 0 && second_commands == 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_rejects_multi_shard_service_before_sending() {
+        let master_a = FakeRedis::start("master-a").await;
+        let slave_a = FakeRedis::start("slave-a").await;
+        let master_b = FakeRedis::start("master-b").await;
+        let slave_b = FakeRedis::start("slave-b").await;
+        let redis = RedisService::sharded(
+            vec![
+                (master_a.endpoint.clone(), vec![slave_a.endpoint.clone()]),
+                (master_b.endpoint.clone(), vec![slave_b.endpoint.clone()]),
+            ],
+            ShardRouting::new("crc32", "modula"),
+        )
+        .await
+        .unwrap();
+
+        let mut pipe = RedisPipe::with_capacity(2);
+        pipe.get("key-a").unwrap();
+        pipe.get("key-b").unwrap();
+
+        let error = redis.pipe(pipe).await.err().unwrap();
+
+        assert_eq!(error.kind(), ErrorKind::ClientError);
+        assert!(error.to_string().contains("multi-shard"));
+        assert!(!slave_a.saw("GET"));
+        assert!(!slave_b.saw("GET"));
+        assert!(!master_a.saw("GET"));
+        assert!(!master_b.saw("GET"));
     }
 
     #[tokio::test]

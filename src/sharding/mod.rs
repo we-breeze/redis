@@ -1,6 +1,6 @@
 // 本目录为 breeze sharding 的原样复制(vendored),风格类告警不参与
 // 主 crate 的 lint 标准。
-#![allow(clippy::all)]
+#![allow(clippy::all, dead_code, unused_imports)]
 
 // #[derive(Debug, Clone)]
 // pub struct Sharding {
