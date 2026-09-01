@@ -2,12 +2,10 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
-use brz_net::{EphemeralBytesArena, NodeReplicaResponseFuture};
+use brz_net::EphemeralBytesArena;
 
-use crate::net_transport::{
-    RedisProtocol, RedisRequest, RedisResponse, RedisResponseKind, map_session_error,
-};
-use crate::redis_service::RedisTopology;
+use crate::net_transport::{RedisRequest, RedisResponse, RedisResponseKind, map_session_error};
+use crate::redis_service::{RedisReplicaResponseFuture, RedisTopology};
 use crate::{
     Cmd, EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, RedisError, RedisResult,
     RedisValues, cmd,
@@ -138,7 +136,7 @@ fn readonly_command(name: &str) -> Cmd {
 }
 
 enum PendingResponses {
-    Direct(VecDeque<NodeReplicaResponseFuture<RedisProtocol>>),
+    Direct(VecDeque<RedisReplicaResponseFuture>),
     Ready(VecDeque<RedisResponse>),
 }
 
@@ -155,7 +153,7 @@ pub struct PipeResponse {
 
 impl PipeResponse {
     pub(crate) fn direct(
-        responses: Vec<NodeReplicaResponseFuture<RedisProtocol>>,
+        responses: Vec<RedisReplicaResponseFuture>,
         topology: Arc<RedisTopology>,
     ) -> Self {
         Self {

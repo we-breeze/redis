@@ -9,7 +9,8 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use brz_net::{
     DnsOptions, DnsSource, EndpointSet, EndpointSource, EphemeralBytesArena, MAX_IN_FLIGHT,
-    NetError, Node, NodeOptions, QuotaBalancerOptions, ReplicaSet, ShardRouter, Sharded,
+    NetError, Node, NodeOptions, QuotaBalancerOptions, ReplicaSet, ReplicaSetResponseFuture,
+    ResponseFuture, SessionError, SessionReplica, ShardRouter, Sharded,
 };
 use futures_util::future::try_join_all;
 use tokio::time::{Instant, MissedTickBehavior, sleep};
@@ -18,6 +19,8 @@ use crate::mesh::MeshConfig;
 use crate::net_transport::{
     RedisProtocol, RedisRequest, RedisResponse, RedisResponseKind, map_session_error,
 };
+#[cfg(feature = "metrics")]
+use crate::profile_metrics::{EndpointProfileMetric, ProfiledResponseFuture};
 use crate::sharding::Sharding;
 use crate::{
     EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, PipeResponse, Redis, RedisArgsSink,
@@ -130,10 +133,117 @@ impl RedisServiceOptions {
     }
 }
 
+type RedisNodeResult = Result<RedisResponse, SessionError<RedisError>>;
+
+#[cfg(feature = "metrics")]
+type RedisNodeResponseFuture = ProfiledResponseFuture<ResponseFuture<RedisNodeResult>>;
+#[cfg(not(feature = "metrics"))]
+type RedisNodeResponseFuture = ResponseFuture<RedisNodeResult>;
+
+/// One physical Redis session plus the logical endpoint state shared by all
+/// addresses resolved from the same configured `host:port`.
+#[derive(Clone)]
+pub(crate) struct RedisReplica {
+    node: Node<RedisProtocol>,
+    #[cfg(feature = "metrics")]
+    profile_metric: Arc<EndpointProfileMetric>,
+}
+
+impl RedisReplica {
+    #[cfg(feature = "metrics")]
+    fn new(node: Node<RedisProtocol>, profile_metric: Arc<EndpointProfileMetric>) -> Self {
+        Self {
+            node,
+            profile_metric,
+        }
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    fn new(node: Node<RedisProtocol>) -> Self {
+        Self { node }
+    }
+
+    fn is_connected(&self) -> bool {
+        self.node.is_connected()
+    }
+
+    fn endpoint(&self) -> SocketAddr {
+        self.node.endpoint()
+    }
+}
+
+impl SessionReplica for RedisReplica {
+    type Request = RedisRequest;
+    type Response = RedisResponse;
+    type Error = RedisError;
+    type Future = RedisNodeResponseFuture;
+
+    fn request(&self, request: Self::Request) -> Result<Self::Future, SessionError<Self::Error>> {
+        #[cfg(feature = "metrics")]
+        {
+            let attempt = self.profile_metric.attempt();
+            let response = self.node.request(request)?;
+            Ok(attempt.wrap(response))
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            self.node.request(request)
+        }
+    }
+
+    fn request_with<F>(&self, build: F) -> Result<Self::Future, SessionError<Self::Error>>
+    where
+        F: FnOnce() -> Self::Request,
+    {
+        #[cfg(feature = "metrics")]
+        {
+            let attempt = self.profile_metric.attempt();
+            let response = self.node.request_with(build)?;
+            Ok(attempt.wrap(response))
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            self.node.request_with(build)
+        }
+    }
+
+    fn request_batch(
+        &self,
+        requests: Vec<Self::Request>,
+    ) -> Result<Vec<Self::Future>, SessionError<Self::Error>> {
+        #[cfg(feature = "metrics")]
+        {
+            let count = requests.len();
+            let started = std::time::Instant::now();
+            let responses = match self.node.request_batch(requests) {
+                Ok(responses) => responses,
+                Err(error) => {
+                    self.profile_metric.record_batch_failure(count, started);
+                    return Err(error);
+                }
+            };
+            Ok(responses
+                .into_iter()
+                .map(|response| {
+                    self.profile_metric
+                        .attempt_started_at(started)
+                        .wrap(response)
+                })
+                .collect())
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            self.node.request_batch(requests)
+        }
+    }
+}
+
+pub(crate) type RedisReplicaResponseFuture = ReplicaSetResponseFuture<RedisReplica>;
+
 struct RedisShard {
     // A hostname may resolve to more than one equivalent IPv4 address.
-    master: ReplicaSet<Node<RedisProtocol>>,
-    slaves: ReplicaSet<Node<RedisProtocol>>,
+    master: ReplicaSet<RedisReplica>,
+    slaves: ReplicaSet<RedisReplica>,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +287,11 @@ struct RedisEndpointConfig {
 impl RedisEndpointConfig {
     fn label(&self) -> String {
         format!("{}:{}:{}", self.host, self.port, self.db)
+    }
+
+    #[cfg(feature = "metrics")]
+    fn profile_name(&self) -> String {
+        format!("{}:{}", self.host, self.port)
     }
 }
 
@@ -808,13 +923,15 @@ async fn build_replicas(
     options: &RedisServiceOptions,
     previous: Option<&RedisTopology>,
 ) -> RedisResult<(
-    ReplicaSet<Node<RedisProtocol>>,
+    ReplicaSet<RedisReplica>,
     HashMap<NodeKey, Node<RedisProtocol>>,
 )> {
     let mut endpoints = HashSet::new();
     let mut node_cache = HashMap::new();
     let mut nodes = Vec::new();
     for resolved in configs {
+        #[cfg(feature = "metrics")]
+        let profile_metric = Arc::new(EndpointProfileMetric::new(resolved.config.profile_name()));
         for &address in resolved.addresses.iter() {
             let key = NodeKey {
                 endpoint: address,
@@ -840,7 +957,10 @@ async fn build_replicas(
                 .map_err(map_net_error)?
             };
             node_cache.insert(key, node.clone());
-            nodes.push(node);
+            #[cfg(feature = "metrics")]
+            nodes.push(RedisReplica::new(node, Arc::clone(&profile_metric)));
+            #[cfg(not(feature = "metrics"))]
+            nodes.push(RedisReplica::new(node));
         }
     }
 
@@ -851,7 +971,7 @@ async fn build_replicas(
 }
 
 async fn wait_until_connected(
-    nodes: &[Node<RedisProtocol>],
+    nodes: &[RedisReplica],
     connect_timeout: Duration,
 ) -> RedisResult<()> {
     let deadline = Instant::now()
@@ -1203,6 +1323,35 @@ mod tests {
 
         assert_eq!(options.master_timeout, Duration::from_secs(3));
         assert_eq!(options.slave_timeout, Duration::from_secs(3));
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn metrics_feature_records_the_configured_authority_without_db_suffix() {
+        let server = FakeRedis::start("metric-value").await;
+        let redis = RedisService::single(format!("{}:3", server.endpoint))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            Redis::get::<_, RedisBytes>(&redis, "key")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"metric-value".as_slice())
+        );
+
+        let mut snapshot = None;
+        brz_metrics::visit(|name, metric_type, candidate| {
+            if name == server.endpoint && metric_type == "REDIS" {
+                snapshot = Some(candidate);
+            }
+        });
+        let snapshot = snapshot.expect("the configured endpoint must be registered");
+        assert_eq!(
+            (snapshot.total, snapshot.success, snapshot.failure),
+            (1, 1, 0)
+        );
     }
 
     #[tokio::test]
@@ -1646,6 +1795,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value.as_deref(), Some(b"master".as_slice()));
+
+        #[cfg(feature = "metrics")]
+        {
+            let mut slave_metric = None;
+            let mut master_metric = None;
+            brz_metrics::visit(|name, metric_type, candidate| {
+                if name == slave.endpoint && metric_type == "REDIS" {
+                    slave_metric = Some(candidate);
+                }
+                if name == master.endpoint && metric_type == "REDIS" {
+                    master_metric = Some(candidate);
+                }
+            });
+            let slave_metric = slave_metric.expect("failed slave attempt must be recorded");
+            let master_metric = master_metric.expect("master fallback must be recorded");
+            assert_eq!(
+                (
+                    slave_metric.total,
+                    slave_metric.success,
+                    slave_metric.failure
+                ),
+                (1, 0, 1)
+            );
+            assert_eq!(
+                (
+                    master_metric.total,
+                    master_metric.success,
+                    master_metric.failure
+                ),
+                (1, 1, 0)
+            );
+        }
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while slave.accepted() < 2 {

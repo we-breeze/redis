@@ -20,6 +20,7 @@ enum_dispatch = "0.3"
 brz-discovery = { workspace = true }
 brz-net = { package = "net", path = "../net" }
 arc-swap = "1"
+brz-metrics = { package = "metrics", path = "../metrics", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -27,6 +28,10 @@ tempfile = { workspace = true }
 
 [features]
 default = []
+# Emit ProfileUtil-compatible endpoint metrics for completed direct Redis
+# attempts. The feature remains opt-in so the SDK has no metrics dependency
+# unless the embedding application explicitly selects this output contract.
+metrics = ["dep:brz-metrics"]
 # Integration tests that require a live redis-server are gated behind this.
 integration-tests = []
 
