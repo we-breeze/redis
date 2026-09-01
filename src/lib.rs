@@ -21,6 +21,8 @@ pub mod error;
 pub mod from_value;
 mod mesh;
 mod net_transport;
+#[cfg(feature = "metrics")]
+mod profile_metrics;
 mod redis_service;
 pub mod resp;
 mod service_pipe;
