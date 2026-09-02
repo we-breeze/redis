@@ -123,14 +123,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
-name = "brz-mem"
-version = "0.1.0"
-dependencies = [
- "crossbeam-utils",
- "mimalloc",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -256,10 +248,12 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 [[package]]
 name = "discovery"
 version = "0.1.0"
+source = "git+https://github.com/we-breeze/discovery.git?tag=v0.0.1#a88d869dc1d099ce2473415ecf1414495fde8495"
 
 [[package]]
 name = "ds"
 version = "0.1.0"
+source = "git+https://github.com/we-breeze/ds.git?tag=v0.0.1#cfb71d3c9873cda51f708a35164369b9bea36ae9"
 dependencies = [
  "crossbeam-utils",
  "mimalloc",
@@ -510,12 +504,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memory"
+version = "0.1.0"
+source = "git+https://github.com/we-breeze/memory.git?tag=v0.0.1#decfd9f173d798e90647f70bdc44464e26b217bb"
+dependencies = [
+ "crossbeam-utils",
+ "mimalloc",
+]
+
+[[package]]
 name = "metrics"
 version = "0.1.0"
+source = "git+https://github.com/we-breeze/metrics.git?tag=v0.0.1#e956b92f41166c1c21c74becad23437a8f87868c"
 dependencies = [
  "ahash",
+ "arc-swap",
  "chrono",
- "ds",
 ]
 
 [[package]]
@@ -551,6 +555,7 @@ dependencies = [
 [[package]]
 name = "net"
 version = "0.1.0"
+source = "git+https://github.com/we-breeze/net.git?tag=v0.0.1#8bcc42d14408bef8f8ce818c0f9fe7e2d1cacaa6"
 dependencies = [
  "arc-swap",
  "atomic-waker",
@@ -725,11 +730,11 @@ dependencies = [
 name = "redis-bench"
 version = "0.1.0"
 dependencies = [
- "brz-mem",
  "bytes",
  "clap",
  "discovery",
  "hdrhistogram",
+ "memory",
  "redis",
  "tokio",
  "tracing",
