@@ -32,6 +32,23 @@ let value: Option<RedisBytes> = service.get("key").await?;
 的等价 slave replicas 之间使用 quota 负载均衡。pipeline 当前只支持单 shard
 拓扑；多 shard 会在发送前快速失败。
 
+## 命令能力
+
+`Redis` trait 提供 application 当前需要的 Redis 原生命令，包括带 `EX/PX/NX/XX`
+选项的 `SET`、`MGET/DEL/EXPIRE/INCR/APPEND/EVAL/EVALSHA`、list/set/hash/zset、
+`PFADD/PFCOUNT` 和 `PUBLISH`。有限 pipeline 同样支持 application 使用的写命令和
+动态 RESP 返回值；额外命令可通过 `Cmd` 和 `Redis::command` 编码执行。
+
+这里仅封装 Redis 协议、读写角色和 shard 路由，不包含分布式锁、缓存、限流、
+队列或其他业务语义。
+
+真实 Redis 集成测试保持 opt-in：
+
+```bash
+BREEZE_REDIS_TEST_ENDPOINT=127.0.0.1:6379 \
+  cargo test --workspace --all-targets --features integration-tests
+```
+
 ## Mesh 语义
 
 `RedisService::mesh(group, namespace)` 复用共享 `discovery` crate，以 Redis 的

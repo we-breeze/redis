@@ -16,6 +16,7 @@ use futures_util::future::try_join_all;
 use tokio::time::{Instant, MissedTickBehavior, sleep};
 
 use crate::mesh::MeshConfig;
+use crate::multi_key::{KeyListArgs, KeyRoute, classify_keys, group_keys};
 use crate::net_transport::{
     RedisProtocol, RedisRequest, RedisResponse, RedisResponseKind, map_session_error,
 };
@@ -23,8 +24,8 @@ use crate::net_transport::{
 use crate::profile_metrics::{EndpointProfileMetric, ProfiledResponseFuture};
 use crate::sharding::Sharding;
 use crate::{
-    EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, PipeResponse, Redis, RedisArgsSink,
-    RedisError, RedisPipe, RedisResult, RedisValues,
+    Cmd, EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, FromRedisValue, PipeResponse,
+    Redis, RedisArgsSink, RedisError, RedisPipe, RedisResult, RedisValues,
 };
 
 const DNS_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
@@ -508,12 +509,7 @@ impl RedisService {
         Ok(service)
     }
 
-    async fn execute<H, F>(
-        &self,
-        routing_key: &H,
-        readonly: bool,
-        build: F,
-    ) -> RedisResult<RedisResponse>
+    async fn execute<H, F>(&self, key: &H, readonly: bool, build: F) -> RedisResult<RedisResponse>
     where
         H: EncodeRedisArg + ?Sized,
         F: FnMut(&EphemeralBytesArena) -> RedisRequest,
@@ -525,14 +521,45 @@ impl RedisService {
         let shard = if topology.shards.shard_count() == 1 {
             topology.shards.get(&[][..]).map_err(map_net_error)?
         } else {
-            let routing_key = crate::arg::encode_arg_contiguous(routing_key)?;
-            topology
-                .shards
-                .get(routing_key.as_ref())
-                .map_err(map_net_error)?
+            let key = crate::arg::encode_arg_contiguous(key)?;
+            topology.shards.get(key.as_ref()).map_err(map_net_error)?
         };
 
-        let mut build = build;
+        self.execute_on_shard(shard, readonly, build).await
+    }
+
+    async fn execute_for_keys<K, F>(
+        &self,
+        keys: &K,
+        readonly: bool,
+        build: F,
+    ) -> RedisResult<RedisResponse>
+    where
+        K: EncodeRedisArgs + ?Sized,
+        F: FnMut(&EphemeralBytesArena) -> RedisRequest,
+    {
+        let topology = self.inner.topology.load_full();
+        let shard = match classify_keys(&topology.shards, keys)? {
+            KeyRoute::Single(shard) => shard,
+            KeyRoute::Multiple => {
+                return Err(RedisError::new(
+                    ErrorKind::ClientError,
+                    "Redis command requires all keys to resolve to the same shard",
+                ));
+            }
+        };
+        self.execute_on_shard(shard, readonly, build).await
+    }
+
+    async fn execute_on_shard<F>(
+        &self,
+        shard: &RedisShard,
+        readonly: bool,
+        mut build: F,
+    ) -> RedisResult<RedisResponse>
+    where
+        F: FnMut(&EphemeralBytesArena) -> RedisRequest,
+    {
         let response = if readonly {
             let response = shard
                 .slaves
@@ -565,6 +592,50 @@ impl RedisService {
             }
         };
         response.map_err(map_session_error)
+    }
+
+    async fn execute_script<D, K, A>(
+        &self,
+        command: &'static str,
+        digest: &D,
+        keys: &K,
+        arguments: &A,
+    ) -> RedisResult<crate::Value>
+    where
+        D: EncodeRedisArg + ?Sized,
+        K: EncodeRedisArgs + ?Sized,
+        A: EncodeRedisArgs + ?Sized,
+    {
+        let response = if keys.num_args() == 0 {
+            self.execute(&"", false, |arena| {
+                RedisRequest::encode(
+                    arena,
+                    &ScriptArgs {
+                        command,
+                        digest,
+                        keys,
+                        arguments,
+                    },
+                    RedisResponseKind::Value,
+                )
+            })
+            .await?
+        } else {
+            self.execute_for_keys(keys, false, |arena| {
+                RedisRequest::encode(
+                    arena,
+                    &ScriptArgs {
+                        command,
+                        digest,
+                        keys,
+                        arguments,
+                    },
+                    RedisResponseKind::Value,
+                )
+            })
+            .await?
+        };
+        response.into_value()
     }
 
     fn validate_pipe(pipe: &RedisPipe) -> RedisResult<()> {
@@ -608,6 +679,34 @@ impl RedisService {
 struct HmgetArgs<'a, K: ?Sized, F: ?Sized> {
     key: &'a K,
     fields: &'a F,
+}
+
+struct ScriptArgs<'a, D: ?Sized, K: ?Sized, A: ?Sized> {
+    command: &'static str,
+    digest: &'a D,
+    keys: &'a K,
+    arguments: &'a A,
+}
+
+impl<D, K, A> EncodeRedisArgs for ScriptArgs<'_, D, K, A>
+where
+    D: EncodeRedisArg + ?Sized,
+    K: EncodeRedisArgs + ?Sized,
+    A: EncodeRedisArgs + ?Sized,
+{
+    fn num_args(&self) -> usize {
+        3_usize
+            .saturating_add(self.keys.num_args())
+            .saturating_add(self.arguments.num_args())
+    }
+
+    fn encode_args<S: RedisArgsSink + ?Sized>(&self, sink: &mut S) -> RedisResult<()> {
+        sink.write_arg(self.command)?;
+        sink.write_arg(self.digest)?;
+        sink.write_arg(&self.keys.num_args())?;
+        self.keys.encode_args(sink)?;
+        self.arguments.encode_args(sink)
+    }
 }
 
 impl<K, F> EncodeRedisArgs for HmgetArgs<'_, K, F>
@@ -665,6 +764,27 @@ async fn reconcile_dns_once(inner: &RedisServiceInner) -> RedisResult<bool> {
 }
 
 impl Redis for RedisService {
+    async fn command<R>(&self, command: Cmd) -> RedisResult<R>
+    where
+        R: FromRedisValue + Send,
+    {
+        if command.arg_count() == 0 {
+            return Err(RedisError::new(
+                ErrorKind::ClientError,
+                "Redis command must contain a command name",
+            ));
+        }
+        let readonly = command.is_readonly();
+        let key = command.arg_at(1).unwrap_or_default();
+        let value = self
+            .execute(key, readonly, |arena| {
+                RedisRequest::encode(arena, &command, RedisResponseKind::Value)
+            })
+            .await?
+            .into_value()?;
+        R::from_redis_value(&value)
+    }
+
     async fn pipe(&self, pipe: RedisPipe) -> RedisResult<PipeResponse> {
         self.execute_pipe(pipe)
     }
@@ -695,32 +815,126 @@ impl Redis for RedisService {
         .into_unit()
     }
 
-    async fn get_routed<H, K, R>(&self, routing_key: H, key: K) -> RedisResult<Option<R>>
+    async fn mget<K, R>(&self, keys: K) -> RedisResult<Vec<Option<R>>>
     where
-        H: EncodeRedisArg + Send,
-        K: EncodeRedisArg + Send,
+        K: EncodeRedisArgs + Send,
         R: FromRedisBulk + Send,
     {
-        self.execute(&routing_key, true, |arena| {
-            RedisRequest::encode(arena, &("GET", &key), RedisResponseKind::Bulk)
-        })
-        .await?
-        .into_bulk()?
-        .map(R::from_redis_bulk)
-        .transpose()
+        let expected = keys.num_args();
+        let topology = self.inner.topology.load_full();
+        match classify_keys(&topology.shards, &keys)? {
+            KeyRoute::Single(shard) => {
+                let values = self
+                    .execute_on_shard(shard, true, |arena| {
+                        RedisRequest::encode(
+                            arena,
+                            &KeyListArgs::new("MGET", &keys),
+                            RedisResponseKind::MultiBulk { expected },
+                        )
+                    })
+                    .await?
+                    .into_multi_bulk::<R>()?;
+                values.collect()
+            }
+            KeyRoute::Multiple => {
+                let groups = group_keys(&topology.shards, "MGET", &keys)?;
+                let responses = try_join_all(groups.iter().map(|group| {
+                    self.execute_on_shard(group.target, true, |arena| {
+                        RedisRequest::encode(
+                            arena,
+                            &group.command,
+                            RedisResponseKind::MultiBulk {
+                                expected: group.positions.len(),
+                            },
+                        )
+                    })
+                }))
+                .await?;
+                let mut output = Vec::with_capacity(expected);
+                output.resize_with(expected, || None);
+                for (group, response) in groups.iter().zip(responses) {
+                    let values = response.into_multi_bulk::<R>()?;
+                    for (&position, value) in group.positions.iter().zip(values) {
+                        output[position] = value?;
+                    }
+                }
+                Ok(output)
+            }
+        }
     }
 
-    async fn set_routed<H, K, V>(&self, routing_key: H, key: K, value: V) -> RedisResult<()>
+    async fn del_many<K>(&self, keys: K) -> RedisResult<i64>
     where
-        H: EncodeRedisArg + Send,
-        K: EncodeRedisArg + Send,
-        V: EncodeRedisArg + Send,
+        K: EncodeRedisArgs + Send,
     {
-        self.execute(&routing_key, false, |arena| {
-            RedisRequest::encode(arena, &("SET", &key, &value), RedisResponseKind::Unit)
+        let topology = self.inner.topology.load_full();
+        match classify_keys(&topology.shards, &keys)? {
+            KeyRoute::Single(shard) => self
+                .execute_on_shard(shard, false, |arena| {
+                    RedisRequest::encode(
+                        arena,
+                        &KeyListArgs::new("DEL", &keys),
+                        RedisResponseKind::Integer,
+                    )
+                })
+                .await?
+                .into_integer(),
+            KeyRoute::Multiple => {
+                let groups = group_keys(&topology.shards, "DEL", &keys)?;
+                let responses = try_join_all(groups.iter().map(|group| {
+                    self.execute_on_shard(group.target, false, |arena| {
+                        RedisRequest::encode(arena, &group.command, RedisResponseKind::Integer)
+                    })
+                }))
+                .await?;
+                responses.into_iter().try_fold(0_i64, |total, response| {
+                    total.checked_add(response.into_integer()?).ok_or_else(|| {
+                        RedisError::new(ErrorKind::TypeError, "Redis DEL result overflowed i64")
+                    })
+                })
+            }
+        }
+    }
+
+    async fn eval<S, K, A, R>(&self, script: S, keys: K, arguments: A) -> RedisResult<R>
+    where
+        S: EncodeRedisArg + Send,
+        K: EncodeRedisArgs + Send,
+        A: EncodeRedisArgs + Send,
+        R: FromRedisValue + Send,
+    {
+        let value = self
+            .execute_script("EVAL", &script, &keys, &arguments)
+            .await?;
+        R::from_redis_value(&value)
+    }
+
+    async fn evalsha<D, K, A, R>(&self, digest: D, keys: K, arguments: A) -> RedisResult<R>
+    where
+        D: EncodeRedisArg + Send,
+        K: EncodeRedisArgs + Send,
+        A: EncodeRedisArgs + Send,
+        R: FromRedisValue + Send,
+    {
+        let value = self
+            .execute_script("EVALSHA", &digest, &keys, &arguments)
+            .await?;
+        R::from_redis_value(&value)
+    }
+
+    async fn pfcount<K>(&self, keys: K) -> RedisResult<i64>
+    where
+        K: EncodeRedisArgs + Send,
+    {
+        self.execute_for_keys(&keys, true, |arena| {
+            RedisRequest::encode(
+                arena,
+                &KeyListArgs::new("PFCOUNT", &keys),
+                RedisResponseKind::Integer,
+            )
         })
         .await?
-        .into_unit()
+        .into_integer()
     }
 
     async fn hget<K, F, R>(&self, key: K, field: F) -> RedisResult<Option<R>>
@@ -1186,12 +1400,14 @@ mod tests {
                                                     "GET" | "HGET" => responses.extend_from_slice(
                                                         format!("${}\r\n{read_value}\r\n", read_value.len()).as_bytes()
                                                     ),
-                                                    "HMGET" => {
-                                                        let fields = argument_count.saturating_sub(2);
-                                                        responses.extend_from_slice(
-                                                            format!("*{fields}\r\n").as_bytes()
+                                                    "MGET" | "HMGET" => {
+                                                        let values = argument_count.saturating_sub(
+                                                            if command == "MGET" { 1 } else { 2 }
                                                         );
-                                                        for _ in 0..fields {
+                                                        responses.extend_from_slice(
+                                                            format!("*{values}\r\n").as_bytes()
+                                                        );
+                                                        for _ in 0..values {
                                                             responses.extend_from_slice(
                                                                 format!("${}\r\n{read_value}\r\n", read_value.len()).as_bytes()
                                                             );
@@ -1505,6 +1721,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn added_native_commands_use_declared_reader_and_writer_roles() {
+        let master = FakeRedis::start("master").await;
+        let slave = FakeRedis::start("slave").await;
+        let redis = RedisService::noshard(master.endpoint.clone(), [slave.endpoint.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(Redis::incr(&redis, "counter").await.unwrap(), 1);
+        assert_eq!(
+            Redis::pfcount(&redis, ["metric:a", "metric:b"])
+                .await
+                .unwrap(),
+            1
+        );
+        let values = Redis::mget::<_, RedisBytes>(&redis, ["metric:a", "metric:b"])
+            .await
+            .unwrap();
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some(b"slave".as_slice()), Some(b"slave".as_slice())]
+        );
+
+        assert!(master.saw("INCR"));
+        assert!(!slave.saw("INCR"));
+        assert!(slave.saw("PFCOUNT"));
+        assert!(!master.saw("PFCOUNT"));
+        assert!(slave.saw("MGET"));
+        assert!(!master.saw("MGET"));
+    }
+
+    #[tokio::test]
     async fn pipeline_submits_to_one_replica_and_takes_typed_responses_in_order() {
         let master = FakeRedis::start("master").await;
         let first_slave = FakeRedis::start("first").await;
@@ -1676,15 +1926,60 @@ mod tests {
             }
         }
 
+        let keys = keys.map(Option::unwrap);
         for (key, expected) in keys
-            .into_iter()
+            .iter()
             .zip([b"slave-a".as_slice(), b"slave-b".as_slice()])
         {
-            let value = crate::Redis::get::<_, crate::RedisBytes>(&redis, key.unwrap())
+            let value = crate::Redis::get::<_, crate::RedisBytes>(&redis, key)
                 .await
                 .unwrap();
             assert_eq!(value.as_deref(), Some(expected));
         }
+
+        let values = Redis::mget::<_, RedisBytes>(&redis, [&keys[1], &keys[0], &keys[1]])
+            .await
+            .unwrap();
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some(b"slave-b".as_slice()),
+                Some(b"slave-a".as_slice()),
+                Some(b"slave-b".as_slice()),
+            ]
+        );
+        assert!(slave_a.saw("MGET"));
+        assert!(slave_b.saw("MGET"));
+
+        assert_eq!(
+            Redis::del_many(&redis, [&keys[0], &keys[1]]).await.unwrap(),
+            2
+        );
+        assert!(master_a.saw("DEL"));
+        assert!(master_b.saw("DEL"));
+
+        let count_error = Redis::pfcount(&redis, [&keys[0], &keys[1]])
+            .await
+            .unwrap_err();
+        assert_eq!(count_error.kind(), ErrorKind::ClientError);
+        assert!(count_error.to_string().contains("same shard"));
+
+        let script_result =
+            Redis::eval::<_, _, _, i64>(&redis, "return 1", [&keys[0]], [] as [&str; 0])
+                .await
+                .unwrap();
+        assert_eq!(script_result, 1);
+        assert!(master_a.saw("EVAL"));
+
+        let script_error =
+            Redis::eval::<_, _, _, i64>(&redis, "return 1", [&keys[0], &keys[1]], [] as [&str; 0])
+                .await
+                .unwrap_err();
+        assert_eq!(script_error.kind(), ErrorKind::ClientError);
+        assert!(script_error.to_string().contains("same shard"));
     }
 
     #[tokio::test]
