@@ -12,7 +12,7 @@ use crate::bulk::RedisValuesSource;
 use crate::error::ServerError;
 use crate::{
     EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, RedisArgSink, RedisArgsSink,
-    RedisError, RedisResult, RedisValues, cmd,
+    RedisError, RedisResult, RedisValues, Value, cmd,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,6 +21,7 @@ pub(crate) enum RedisResponseKind {
     Integer,
     Bulk,
     MultiBulk { expected: usize },
+    Value,
 }
 
 #[derive(Debug)]
@@ -29,6 +30,7 @@ pub(crate) enum RedisResponse {
     Integer(i64),
     Bulk(Option<Bytes>),
     MultiBulk(RedisValuesSource),
+    Value(Value),
     ServerError(ServerError),
 }
 
@@ -62,6 +64,14 @@ impl RedisResponse {
             Self::MultiBulk(values) => Ok(RedisValues::from_source(values)),
             Self::ServerError(error) => Err(error.into()),
             other => Err(unexpected_reply("bulk-string array", &other)),
+        }
+    }
+
+    pub(crate) fn into_value(self) -> RedisResult<Value> {
+        match self {
+            Self::Value(value) => value.into_result(),
+            Self::ServerError(error) => Err(error.into()),
+            other => Err(unexpected_reply("RESP value", &other)),
         }
     }
 }
@@ -218,7 +228,7 @@ impl RedisProtocol {
             }
             Scanned::Complete { layout, consumed } => {
                 self.responses.pop_front();
-                Ok(Some(materialize(source.take(consumed), layout)))
+                Ok(Some(materialize(source.take(consumed), layout)?))
             }
         }
     }
@@ -301,6 +311,7 @@ enum ResponseLayout {
     Integer(i64),
     Bulk(Option<Range<usize>>),
     MultiBulk { first: usize, count: usize },
+    Value,
     ServerError(Range<usize>),
 }
 
@@ -347,6 +358,90 @@ fn scan_response(source: &RxBuffer, expected: RedisResponseKind) -> RedisResult<
             }),
         },
         RedisResponseKind::MultiBulk { expected } => scan_multi_bulk(source, expected),
+        RedisResponseKind::Value => scan_value(source, 0, 0),
+    }
+}
+
+fn scan_value(source: &RxBuffer, start: usize, depth: usize) -> RedisResult<Scanned> {
+    if depth > 128 {
+        return Err(protocol_error("Redis response nested too deeply"));
+    }
+    let Some(marker) = source.byte(start) else {
+        return Ok(Scanned::Incomplete { reserve: 1 });
+    };
+    match marker {
+        b'+' | b'-' | b':' | b'_' | b'#' | b',' | b'(' => {
+            let Some((_, consumed)) = line_range(source, start + 1) else {
+                return Ok(Scanned::Incomplete { reserve: 512 });
+            };
+            Ok(Scanned::Complete {
+                layout: ResponseLayout::Value,
+                consumed,
+            })
+        }
+        b'$' | b'=' => {
+            let Some((length_range, body_start)) = line_range(source, start + 1) else {
+                return Ok(Scanned::Incomplete { reserve: 512 });
+            };
+            let length = parse_length(source, length_range)?;
+            if length < 0 {
+                return Ok(Scanned::Complete {
+                    layout: ResponseLayout::Value,
+                    consumed: body_start,
+                });
+            }
+            let length = usize::try_from(length)
+                .map_err(|_| protocol_error("Redis response is too large"))?;
+            let consumed = body_start
+                .checked_add(length)
+                .and_then(|end| end.checked_add(2))
+                .ok_or_else(|| protocol_error("Redis response length overflow"))?;
+            if source.len() < consumed {
+                return Ok(Scanned::Incomplete {
+                    reserve: consumed.saturating_sub(source.len()).max(1),
+                });
+            }
+            if source.byte(consumed - 2) != Some(b'\r') || source.byte(consumed - 1) != Some(b'\n')
+            {
+                return Err(protocol_error("Redis response is missing trailing CRLF"));
+            }
+            Ok(Scanned::Complete {
+                layout: ResponseLayout::Value,
+                consumed,
+            })
+        }
+        b'*' | b'~' | b'>' | b'%' => {
+            let Some((length_range, mut position)) = line_range(source, start + 1) else {
+                return Ok(Scanned::Incomplete { reserve: 512 });
+            };
+            let length = parse_length(source, length_range)?;
+            if length < 0 {
+                return Ok(Scanned::Complete {
+                    layout: ResponseLayout::Value,
+                    consumed: position,
+                });
+            }
+            let mut elements = usize::try_from(length)
+                .map_err(|_| protocol_error("Redis response is too large"))?;
+            if marker == b'%' {
+                elements = elements
+                    .checked_mul(2)
+                    .ok_or_else(|| protocol_error("Redis map length overflow"))?;
+            }
+            for _ in 0..elements {
+                match scan_value(source, position, depth + 1)? {
+                    Scanned::Complete { consumed, .. } => position = consumed,
+                    Scanned::Incomplete { reserve } => {
+                        return Ok(Scanned::Incomplete { reserve });
+                    }
+                }
+            }
+            Ok(Scanned::Complete {
+                layout: ResponseLayout::Value,
+                consumed: position,
+            })
+        }
+        _ => Err(protocol_error("unknown Redis response marker")),
     }
 }
 
@@ -498,8 +593,8 @@ fn parse_length(source: &RxBuffer, range: Range<usize>) -> RedisResult<i64> {
     Ok(if negative { -value } else { value })
 }
 
-fn materialize(frame: RxFrame, layout: ResponseLayout) -> RedisResponse {
-    match layout {
+fn materialize(frame: RxFrame, layout: ResponseLayout) -> RedisResult<RedisResponse> {
+    Ok(match layout {
         ResponseLayout::Unit => RedisResponse::Unit,
         ResponseLayout::Integer(value) => RedisResponse::Integer(value),
         ResponseLayout::ServerError(range) => {
@@ -527,7 +622,28 @@ fn materialize(frame: RxFrame, layout: ResponseLayout) -> RedisResponse {
                 remaining: count,
             }),
         },
-    }
+        ResponseLayout::Value => {
+            let bytes = match frame.into_contiguous() {
+                Ok(frame) => Bytes::from_owner(frame),
+                Err(frame) => frame.copy_range(0..frame.len()),
+            };
+            match crate::resp::parse_reply(&bytes)? {
+                crate::resp::ParseResult::Complete { value, consumed }
+                    if consumed == bytes.len() =>
+                {
+                    RedisResponse::Value(value)
+                }
+                crate::resp::ParseResult::Complete { .. } => {
+                    return Err(protocol_error("Redis parser left trailing response bytes"));
+                }
+                crate::resp::ParseResult::Incomplete => {
+                    return Err(protocol_error(
+                        "Redis scanner accepted an incomplete response",
+                    ));
+                }
+            }
+        }
+    })
 }
 
 fn protocol_error(message: &'static str) -> RedisError {
@@ -632,6 +748,33 @@ mod tests {
         assert_eq!(values[0].as_deref(), Some(b"a".as_slice()));
         assert_eq!(values[1], None);
         assert_eq!(values[2].as_deref(), Some(b"bb".as_slice()));
+    }
+
+    #[test]
+    fn dynamic_value_decodes_nested_and_variable_length_replies() {
+        let mut protocol = RedisProtocol::new(None, 0);
+        protocol
+            .encode(
+                request(RedisResponseKind::Value),
+                brz_net::RequestToken::from_raw(1),
+            )
+            .unwrap();
+        let mut source = RxBuffer::with_capacity(8);
+        feed(&mut source, b"*3\r\n$1\r\na\r\n:2\r\n");
+        assert!(protocol.decode(&mut source).unwrap().is_none());
+        feed(&mut source, b"*2\r\n+OK\r\n$-1\r\n");
+
+        let response = protocol.decode(&mut source).unwrap().unwrap().response;
+        let value = response.into_value().unwrap();
+        assert!(matches!(
+            value,
+            crate::Value::Array(values)
+                if values.len() == 3
+                    && values[0].as_bytes() == Some(b"a".as_slice())
+                    && values[1] == crate::Value::Int(2)
+                    && matches!(&values[2], crate::Value::Array(nested)
+                        if nested == &[crate::Value::Okay, crate::Value::Nil])
+        ));
     }
 
     #[test]

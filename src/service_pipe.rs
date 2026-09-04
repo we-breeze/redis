@@ -4,11 +4,12 @@ use std::{collections::VecDeque, sync::Arc};
 
 use brz_net::EphemeralBytesArena;
 
+use crate::api::SetOptions;
 use crate::net_transport::{RedisRequest, RedisResponse, RedisResponseKind, map_session_error};
 use crate::redis_service::{RedisReplicaResponseFuture, RedisTopology};
 use crate::{
-    Cmd, EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, RedisError, RedisResult,
-    RedisValues, cmd,
+    Cmd, EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, FromRedisValue, RedisError,
+    RedisResult, RedisValues, Value, cmd,
 };
 
 /// Maximum number of commands admitted by one finite Redis pipeline.
@@ -45,6 +46,20 @@ impl RedisPipe {
         }
     }
 
+    /// Adds an arbitrary finite request/response Redis command.
+    ///
+    /// Mark read-only commands with [`Cmd::mark_readonly`] before adding them.
+    /// Replies are consumed through [`PipeResponse::take_value`].
+    pub fn command(&mut self, command: Cmd) -> RedisResult<&mut Self> {
+        if command.arg_count() == 0 {
+            return Err(RedisError::new(
+                ErrorKind::ClientError,
+                "Redis command must contain a command name",
+            ));
+        }
+        Ok(self.push(command, RedisResponseKind::Value))
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.commands.len()
@@ -72,6 +87,100 @@ impl RedisPipe {
         let mut command = cmd("SET");
         command.arg_encoded(key)?.arg_encoded(value)?;
         Ok(self.push(command, RedisResponseKind::Unit))
+    }
+
+    /// Adds `SET key value [EX seconds|PX milliseconds] [NX|XX]`.
+    pub fn set_with<K, V>(
+        &mut self,
+        key: K,
+        value: V,
+        options: SetOptions,
+    ) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+        V: EncodeRedisArg,
+    {
+        let mut command = cmd("SET");
+        command.arg_encoded(key)?.arg_encoded(value)?;
+        options.encode(&mut command)?;
+        Ok(self.push(command, RedisResponseKind::Value))
+    }
+
+    /// Adds `DEL key [key ...]`.
+    pub fn del<K>(&mut self, keys: K) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArgs,
+    {
+        let mut command = cmd("DEL");
+        keys.encode_args(&mut command)?;
+        Ok(self.push(command, RedisResponseKind::Integer))
+    }
+
+    /// Adds `EXPIRE key seconds`.
+    pub fn expire<K>(&mut self, key: K, seconds: u64) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+    {
+        let mut command = cmd("EXPIRE");
+        command.arg_encoded(key)?.arg_encoded(seconds)?;
+        Ok(self.push(command, RedisResponseKind::Integer))
+    }
+
+    /// Adds `INCR key`.
+    pub fn incr<K>(&mut self, key: K) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+    {
+        self.integer_key_command("INCR", key)
+    }
+
+    /// Adds `APPEND key value`.
+    pub fn append<K, V>(&mut self, key: K, value: V) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+        V: EncodeRedisArg,
+    {
+        let mut command = cmd("APPEND");
+        command.arg_encoded(key)?.arg_encoded(value)?;
+        Ok(self.push(command, RedisResponseKind::Integer))
+    }
+
+    /// Adds `RPUSH key value [value ...]`.
+    pub fn rpush<K, V>(&mut self, key: K, values: V) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+        V: EncodeRedisArgs,
+    {
+        let mut command = cmd("RPUSH");
+        command.arg_encoded(key)?;
+        values.encode_args(&mut command)?;
+        Ok(self.push(command, RedisResponseKind::Integer))
+    }
+
+    /// Adds `LSET key index value`.
+    pub fn lset<K, V>(&mut self, key: K, index: i64, value: V) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+        V: EncodeRedisArg,
+    {
+        let mut command = cmd("LSET");
+        command
+            .arg_encoded(key)?
+            .arg_encoded(index)?
+            .arg_encoded(value)?;
+        Ok(self.push(command, RedisResponseKind::Unit))
+    }
+
+    /// Adds `PFADD key element [element ...]`.
+    pub fn pfadd<K, E>(&mut self, key: K, elements: E) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+        E: EncodeRedisArgs,
+    {
+        let mut command = cmd("PFADD");
+        command.arg_encoded(key)?;
+        elements.encode_args(&mut command)?;
+        Ok(self.push(command, RedisResponseKind::Integer))
     }
 
     pub fn hget<K, F>(&mut self, key: K, field: F) -> RedisResult<&mut Self>
@@ -108,6 +217,67 @@ impl RedisPipe {
         command.arg_encoded(key)?;
         fields.encode_args(&mut command)?;
         Ok(self.push(command, RedisResponseKind::MultiBulk { expected }))
+    }
+
+    /// Adds `HGETALL key` with a dynamically sized RESP result.
+    pub fn hgetall<K>(&mut self, key: K) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+    {
+        let mut command = readonly_command("HGETALL");
+        command.arg_encoded(key)?;
+        Ok(self.push(command, RedisResponseKind::Value))
+    }
+
+    /// Adds `ZREVRANGE key start stop`.
+    pub fn zrevrange<K>(&mut self, key: K, start: i64, stop: i64) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+    {
+        self.zrevrange_command(key, start, stop, false)
+    }
+
+    /// Adds `ZREVRANGE key start stop WITHSCORES`.
+    pub fn zrevrange_with_scores<K>(
+        &mut self,
+        key: K,
+        start: i64,
+        stop: i64,
+    ) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+    {
+        self.zrevrange_command(key, start, stop, true)
+    }
+
+    fn integer_key_command<K>(&mut self, name: &str, key: K) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+    {
+        let mut command = cmd(name);
+        command.arg_encoded(key)?;
+        Ok(self.push(command, RedisResponseKind::Integer))
+    }
+
+    fn zrevrange_command<K>(
+        &mut self,
+        key: K,
+        start: i64,
+        stop: i64,
+        with_scores: bool,
+    ) -> RedisResult<&mut Self>
+    where
+        K: EncodeRedisArg,
+    {
+        let mut command = readonly_command("ZREVRANGE");
+        command
+            .arg_encoded(key)?
+            .arg_encoded(start)?
+            .arg_encoded(stop)?;
+        if with_scores {
+            command.arg_encoded("WITHSCORES")?;
+        }
+        Ok(self.push(command, RedisResponseKind::Value))
     }
 
     fn push(&mut self, command: Cmd, response: RedisResponseKind) -> &mut Self {
@@ -198,6 +368,15 @@ impl PipeResponse {
         };
         <T as private::FromResponse>::from_response(response)
     }
+
+    /// Takes one dynamically shaped RESP reply and converts it to `T`.
+    pub async fn take_value<T>(&mut self) -> RedisResult<T>
+    where
+        T: FromRedisValue,
+    {
+        let value: Value = self.take().await?;
+        T::from_redis_value(&value)
+    }
 }
 
 fn no_pipe_response() -> RedisError {
@@ -237,6 +416,12 @@ mod private {
             response.into_multi_bulk()
         }
     }
+
+    impl FromResponse for Value {
+        fn from_response(response: RedisResponse) -> RedisResult<Self> {
+            response.into_value()
+        }
+    }
 }
 
 /// Types accepted by [`PipeResponse::take`].
@@ -268,6 +453,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn builder_supports_application_native_write_commands() {
+        let mut pipe = RedisPipe::with_capacity(5);
+        pipe.incr("counter").unwrap();
+        pipe.expire("counter", 60).unwrap();
+        pipe.rpush("blocks", ["one", "two"]).unwrap();
+        pipe.lset("blocks", 0, "first").unwrap();
+        pipe.pfadd("metrics", ["task-1", "task-2"]).unwrap();
+
+        assert_eq!(pipe.len(), 5);
+        assert!(!pipe.is_readonly());
+        assert_eq!(pipe.commands[0].command.name(), "INCR");
+        assert_eq!(pipe.commands[2].command.arg_at(3), Some(b"two".as_slice()));
+        assert!(matches!(pipe.commands[3].response, RedisResponseKind::Unit));
+    }
+
     #[tokio::test]
     async fn ready_responses_are_taken_in_order_and_lazily_converted() {
         let responses = vec![
@@ -284,6 +485,21 @@ mod tests {
 
         assert_eq!(version, Some(42));
         assert_eq!(values, vec![Some(Bytes::from_static(b"v")), None]);
+        assert!(responses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dynamic_pipe_response_converts_through_from_redis_value() {
+        let responses = vec![RedisResponse::Value(Value::Array(vec![
+            Value::BulkString(Bytes::from_static(b"field")),
+            Value::BulkString(Bytes::from_static(b"value")),
+        ]))];
+        let mut responses = PipeResponse::ready(responses);
+
+        let values: std::collections::HashMap<String, String> =
+            responses.take_value().await.unwrap();
+
+        assert_eq!(values.get("field").map(String::as_str), Some("value"));
         assert!(responses.is_empty());
     }
 }

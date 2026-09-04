@@ -20,6 +20,7 @@ pub mod cmd;
 pub mod error;
 pub mod from_value;
 mod mesh;
+mod multi_key;
 mod net_transport;
 #[cfg(feature = "metrics")]
 mod profile_metrics;
@@ -30,7 +31,7 @@ mod sharding;
 pub mod to_args;
 pub mod types;
 
-pub use api::Redis;
+pub use api::{Redis, SetCondition, SetExpiration, SetOptions};
 pub use arg::{EncodeRedisArg, EncodeRedisArgs, RedisArgSink, RedisArgsSink, RedisKey2, RedisKey3};
 pub use brz_net::{
     DEFAULT_REQUEST_ARENA_CHUNK_SIZE, global_request_arena, init_global_request_arena,
