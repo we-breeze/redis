@@ -32,6 +32,21 @@ let value: Option<RedisBytes> = service.get("key").await?;
 的等价 slave replicas 之间使用 quota 负载均衡。pipeline 当前只支持单 shard
 拓扑；多 shard 会在发送前快速失败。
 
+需要密码认证时，从应用配置读取密码，通过 options 传入：
+
+```rust,no_run
+use redis::{RedisResult, RedisService, RedisServiceOptions};
+
+async fn connect(endpoint: String, password: Option<String>) -> RedisResult<RedisService> {
+    let options = RedisServiceOptions::default().with_password(password);
+    RedisService::single_with_options(endpoint, options).await
+}
+```
+
+`Some(password)` 对所有主节点和副本启用 `AUTH password`；`None` 不发送 AUTH。
+首次连接和重连均在认证、SELECT 完成后才接收业务命令。endpoint 仍使用
+`host:port[:db]`，密码单独传递；options 的 Debug 输出会隐藏密码。
+
 ## 命令能力
 
 `Redis` trait 提供 application 当前需要的 Redis 原生命令，包括带 `EX/PX/NX/XX`
