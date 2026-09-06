@@ -20,7 +20,7 @@ enum_dispatch = "0.3"
 brz-discovery = { workspace = true }
 brz-net = { package = "net", git = "https://github.com/we-breeze/net.git", tag = "v0.0.1" }
 arc-swap = "1"
-brz-metrics = { package = "metrics", git = "https://github.com/we-breeze/metrics.git", tag = "v0.0.1", optional = true }
+brz-metrics = { package = "metrics", git = "https://github.com/we-breeze/metrics.git", tag = "v0.0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

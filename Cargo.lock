@@ -515,7 +515,7 @@ dependencies = [
 [[package]]
 name = "metrics"
 version = "0.1.0"
-source = "git+https://github.com/we-breeze/metrics.git?tag=v0.0.1#e956b92f41166c1c21c74becad23437a8f87868c"
+source = "git+https://github.com/we-breeze/metrics.git?tag=v0.0.2#32b13bd58a51dbfef2f5ab867a2747093ced3833"
 dependencies = [
  "ahash",
  "arc-swap",
