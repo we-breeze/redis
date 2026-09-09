@@ -1,3 +1,7 @@
+#[path = "support/runtime.rs"]
+mod runtime;
+use runtime::runtime_test;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -119,7 +123,7 @@ fn options(password: Option<&str>) -> RedisServiceOptions {
         .with_timeout(Duration::from_secs(1))
 }
 
-#[tokio::test]
+runtime_test! {
 async fn password_authenticates_master_and_replica_before_commands() {
     let master = AuthRedis::start().await;
     let replica = AuthRedis::start().await;
@@ -145,8 +149,9 @@ async fn password_authenticates_master_and_replica_before_commands() {
         );
     }
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn reconnect_authenticates_again_before_serving_requests() {
     let server = AuthRedis::start().await;
     let redis = RedisService::single_with_options(server.endpoint.clone(), options(Some(PASSWORD)))
@@ -179,8 +184,9 @@ async fn reconnect_authenticates_again_before_serving_requests() {
             .all(|commands| commands[0] == "AUTH")
     );
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn rejected_or_missing_password_never_exposes_an_authenticated_service() {
     let server = AuthRedis::start().await;
     for password in [None, Some("incorrect")] {
@@ -195,6 +201,7 @@ async fn rejected_or_missing_password_never_exposes_an_authenticated_service() {
             .flatten()
             .all(|command| command == "AUTH" || command == "SELECT")
     );
+}
 }
 
 #[test]

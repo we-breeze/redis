@@ -1,3 +1,7 @@
+#[path = "../../tests/support/runtime.rs"]
+mod runtime;
+use runtime::runtime_test;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -213,7 +217,7 @@ fn unified_timeout_updates_both_roles() {
 }
 
 #[cfg(feature = "metrics")]
-#[tokio::test]
+runtime_test! {
 async fn metrics_feature_records_the_configured_authority_without_db_suffix() {
     let server = FakeRedis::start("metric-value").await;
     let redis = RedisService::single(format!("{}:3", server.endpoint))
@@ -240,6 +244,7 @@ async fn metrics_feature_records_the_configured_authority_without_db_suffix() {
         (1, 1, 0)
     );
 }
+}
 
 struct TestConfigProvider {
     config: Mutex<RedisConfig>,
@@ -255,7 +260,7 @@ impl RedisConfigProvider for TestConfigProvider {
     }
 }
 
-#[tokio::test]
+runtime_test! {
 async fn provider_loads_once_and_service_keeps_its_config_snapshot() {
     let first = FakeRedis::start("first").await;
     let second = FakeRedis::start("second").await;
@@ -288,8 +293,9 @@ async fn provider_loads_once_and_service_keeps_its_config_snapshot() {
     );
     assert_eq!(second.accepted(), 0);
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn provider_error_is_returned_unchanged() {
     struct FailingProvider;
     impl RedisConfigProvider for FailingProvider {
@@ -309,8 +315,9 @@ async fn provider_error_is_returned_unchanged() {
     assert_eq!(error.kind(), ErrorKind::ClientError);
     assert!(error.to_string().contains("config unavailable"));
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn injected_config_preserves_read_write_roles_and_options() {
     let master = FakeRedis::start("master").await;
     let slave = FakeRedis::start("slave").await;
@@ -350,8 +357,9 @@ async fn injected_config_preserves_read_write_roles_and_options() {
             .any(|command| command == "HSET")
     );
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn injected_config_uses_existing_validation() {
     for config in [
         RedisConfig::sharded(vec![], ShardRouting::new("raw", "modula")),
@@ -362,6 +370,7 @@ async fn injected_config_uses_existing_validation() {
     ] {
         assert!(RedisService::from_config(config).await.is_err());
     }
+}
 }
 
 #[test]
@@ -435,7 +444,7 @@ fn smartnum_is_only_an_equivalent_key_mapping_not_crc32_short() {
     assert_ne!(Hasher::from("crc32-short").hash(&uid), standard);
 }
 
-#[tokio::test]
+runtime_test! {
 async fn single_uses_independent_read_and_write_connections() {
     let server = FakeRedis::start("single").await;
     let redis = RedisService::single(server.endpoint.clone()).await.unwrap();
@@ -451,8 +460,9 @@ async fn single_uses_independent_read_and_write_connections() {
 
     assert_eq!(server.accepted(), 2);
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn hset_uses_the_master_and_decodes_the_integer_response() {
     let master = FakeRedis::start("master").await;
     let slave = FakeRedis::start("slave").await;
@@ -467,8 +477,9 @@ async fn hset_uses_the_master_and_decodes_the_integer_response() {
     assert!(master.saw("HSET"));
     assert!(!slave.saw("HSET"));
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn added_native_commands_use_declared_reader_and_writer_roles() {
     let master = FakeRedis::start("master").await;
     let slave = FakeRedis::start("slave").await;
@@ -501,8 +512,9 @@ async fn added_native_commands_use_declared_reader_and_writer_roles() {
     assert!(slave.saw("MGET"));
     assert!(!master.saw("MGET"));
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn pipeline_submits_to_one_replica_and_takes_typed_responses_in_order() {
     let master = FakeRedis::start("master").await;
     let first_slave = FakeRedis::start("first").await;
@@ -536,8 +548,9 @@ async fn pipeline_submits_to_one_replica_and_takes_typed_responses_in_order() {
             || (first_commands == 0 && second_commands == 3)
     );
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn pipeline_rejects_multi_shard_service_before_sending() {
     let master_a = FakeRedis::start("master-a").await;
     let slave_a = FakeRedis::start("slave-a").await;
@@ -566,8 +579,9 @@ async fn pipeline_rejects_multi_shard_service_before_sending() {
     assert!(!master_a.saw("GET"));
     assert!(!master_b.saw("GET"));
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn reuses_one_connection_and_splits_reads_from_writes() {
     let master = FakeRedis::start("master").await;
     let slave = FakeRedis::start("slave").await;
@@ -602,8 +616,9 @@ async fn reuses_one_connection_and_splits_reads_from_writes() {
     assert_eq!(master.accepted(), initial_master_connections);
     assert_eq!(slave.accepted(), initial_slave_connections);
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn noshard_does_not_encode_the_key_for_routing() {
     struct CountingKey<'a>(&'a AtomicUsize);
 
@@ -633,8 +648,9 @@ async fn noshard_does_not_encode_the_key_for_routing() {
     assert_eq!(value.as_deref(), Some(b"slave".as_slice()));
     assert_eq!(encodes.load(Ordering::Relaxed), 1);
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn noshard_rejects_an_empty_slave_set() {
     let error = RedisService::noshard("127.0.0.1:6379", Vec::<String>::new())
         .await
@@ -644,8 +660,9 @@ async fn noshard_rejects_an_empty_slave_set() {
     assert_eq!(error.kind(), ErrorKind::ClientError);
     assert!(error.to_string().contains("at least one slave"));
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn sharded_routes_before_selecting_each_groups_slaves() {
     let master_a = FakeRedis::start("master-a").await;
     let slave_a = FakeRedis::start("slave-a").await;
@@ -732,8 +749,9 @@ async fn sharded_routes_before_selecting_each_groups_slaves() {
     assert_eq!(script_error.kind(), ErrorKind::ClientError);
     assert!(script_error.to_string().contains("same shard"));
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn concurrent_reads_share_one_physical_slave_connection() {
     let master = FakeRedis::start("master").await;
     let slave = FakeRedis::start("slave").await;
@@ -757,8 +775,9 @@ async fn concurrent_reads_share_one_physical_slave_connection() {
     assert_eq!(master.accepted(), 1);
     assert_eq!(slave.accepted(), 1);
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn slave_selection_rotates_after_consuming_time_quota() {
     let master = FakeRedis::start("master").await;
     let slave_a = FakeRedis::start_with_delay("a", Duration::from_millis(3)).await;
@@ -783,8 +802,9 @@ async fn slave_selection_rotates_after_consuming_time_quota() {
     assert!(slave_a.saw("GET"));
     assert!(slave_b.saw("GET"));
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn changed_dns_snapshot_is_applied_automatically_and_reuses_nodes() {
     let master = FakeRedis::start("master").await;
     let old_slave = FakeRedis::start("old-slave").await;
@@ -824,8 +844,9 @@ async fn changed_dns_snapshot_is_applied_automatically_and_reuses_nodes() {
     assert_eq!(old_slave.accepted(), 1);
     assert_eq!(new_slave.accepted(), 1);
 }
+}
 
-#[tokio::test]
+runtime_test! {
 async fn response_timeout_retries_master_then_reconnects_the_slave() {
     let master = FakeRedis::start("master").await;
     let slave = RecoveringRedis::start().await;
@@ -892,6 +913,7 @@ async fn response_timeout_retries_master_then_reconnects_the_slave() {
             Err(error) => panic!("unexpected retry failure: {error}"),
         }
     }
+}
 }
 
 fn java_crc32(bytes: &[u8]) -> u32 {
