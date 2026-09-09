@@ -2,9 +2,10 @@
 name = "redis-bench"
 version = "0.1.0"
 edition = "2024"
-description = "Load-test harness for the redis SDK against the breeze mesh"
-license = "MIT"
+description = "Load-test harness for single-endpoint and sharded Redis configurations"
+license = "MIT OR Apache-2.0"
 publish = false
+repository = "https://github.com/we-breeze/redis"
 
 [[bin]]
 name = "redis-bench"
@@ -17,12 +18,14 @@ default = ["memory-stats"]
 memory-stats = ["brz-mem/heap-stats"]
 
 [dependencies]
-redis = { path = "../.." }
-brz-discovery.workspace = true
-brz-mem.workspace = true
+redis = { path = "../..", package = "brz-redis"}
+brz-mem = { package = "brz-memory", path = "../../../memory", default-features = false }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 hdrhistogram = "7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[workspace]
+resolver = "2"

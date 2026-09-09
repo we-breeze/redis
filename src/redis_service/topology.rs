@@ -1,10 +1,10 @@
 use super::*;
 
-pub(super) async fn build_discovery(
+pub(super) async fn build_dns_sources(
     shards: Vec<(String, Vec<String>)>,
     routing: &ShardRouting,
     options: &RedisServiceOptions,
-) -> RedisResult<Arc<RedisDiscovery>> {
+) -> RedisResult<Arc<RedisDnsSources>> {
     validate_routing(routing, shards.len())?;
     let mut master_labels = HashSet::with_capacity(shards.len());
     let mut builds = Vec::with_capacity(shards.len());
@@ -42,7 +42,7 @@ pub(super) async fn build_discovery(
     let router = RedisRouter {
         sharding: Sharding::new(routing.hash_algorithm(), routing.distribution(), &names),
     };
-    Ok(Arc::new(RedisDiscovery {
+    Ok(Arc::new(RedisDnsSources {
         shards,
         router,
         _dns_registrations: registrations,
@@ -93,11 +93,11 @@ pub(super) async fn build_endpoint_source(
 }
 
 pub(super) async fn build_topology(
-    discovery: Arc<RedisDiscovery>,
+    dns_sources: Arc<RedisDnsSources>,
     options: &RedisServiceOptions,
     previous: Option<&RedisTopology>,
 ) -> RedisResult<RedisTopology> {
-    let resolved = discovery.resolve();
+    let resolved = dns_sources.resolve();
     let built = try_join_all(
         resolved
             .shards
@@ -113,8 +113,8 @@ pub(super) async fn build_topology(
     }
 
     Ok(RedisTopology {
-        shards: Sharded::new(discovery.router.clone(), shards).map_err(map_net_error)?,
-        discovery,
+        shards: Sharded::new(dns_sources.router.clone(), shards).map_err(map_net_error)?,
+        dns_sources,
         resolved,
         nodes,
     })

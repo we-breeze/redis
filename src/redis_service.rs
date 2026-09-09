@@ -15,7 +15,6 @@ use brz_net::{
 use futures_util::future::try_join_all;
 use tokio::time::{Instant, MissedTickBehavior, sleep};
 
-use crate::mesh::MeshConfig;
 use crate::multi_key::{KeyListArgs, KeyRoute, classify_keys, group_keys};
 use crate::net_transport::{
     RedisProtocol, RedisRequest, RedisResponse, RedisResponseKind, map_session_error,
@@ -27,9 +26,10 @@ use crate::{
     Cmd, EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, FromRedisValue, PipeResponse,
     Redis, RedisArgsSink, RedisError, RedisPipe, RedisResult, RedisValues,
 };
+use crate::{RedisConfig, RedisConfigProvider};
 
 mod topology;
-use topology::{build_discovery, build_topology, map_net_error, validate_options};
+use topology::{build_dns_sources, build_topology, map_net_error, validate_options};
 
 const DNS_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -49,13 +49,11 @@ impl ShardRouting {
         }
     }
 
-    /// Creates the Java `hashGene`-compatible range distribution.
+    /// Creates a range distribution compatible with unsigned Java CRC32.
     ///
-    /// For example, `range("crc32", 256)` with 16 shards matches
-    /// `ShardingSupportHash(hashAlg=crc32, hashGene=256, tablePerDb=16)`.
-    /// This is the standard Java CRC32 mapping. The cache-client-specific
-    /// convention that rewrites a configured `crc32` to `crc32-short` applies
-    /// to memcached and must not be used for this Redis sharding component.
+    /// For example, `range("crc32", 256)` with 16 shards preserves the
+    /// corresponding CRC32 range mapping. `crc32` uses the full CRC32 value;
+    /// `crc32-short` is a distinct algorithm and must be selected explicitly.
     pub fn range(hash_algorithm: impl Into<String>, slots: u64) -> Self {
         Self::new(hash_algorithm, format!("range-{slots}"))
     }
@@ -204,7 +202,7 @@ impl ShardRouter<[u8]> for RedisRouter {
 
 pub(crate) struct RedisTopology {
     shards: Sharded<RedisShard, RedisRouter>,
-    discovery: Arc<RedisDiscovery>,
+    dns_sources: Arc<RedisDnsSources>,
     resolved: ResolvedTopology,
     nodes: HashMap<NodeKey, Node<RedisProtocol>>,
 }
@@ -245,7 +243,7 @@ struct RedisShardSources {
     slaves: Vec<RedisEndpointSource>,
 }
 
-struct RedisDiscovery {
+struct RedisDnsSources {
     shards: Vec<RedisShardSources>,
     router: RedisRouter,
     // Keeping the registrations alive keeps the shared DNS resolver watching
@@ -287,7 +285,7 @@ impl Hash for NodeKey {
     }
 }
 
-impl RedisDiscovery {
+impl RedisDnsSources {
     fn resolve(&self) -> ResolvedTopology {
         ResolvedTopology {
             shards: self
@@ -304,7 +302,7 @@ impl RedisDiscovery {
 
 impl RedisTopology {
     fn dns_changed(&self) -> bool {
-        self.discovery
+        self.dns_sources
             .shards
             .iter()
             .zip(&self.resolved.shards)
@@ -333,7 +331,7 @@ fn resolve_source(source: &RedisEndpointSource) -> ResolvedEndpoint {
 /// Direct Redis access over persistent multiplexed sessions.
 ///
 /// This type does not know where configuration came from. Callers resolve a
-/// single endpoint or `(master, slaves)` groups from properties, Vintage, or
+/// single endpoint or `(master, slaves)` groups from properties or
 /// another source before constructing it.
 #[derive(Clone)]
 pub struct RedisService {
@@ -341,30 +339,19 @@ pub struct RedisService {
 }
 
 impl RedisService {
-    /// Discovers one local Breeze mesh TCP endpoint and builds a fixed service.
-    ///
-    /// Registry discovery happens once. The resolved endpoint then has exactly
-    /// the same semantics as [`RedisService::single`].
-    pub async fn mesh(group: impl Into<String>, namespace: impl Into<String>) -> RedisResult<Self> {
-        Self::mesh_with_options(group, namespace, RedisServiceOptions::default()).await
+    /// Build a service from an application-supplied configuration snapshot.
+    pub async fn from_config(config: RedisConfig) -> RedisResult<Self> {
+        let shards = config
+            .shards
+            .into_iter()
+            .map(|shard| (shard.master, shard.slaves))
+            .collect();
+        Self::sharded_with_options(shards, config.routing, config.options).await
     }
 
-    /// Discovers one local Breeze mesh endpoint with explicit transport options.
-    pub async fn mesh_with_options(
-        group: impl Into<String>,
-        namespace: impl Into<String>,
-        options: RedisServiceOptions,
-    ) -> RedisResult<Self> {
-        Self::mesh_with_config(MeshConfig::new(group, namespace), options).await
-    }
-
-    /// Builds a fixed service from explicit mesh discovery coordinates.
-    pub async fn mesh_with_config(
-        config: MeshConfig,
-        options: RedisServiceOptions,
-    ) -> RedisResult<Self> {
-        let endpoint = config.resolve()?;
-        Self::single_with_options(format!("{}:{}", endpoint.host, endpoint.port), options).await
+    /// Load configuration once. The provider is not retained or watched.
+    pub async fn from_provider<P: RedisConfigProvider + ?Sized>(provider: &P) -> RedisResult<Self> {
+        Self::from_config(provider.load().await?).await
     }
 
     /// Builds one direct endpoint using the transport defaults.
@@ -434,8 +421,8 @@ impl RedisService {
     ) -> RedisResult<Self> {
         validate_options(&options)?;
         let request_arena = RedisRequest::shared_arena();
-        let discovery = build_discovery(shards, &routing, &options).await?;
-        let topology = build_topology(discovery, &options, None).await?;
+        let dns_sources = build_dns_sources(shards, &routing, &options).await?;
+        let topology = build_topology(dns_sources, &options, None).await?;
         let service = Self {
             inner: Arc::new(RedisServiceInner {
                 topology: ArcSwap::from_pointee(topology),
@@ -508,7 +495,7 @@ impl RedisService {
                     .as_ref()
                     .is_err_and(|error| error.is_retryable_transport())
             {
-                // Match reference-client: when there is only one slave, the one
+                // When there is only one slave, the one
                 // bounded read retry falls back to the master replica group.
                 match shard
                     .master
@@ -690,7 +677,7 @@ async fn reconcile_dns_once(inner: &RedisServiceInner) -> RedisResult<bool> {
     }
 
     let topology = build_topology(
-        Arc::clone(&previous.discovery),
+        Arc::clone(&previous.dns_sources),
         &inner.options,
         Some(&previous),
     )

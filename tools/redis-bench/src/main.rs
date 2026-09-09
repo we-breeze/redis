@@ -2,12 +2,11 @@
 //!
 //! Runs a fixed number of operations across `--concurrency` async workers and
 //! reports throughput plus latency percentiles (p50/p95/p99). It drives the
-//! SDK's unified [`redis::RedisService`] in mesh, single-endpoint, or sharded
+//! SDK's unified [`redis::RedisService`] in single-endpoint or sharded
 //! construction modes.
 //!
 //! Usage:
-//!   redis-bench --namespace my_ns --concurrency 64 --ops 100000 get
-//!   redis-bench --direct 127.0.0.1:6379 --concurrency 64 --ops 100000 set
+//!   redis-bench --direct 127.0.0.1:6379 --concurrency 64 --ops 100000 hget
 //!
 //! # Exit code
 //!
@@ -23,7 +22,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use driver::{Workload, WorkloadKind};
 use fault::FaultInjector;
-use redis::{MeshConfig, Redis, RedisService, RedisServiceOptions, ShardRouting};
+use redis::{
+    Redis, RedisConfig, RedisService, RedisServiceOptions, RedisShardConfig, ShardRouting,
+};
 use stats::{MemoryWindow, OpBudget, Summary, WorkerStats};
 
 // Install mimalloc (with per-request heap accounting under the `memory-stats`
@@ -35,12 +36,8 @@ brz_mem::install_global_allocator!();
 #[derive(Parser, Debug)]
 #[command(name = "redis-bench", version, about = "Load-test the redis SDK")]
 struct Args {
-    /// Mesh resource namespace to connect through.
-    #[arg(long, env = "BREEZE_REDIS_NS")]
-    namespace: Option<String>,
-
-    /// Connect one RedisService directly to `host:port[:db]` (no mesh).
-    #[arg(long)]
+    /// Connect one RedisService directly to `host:port[:db]` .
+    #[arg(long, required_unless_present = "shards", conflicts_with = "shards")]
     direct: Option<String>,
 
     /// Shards mode: comma-separated direct backends
@@ -49,7 +46,7 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     shards: Option<Vec<String>>,
 
-    /// Hash algorithm for --shards (breeze mesh names, e.g. crc32).
+    /// Hash algorithm for --shards (e.g. crc32).
     #[arg(long, default_value = "crc32")]
     hash: String,
 
@@ -61,14 +58,6 @@ struct Args {
     /// index. Defaults to shard 0.
     #[arg(long)]
     fault_shard: Option<usize>,
-
-    /// Deployment group segment of the mesh sock-file name.
-    #[arg(long, default_value = "default")]
-    group: String,
-
-    /// Directory the mesh publishes sock files into.
-    #[arg(long, default_value = "/data1/breeze/socks")]
-    socket_dir: String,
 
     /// Per-command operation timeout, in milliseconds.
     #[arg(long, default_value_t = 1000)]
@@ -95,7 +84,7 @@ struct Args {
     key_len: usize,
 
     /// Maximum value size, in bytes; the SET workload cycles through
-    /// `1..=max`. Ignored by the GET workload.
+    /// `1..=max`. Ignored by workloads with fixed-size values.
     #[arg(long, default_value_t = 1024)]
     val_size: usize,
 
@@ -136,7 +125,7 @@ struct Args {
     timeout_ms: u64,
 
     /// Fraction of frames after which the proxy kills the connection
-    /// (simulated resets: LB/proxy/mesh restart).
+    /// (simulated resets: load balancer or proxy restart).
     #[arg(long, default_value_t = 0.0)]
     reset_rate: f64,
 
@@ -207,7 +196,7 @@ fn main() {
 
 async fn run(mut args: Args) -> i32 {
     // Optional fault injection: insert a delaying TCP proxy between the
-    // bench and the target (mesh endpoint or raw redis) so slow/timeout
+    // bench and the target (configured Redis endpoint) so slow/timeout
     // faults exercise the SDK's timeout/breaker/retry machinery.
     let injector = FaultInjector::new(
         args.slow_rate,
@@ -334,8 +323,7 @@ enum RunMode {
 }
 
 /// Insert the fault-injecting proxy between the bench and the configured
-/// target, rewriting `args` to point at the proxy. Mesh mode re-publishes
-/// a bench-owned sock file (proxy port) in a fresh socket dir.
+/// target, rewriting `args` to point at the proxy.
 async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<(), String> {
     if let Some(shards) = args.shards.clone() {
         // Only the selected shard goes through the fault proxy; the others
@@ -382,35 +370,7 @@ async fn inject_faults(args: &mut Args, injector: Arc<FaultInjector>) -> Result<
         args.direct = Some(format!("{proxy}{db}"));
         return Ok(());
     }
-    if let Some(ns) = args.namespace.clone() {
-        let endpoint = brz_discovery::Registry::new(&args.socket_dir)
-            .discover(
-                "redis",
-                brz_discovery::CoordinateLayout::GroupNamespace,
-                &args.group,
-                &ns,
-            )
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .next()
-            .ok_or("no TCP mesh endpoint to proxy")?;
-        let brz_discovery::Endpoint { host, port } = endpoint;
-        let target = resolve(&format!("{host}:{port}")).await?;
-        let proxy = fault::start_proxy(target, injector).await?;
-        let dir = std::env::temp_dir().join(format!("redis-bench-fault-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let sock = dir.join(format!(
-            "static.config.api.example.com+3+config+cloud+redis+{}+{}@redis:{}@rs",
-            args.group,
-            ns,
-            proxy.port()
-        ));
-        std::fs::File::create(&sock).map_err(|e| e.to_string())?;
-        eprintln!("fault proxy: {proxy} -> {target} (sock {})", sock.display());
-        args.socket_dir = dir.to_string_lossy().into_owned();
-        return Ok(());
-    }
-    Err("fault injection requires one of --namespace/--direct/--shards".to_string())
+    Err("fault injection requires one of --direct/--shards".to_string())
 }
 
 async fn resolve(host_port: &str) -> Result<std::net::SocketAddr, String> {
@@ -428,37 +388,30 @@ async fn build_client(args: &Args) -> Result<Arc<RedisService>, String> {
     if let Some(shards) = &args.shards {
         let topology = shards
             .iter()
-            .map(|address| (address.clone(), vec![address.clone()]))
+            .map(|address| RedisShardConfig {
+                master: address.clone(),
+                slaves: vec![address.clone()],
+            })
             .collect();
-        let service = RedisService::sharded_with_options(
-            topology,
-            ShardRouting::new(&args.hash, &args.distribution),
-            options,
+        let service = RedisService::from_config(
+            RedisConfig::sharded(topology, ShardRouting::new(&args.hash, &args.distribution))
+                .with_options(options),
         )
         .await
         .map_err(|error| error.to_string())?;
         return Ok(Arc::new(service));
     }
     if let Some(addr) = &args.direct {
-        let service = RedisService::single_with_options(addr, options)
+        let service = RedisService::from_config(RedisConfig::single(addr).with_options(options))
             .await
             .map_err(|error| error.to_string())?;
         return Ok(Arc::new(service));
     }
 
-    let ns = args
-        .namespace
-        .clone()
-        .ok_or_else(|| "one of --namespace, --direct, or --shards is required".to_string())?;
-
-    let config = MeshConfig::new(&args.group, ns).with_socket_dir(&args.socket_dir);
-    let service = RedisService::mesh_with_config(config, options)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(Arc::new(service))
+    Err("one of --direct or --shards is required".to_string())
 }
 
-/// Issue throwaway operations to prime the pool and let the server/mesh warm
+/// Issue throwaway operations to prime the pool and let the server warm
 /// up; not measured.
 async fn warmup(
     client: &Arc<RedisService>,
@@ -728,4 +681,40 @@ fn report(summary: &Summary, elapsed: Duration, memory: &MemoryWindow) {
     }
     memory.print();
     println!("=============================");
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn requires_exactly_one_target_mode() {
+        assert!(Args::try_parse_from(["redis-bench", "hget"]).is_err());
+        assert!(
+            Args::try_parse_from([
+                "redis-bench",
+                "--direct",
+                "127.0.0.1:6379",
+                "--shards",
+                "127.0.0.1:6380",
+                "hget",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_direct_and_sharded_targets() {
+        let direct =
+            Args::try_parse_from(["redis-bench", "--direct", "127.0.0.1:6379", "hget"]).unwrap();
+        assert_eq!(direct.direct.as_deref(), Some("127.0.0.1:6379"));
+        let shards = Args::try_parse_from([
+            "redis-bench",
+            "--shards",
+            "127.0.0.1:6379,127.0.0.1:6380",
+            "hget",
+        ])
+        .unwrap();
+        assert_eq!(shards.shards.unwrap().len(), 2);
+    }
 }

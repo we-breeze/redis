@@ -11,7 +11,7 @@ fn endpoint() -> Option<String> {
 }
 
 #[tokio::test]
-async fn application_native_commands_roundtrip_against_redis_7() {
+async fn native_commands_roundtrip_against_redis_7() {
     let Some(endpoint) = endpoint() else {
         eprintln!("skipping: BREEZE_REDIS_TEST_ENDPOINT not set");
         return;

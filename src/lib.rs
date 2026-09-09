@@ -1,13 +1,13 @@
 //! High-performance asynchronous Redis access through one unified
 //! [`RedisService`] facade.
 //!
-//! - [`RedisService::mesh`] discovers a local Breeze TCP endpoint once and
-//!   then uses the same fixed implementation as [`RedisService::single`].
+//! - [`RedisService::from_config`] accepts application-supplied configuration.
+//! - [`RedisService::from_provider`] loads a configuration snapshot once.
 //! - [`RedisService::noshard`] builds one master/slave replica group.
 //! - [`RedisService::sharded`] routes a key to one master/slave group before
 //!   selecting a replica.
-//! - Hostname endpoints retain automatic IPv4 DNS refresh. Mesh registry
-//!   coordinates and logical shard layouts remain fixed after construction.
+//! - Hostname endpoints retain automatic IPv4 DNS refresh. Logical shard
+//!   layouts remain fixed after construction.
 //!
 //! Each physical node owns one multiplexed `brz-net` session with fail-fast
 //! admission, request deadlines, elastic receive buffering, and quota-based
@@ -17,9 +17,9 @@ mod api;
 mod arg;
 mod bulk;
 pub mod cmd;
+mod config;
 pub mod error;
 pub mod from_value;
-mod mesh;
 mod multi_key;
 mod net_transport;
 #[cfg(feature = "metrics")]
@@ -38,9 +38,9 @@ pub use brz_net::{
 };
 pub use bulk::{FromRedisBulk, RedisBytes, RedisValues};
 pub use cmd::{Cmd, cmd};
+pub use config::{RedisConfig, RedisConfigFuture, RedisConfigProvider, RedisShardConfig};
 pub use error::{ErrorKind, RedisError, RedisResult};
 pub use from_value::FromRedisValue;
-pub use mesh::{DEFAULT_SOCKS_DIR, MESH_CONNECT_HOST_ENV, MeshConfig};
 pub use redis_service::{RedisService, RedisServiceOptions, ShardRouting};
 pub use service_pipe::{FromPipeResponse, MAX_PIPELINE_COMMANDS, PipeResponse, RedisPipe, pipe};
 pub use to_args::{Bytes, RedisWrite, ToRedisArgs, ToSingleRedisArg};

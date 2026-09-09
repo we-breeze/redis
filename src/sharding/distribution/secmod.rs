@@ -13,7 +13,7 @@ impl SecMod {
     }
 
     pub fn index(&self, hash: i64) -> usize {
-        // 理论上，使用secmod的业务，hash不应该是负数; 说人话就是：对负数hash，具体idx不保证确定结果
+        // secmod 要求非负 hash；负数输入的分片结果不保证兼容性
         if hash < 0 {
             log::error!("found negative hash for secmod:{}", hash);
         }

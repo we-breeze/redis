@@ -176,7 +176,9 @@ where
                 return Err(type_error("expected an even-length array for pairs"));
             }
             items
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     Ok((
                         K::from_redis_value(&pair[0])?,

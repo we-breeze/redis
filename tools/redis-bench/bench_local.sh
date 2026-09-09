@@ -5,7 +5,6 @@
 #
 # 模式（MODE 环境变量）：
 #   direct   （默认）SDK RedisService::single 直连 redis
-#   mesh  用假 sock 文件模拟 mesh 发布，走完整 mesh 链路
 #   shards   N 个原生 redis 当分片，走 RedisService::sharded 客户端路由
 #
 # 用法示例：
@@ -13,7 +12,6 @@
 #   基本：
 #     ./bench_local.sh --ops 1000000 hget                     # direct 模式
 #     ./bench_local.sh -c 64 -d 60 hmget                      # 60 秒时长模式，4 字段 HMGET
-#     MODE=mesh ./bench_local.sh --ops 1000000 hget        # mesh（假 sock 文件）
 #     MODE=shards SHARDS=4 ./bench_local.sh --ops 1000000 hget  # N 个本机 redis 分片
 #
 #   故障注入（本地代理按帧注入）：
@@ -42,7 +40,7 @@
 #     MATRIX=1 MODE=shards SHARDS=4 ./bench_local.sh
 #
 # 环境变量：
-#   MODE      direct | mesh | shards（默认 direct）
+#   MODE      direct | shards（默认 direct）
 #   MATRIX    1 = 跑完整压测矩阵（默认关）
 #   PORT      redis 端口（默认 16399；shards 模式占用 PORT..PORT+SHARDS-1）
 #   SHARDS    分片数（默认 4）
@@ -57,9 +55,10 @@
 # 也可以自己起 redis，脚本会复用 PORT 上已在监听的实例。
 #
 # 压测后查看 key（需 KEEP_REDIS=1）：
-#   redis-cli -p 16399 --no-raw --scan | head        # direct/mesh 的 key
+#   redis-cli -p 16399 --no-raw --scan | head        # direct 的 key
 
 set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # redis-server 8.x 在某些 locale 下拒绝启动（如 macOS 的 C.UTF-8），强制可用值。
 export LC_ALL=en_US.UTF-8
@@ -71,10 +70,6 @@ SHARDS="${SHARDS:-4}"
 OPS="${OPS:-500000}"
 REDIS="${REDIS:-redis-server}"
 CARGO="${CARGO:-cargo}"
-NAMESPACE="${NAMESPACE:-bench_ns}"
-GROUP="${GROUP:-bench}"
-# 每次运行独立的 sock 目录：旧目录里的残留 sock 文件会赢得发现评分、指向死端口。
-SOCK_DIR="$(mktemp -d /tmp/bench-socks.XXXXXX)"
 
 started_ports=()
 cleanup() {
@@ -83,7 +78,6 @@ cleanup() {
       redis-cli -p "$p" shutdown nosave 2>/dev/null || true
     done
   fi
-  rm -rf "$SOCK_DIR"
 }
 trap cleanup EXIT INT TERM
 
@@ -115,15 +109,6 @@ prepare() {
       ensure_redis "$PORT"
       TARGET_ARGS=(--direct "127.0.0.1:$PORT")
       ;;
-    mesh)
-      ensure_redis "$PORT"
-      # 模拟 mesh 发布 sock 配置文件：
-      #   <以 + 分隔的服务路径>@redis:<port>@rs，尾部是 +<group>+<namespace>
-      local sock="$SOCK_DIR/static.config.api.example.com+3+config+cloud+redis+${GROUP}+${NAMESPACE}@redis:${PORT}@rs"
-      touch "$sock"
-      echo "mesh 模式: 已发布 sock 文件 $(basename "$sock")"
-      TARGET_ARGS=(--namespace "$NAMESPACE" --group "$GROUP" --socket-dir "$SOCK_DIR")
-      ;;
     shards)
       local addrs=""
       for i in $(seq 0 $((SHARDS - 1))); do
@@ -135,7 +120,7 @@ prepare() {
       TARGET_ARGS=(--shards "$addrs")
       ;;
     *)
-      echo "error: 未知 MODE '$MODE'（direct | mesh | shards）" >&2
+      echo "error: 未知 MODE '$MODE'（direct | shards）" >&2
       exit 2
       ;;
   esac
@@ -146,7 +131,7 @@ run_one() {
   local title="$1"; shift
   echo
   echo "########## $title ##########"
-  "$CARGO" run --release -p redis-bench -- "${TARGET_ARGS[@]}" "$@"
+  "$CARGO" run --manifest-path "$SCRIPT_DIR/Cargo.toml" --release -p redis-bench -- "${TARGET_ARGS[@]}" "$@"
 }
 
 run_matrix() {
@@ -167,5 +152,5 @@ prepare
 if [[ "$MATRIX" == "1" ]]; then
   run_matrix
 else
-  "$CARGO" run --release -p redis-bench -- "${TARGET_ARGS[@]}" "$@"
+  "$CARGO" run --manifest-path "$SCRIPT_DIR/Cargo.toml" --release -p redis-bench -- "${TARGET_ARGS[@]}" "$@"
 fi

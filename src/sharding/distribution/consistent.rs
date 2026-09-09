@@ -42,7 +42,7 @@ impl Consistent {
                         | (((out_bytes[1 + j * 4] & 0xFF) as i64) << 8)
                         | ((out_bytes[0 + j * 4] & 0xFF) as i64);
 
-                    // twemproxy 为代表的原始版ketama算法，不需要此计算, 但业务sdk的修正版需要此计算
+                    // twemproxy 为代表的原始版ketama算法，不需要此计算, 但当前兼容变体需要此计算
                     if !origin_alg {
                         hash = hash.wrapping_rem(i32::MAX as i64);
                     }

@@ -1,7 +1,7 @@
 #[derive(Debug, Default, Clone)]
 pub struct Crc64;
 
-/// Crc64 基于u64计算，hash可能为负，distribution需要根据业务需要进行类型转换
+/// Crc64 基于u64计算，hash可能为负，distribution 需按其有符号数约定进行类型转换
 impl super::Hash for Crc64 {
     fn hash<S: super::HashKey>(&self, key: &S) -> i64 {
         let mut crc: u64 = CRC64_TABLE[0];

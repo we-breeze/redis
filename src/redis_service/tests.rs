@@ -11,7 +11,10 @@ use tokio::time::{Instant, sleep};
 use crate::resp::parser::{ParseResult, parse_reply};
 use crate::sharding::Sharding;
 use crate::sharding::hash::{Hash, Hasher};
-use crate::{ErrorKind, MeshConfig, Redis, RedisBytes, RedisPipe, RedisResult, RedisValues, Value};
+use crate::{
+    ErrorKind, Redis, RedisBytes, RedisConfig, RedisConfigProvider, RedisPipe, RedisResult,
+    RedisValues, Value,
+};
 
 use super::{RedisService, RedisServiceOptions, ShardRouting};
 
@@ -238,41 +241,44 @@ async fn metrics_feature_records_the_configured_authority_without_db_suffix() {
     );
 }
 
+struct TestConfigProvider {
+    config: Mutex<RedisConfig>,
+    loads: AtomicUsize,
+}
+
+impl RedisConfigProvider for TestConfigProvider {
+    fn load(&self) -> crate::RedisConfigFuture<'_> {
+        Box::pin(async move {
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.config.lock().unwrap().clone())
+        })
+    }
+}
+
 #[tokio::test]
-async fn mesh_discovers_once_then_behaves_like_single() {
+async fn provider_loads_once_and_service_keeps_its_config_snapshot() {
     let first = FakeRedis::start("first").await;
     let second = FakeRedis::start("second").await;
-    let directory = tempfile::tempdir().unwrap();
-    let first_port = first.endpoint.rsplit_once(':').unwrap().1;
-    let second_port = second.endpoint.rsplit_once(':').unwrap().1;
-    let first_record = directory.path().join(format!(
-        "static.config.api.example.com+3+config+cloud+redis+feed+profiles@redis:{first_port}@rs"
-    ));
-    std::fs::write(&first_record, []).unwrap();
-
-    let redis = RedisService::mesh_with_config(
-        MeshConfig::new("feed", "profiles").with_socket_dir(directory.path()),
-        RedisServiceOptions::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        Redis::get::<_, RedisBytes>(&redis, "key")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(b"first".as_slice())
-    );
-
-    std::fs::remove_file(first_record).unwrap();
-    std::fs::write(
-        directory.path().join(format!(
-            "static.config.api.example.com+3+config+cloud+redis+feed+profiles@redis:{second_port}@rs"
-        )),
-        [],
-    )
-    .unwrap();
-
+    let provider = TestConfigProvider {
+        config: Mutex::new(RedisConfig::single(&first.endpoint)),
+        loads: AtomicUsize::new(0),
+    };
+    // Also exercise injection through a trait object.
+    let redis = RedisService::from_provider(&provider as &dyn RedisConfigProvider)
+        .await
+        .unwrap();
+    *provider.config.lock().unwrap() = RedisConfig::single(&second.endpoint);
+    for _ in 0..2 {
+        assert_eq!(
+            Redis::get::<_, RedisBytes>(&redis, "key")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"first".as_slice())
+        );
+    }
+    assert_eq!(provider.loads.load(Ordering::Relaxed), 1);
+    drop(provider);
     assert_eq!(
         Redis::get::<_, RedisBytes>(&redis, "key")
             .await
@@ -281,6 +287,81 @@ async fn mesh_discovers_once_then_behaves_like_single() {
         Some(b"first".as_slice())
     );
     assert_eq!(second.accepted(), 0);
+}
+
+#[tokio::test]
+async fn provider_error_is_returned_unchanged() {
+    struct FailingProvider;
+    impl RedisConfigProvider for FailingProvider {
+        fn load(&self) -> crate::RedisConfigFuture<'_> {
+            Box::pin(async {
+                Err(crate::RedisError::new(
+                    ErrorKind::ClientError,
+                    "config unavailable",
+                ))
+            })
+        }
+    }
+    let error = RedisService::from_provider(&FailingProvider)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), ErrorKind::ClientError);
+    assert!(error.to_string().contains("config unavailable"));
+}
+
+#[tokio::test]
+async fn injected_config_preserves_read_write_roles_and_options() {
+    let master = FakeRedis::start("master").await;
+    let slave = FakeRedis::start("slave").await;
+    let config = RedisConfig::noshard(&master.endpoint, [&slave.endpoint])
+        .with_options(RedisServiceOptions::default().with_timeout(Duration::from_millis(750)));
+    let redis = RedisService::from_config(config).await.unwrap();
+    assert_eq!(
+        redis.inner.options.master_timeout,
+        Duration::from_millis(750)
+    );
+    assert_eq!(
+        redis.inner.options.slave_timeout,
+        Duration::from_millis(750)
+    );
+    assert_eq!(
+        Redis::get::<_, RedisBytes>(&redis, "key")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"slave".as_slice())
+    );
+    let _: i64 = Redis::hset(&redis, "key", "field", "value").await.unwrap();
+    assert!(
+        master
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| command == "HSET")
+    );
+    assert!(
+        !slave
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| command == "HSET")
+    );
+}
+
+#[tokio::test]
+async fn injected_config_uses_existing_validation() {
+    for config in [
+        RedisConfig::sharded(vec![], ShardRouting::new("raw", "modula")),
+        RedisConfig::noshard("127.0.0.1:6379", Vec::<String>::new()),
+        RedisConfig::single("invalid-address"),
+        RedisConfig::single("127.0.0.1:6379")
+            .with_options(RedisServiceOptions::default().with_timeout(Duration::ZERO)),
+    ] {
+        assert!(RedisService::from_config(config).await.is_err());
+    }
 }
 
 #[test]
@@ -295,7 +376,7 @@ fn crc32_java_mapping_keeps_standard_and_short_distinct() {
     assert_eq!(short, 0x4bf4);
     assert_ne!(standard, short);
 
-    // reference-library HashUtilTest.testGetHashCrc32 uses these exact expected
+    // Fixed compatibility vectors preserve these exact expected
     // values for Java's `(crc32 / splitCount) % splitCount` mapping.
     let java_uid_crc = Hasher::from("crc32").hash(&b"1821155363".as_slice());
     assert_eq!((java_uid_crc / 32) % 32, 12);
@@ -326,8 +407,7 @@ fn explicit_uid_route_matches_java_range_sharding() {
 
 #[test]
 fn java_sharding_support_hash_test_vectors_match_range() {
-    // Copied from reference-library ShardingSupportHashTest.testGetDbTableUid:
-    // hashAlg=crc32, hashGene=1024, tablePerDb=64, noneHash=new.
+    // Fixed CRC32 range compatibility vectors: 1024 slots and 64 shards.
     let vectors = [
         (1_750_715_731_u64, 15_usize),
         (1_821_155_363, 13),
@@ -571,13 +651,19 @@ async fn sharded_routes_before_selecting_each_groups_slaves() {
     let slave_a = FakeRedis::start("slave-a").await;
     let master_b = FakeRedis::start("master-b").await;
     let slave_b = FakeRedis::start("slave-b").await;
-    let redis = RedisService::sharded(
+    let redis = RedisService::from_config(RedisConfig::sharded(
         vec![
-            (master_a.endpoint.clone(), vec![slave_a.endpoint.clone()]),
-            (master_b.endpoint.clone(), vec![slave_b.endpoint.clone()]),
+            crate::RedisShardConfig {
+                master: master_a.endpoint.clone(),
+                slaves: vec![slave_a.endpoint.clone()],
+            },
+            crate::RedisShardConfig {
+                master: master_b.endpoint.clone(),
+                slaves: vec![slave_b.endpoint.clone()],
+            },
         ],
         ShardRouting::new("crc32", "modula"),
-    )
+    ))
     .await
     .unwrap();
     let sharding = Sharding::new("crc32", "modula", &["a".to_owned(), "b".to_owned()]);
@@ -716,7 +802,7 @@ async fn changed_dns_snapshot_is_applied_automatically_and_reuses_nodes() {
     );
     let topology = redis.inner.topology.load_full();
     assert!(
-        topology.discovery.shards[0].slaves[0]
+        topology.dns_sources.shards[0].slaves[0]
             .endpoints
             .replace([new_slave.endpoint.parse().unwrap()])
     );

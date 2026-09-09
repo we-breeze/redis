@@ -1,4 +1,4 @@
-// 用于兼容reference-library中的Util.crc32(Longs.toByteArray(id))，一般尽量不用使用 fishermen
+// 先将整数转换为字节，再按历史 CRC32 约定计算。 fishermen
 
 use std::fmt::Display;
 

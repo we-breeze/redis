@@ -1,4 +1,4 @@
-// 用于兼容reference-library中的Util.crc32()，一般尽量不用使用 fishermen
+// 保留历史 CRC32 计算约定，供已有分片映射兼容使用。 fishermen
 
 use std::fmt::Display;
 

@@ -1,7 +1,7 @@
 #[derive(Clone, Default, Debug)]
 pub struct Bkdr;
 
-//TODO 参考java版本调整，手动测试各种长度key，hash一致，需要线上继续验证 fishermen
+//TODO 参考java版本调整，手动测试各种长度key，hash一致，仍需补充更广泛的兼容性验证 fishermen
 impl super::Hash for Bkdr {
     fn hash<K: super::HashKey>(&self, b: &K) -> i64 {
         let mut h = 0i32;

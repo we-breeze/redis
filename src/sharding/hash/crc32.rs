@@ -124,7 +124,7 @@ impl super::Hash for Crc32 {
     }
 }
 
-// 兼容reference-library中mc crc32 hash算法调整，手动测试各种长度key，hash一致；
+// 保留历史缓存客户端 CRC32 变体；已对多种 key 长度校验一致性；
 // 核心算法同crc32，但要多做一次做移位及截断
 impl super::Hash for Crc32Short {
     #[inline]
@@ -307,7 +307,7 @@ pub(crate) fn parse_smartnum_hashkey<S: super::HashKey>(key: &S) -> (usize, usiz
             if end - start >= super::SMARTNUM_MIN_LEN {
                 break;
             } else {
-                // 长度小于uid最小长度，重置
+                // 数字段长度小于要求的最小值，重置
                 start = usize::MAX;
                 end = usize::MAX;
             }

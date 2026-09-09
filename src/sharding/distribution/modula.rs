@@ -5,7 +5,7 @@ pub enum Modula {
 }
 
 impl Modula {
-    // absolut_hash 用于兼容兼容算法：google commons crc32 + java 求余并absolute
+    // absolut_hash 使用 CRC32、Java 有符号求余，再取绝对值
     pub fn from(sharding_num: usize, absolute_hash: bool) -> Self {
         if sharding_num == 0 || sharding_num & (sharding_num - 1) == 0 {
             Modula::Pow2(Pow2::from(sharding_num, absolute_hash))

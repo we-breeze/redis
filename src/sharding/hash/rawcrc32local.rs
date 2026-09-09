@@ -1,7 +1,7 @@
 use super::{Crc32local, Hash};
 
 // 用于支持groupchat中的UidSelectionStrategy
-// 算法描述：1 优先解析“_”之前的uid，没有"_"解析整个字符串，如果是数字，直接返回；
+// 算法描述：1 优先解析“_”之前的数字标识，没有"_"解析整个字符串，如果是数字，直接返回；
 //         2 否则进行crc32local计算
 #[derive(Clone, Debug)]
 pub struct Rawcrc32local {
@@ -22,7 +22,7 @@ impl Hash for Rawcrc32local {
     fn hash<S: super::HashKey>(&self, key: &S) -> i64 {
         let mut hash = 0;
 
-        // 先尝试按uid_xxx来hash
+        // 先尝试按数字标识加后缀的格式计算 hash
         for i in 0..key.len() {
             let c = key.at(i);
             if !c.is_ascii_digit() {

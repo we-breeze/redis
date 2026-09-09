@@ -28,7 +28,7 @@ pub mod crc;
 use self::{bkdrsub::BkdrsubDelimiter, crc64::Crc64, fnv1::Fnv1F32, fnv1::Fnv1aF64};
 use enum_dispatch::enum_dispatch;
 
-// 占位hash，主要用于兼容服务框架，供mq等业务使用
+// 占位 hash，用于无需按 key 计算散列的调用场景
 pub const HASH_PADDING: &str = "padding";
 
 // hash算法名称分隔符，合法的算法如：crc32,crc-short, crc32-num, crc32-point, crc32-pound, crc32-underscore
@@ -148,7 +148,7 @@ impl Hasher {
         // 扩展hash，包括crc32扩展、crc32local扩展：
         // 1 crc32 扩展hash，目前包含3类：short、num、delimiter，前两种为：crc32-short, crc-32-num；
         //   crc32-delimiter包括各种可扩展的分隔符，like： crc32-point, crc32-pound,crc32-underscore；
-        //   如果业务有固定前缀，也可以支持，在hash name后加-xxx，xxx为前缀长度。
+        //   如果 key 有固定前缀，也可以支持，在hash name后加-xxx，xxx为前缀长度。
         // 2 crc32local 扩展hash，包括各种可扩展的分隔符，like： crc32-point, crc32-pound,crc32-underscore；
         debug_assert!(alg_parts.len() == 2 || alg_parts.len() == 3);
         match alg_parts[0] {

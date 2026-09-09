@@ -1,9 +1,10 @@
 [package]
-name = "redis"
+name = "brz-redis"
 version = "0.1.0"
 edition = "2024"
-description = "High-performance, high-availability async Redis client for the example breeze platform"
-license = "MIT"
+description = "Asynchronous Redis client with multiplexed connections and client-side sharding"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/we-breeze/redis"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "io-util", "macros"] }
@@ -17,14 +18,12 @@ rand = "0.8"
 memchr = "2"
 log = "0.4"
 enum_dispatch = "0.3"
-brz-discovery = { workspace = true }
-brz-net = { package = "net", git = "https://github.com/we-breeze/net.git", tag = "v0.0.1" }
+brz-net = { package = "brz-net",   version = "0.0.2"}
 arc-swap = "1"
-brz-metrics = { package = "metrics", git = "https://github.com/we-breeze/metrics.git", tag = "v0.0.2", optional = true }
+brz-metrics = { package = "brz-metrics",   optional = true, version = "0.0.3"}
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-tempfile = { workspace = true }
 
 [features]
 default = []
@@ -35,18 +34,11 @@ metrics = ["dep:brz-metrics"]
 # Integration tests that require a live redis-server are gated behind this.
 integration-tests = []
 
-# This crate is itself the SDK (`redis`) AND the workspace root. The
-# `redis-bench` load-test harness lives under `tools/redis-bench` and is the
-# only other member.
+# Deployment-specific benchmark tooling has its own workspace.
 [workspace]
-members = ["tools/redis-bench"]
+members = []
+exclude = ["tools/redis-bench"]
 resolver = "2"
 
-[workspace.dependencies]
-# Shared Breeze libraries use the same release tag across repositories.
-brz-discovery = { package = "discovery", git = "https://github.com/we-breeze/discovery.git", tag = "v0.0.1" }
-tempfile = "3"
-# Shared sibling crate: the bench harness installs this allocator at its binary
-# composition root to get mimalloc + per-request allocation accounting. The SDK
-# itself stays allocator-agnostic.
-brz-mem = { package = "memory", git = "https://github.com/we-breeze/memory.git", tag = "v0.0.1", version = "0.1.0", default-features = false }
+[lib]
+name = "redis"

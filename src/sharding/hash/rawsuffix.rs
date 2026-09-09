@@ -1,4 +1,4 @@
-// 对分隔符后缀之后的部分进行long型转换，当前按业务要求，强制分隔符个数为1 fishermen
+// 对分隔符后缀之后的部分进行long型转换，当前要求恰好一个分隔符 fishermen
 
 use super::DebugName;
 use std::fmt::Display;
@@ -25,7 +25,7 @@ impl RawSuffix {
 
 impl super::Hash for RawSuffix {
     fn hash<S: super::HashKey>(&self, key: &S) -> i64 {
-        // 按业务要求，如果没有分隔符，或者后缀有非数字，统统按照0处理
+        // 如果没有分隔符，或者后缀包含非数字，均按 0 处理
         let mut hash = 0i64;
         let mut found_delimiter = false;
 

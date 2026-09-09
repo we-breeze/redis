@@ -1,87 +1,139 @@
-# redis
+# brz-redis
 
-基于 `brz-net` 单连接多路复用会话的高性能异步 Redis SDK。对外统一使用
-`RedisService`，不再区分旧的 sidecar client、direct client、connection pool。
+An asynchronous Redis client built on `brz-net`, with multiplexed connections,
+master/replica routing, client-side sharding, and typed command results.
 
-## 构造方式
+The application supplies connection configuration. The library does not read
+service-registry directories or depend on a particular configuration service.
+
+## Configuration
 
 ```rust,no_run
-use redis::{Redis, RedisBytes, RedisService};
+use redis::{Redis, RedisBytes, RedisConfig, RedisService, RedisServiceOptions};
 
 # async fn example() -> redis::RedisResult<()> {
-// 一次性发现 Breeze mesh 发布的本地 TCP 端口，之后等价于 single。
-let mesh = RedisService::mesh("feed", "profiles").await?;
-
-// 一个地址；读、写角色各自持有一个物理连接。
-let single = RedisService::single("127.0.0.1:6379").await?;
-
-// 一个 master/slave replica group。
-let service = RedisService::noshard(
-    "redis-master.example:6379",
-    ["redis-slave-a.example:6379", "redis-slave-b.example:6379"],
-)
-.await?;
-
-let value: Option<RedisBytes> = service.get("key").await?;
-# let _ = (mesh, single, value);
+let config = RedisConfig::single("127.0.0.1:6379")
+    .with_options(RedisServiceOptions::default());
+let service = RedisService::from_config(config).await?;
+let value: Option<RedisBytes> = service.get("example:key").await?;
 # Ok(())
 # }
 ```
 
-多分片场景使用 `RedisService::sharded`：先按 key 选择 shard，再在该 shard
-的等价 slave replicas 之间使用 quota 负载均衡。pipeline 当前只支持单 shard
-拓扑；多 shard 会在发送前快速失败。
+`RedisConfig` contains:
 
-需要密码认证时，从应用配置读取密码，通过 options 传入：
+- `shards: Vec<RedisShardConfig>`: ordered master/replica groups.
+- `routing: ShardRouting`: hash and distribution algorithms.
+- `options: RedisServiceOptions`: authentication, deadlines, DNS refresh, and
+  replica balancing settings.
+
+Each `RedisShardConfig` has a `master` address and a `slaves` list. Addresses use
+`host:port[:db]`. Writes go to the master and reads use the replicas. A single
+endpoint fills both roles using independent read and write connections.
+
+Use `RedisConfig::noshard(master, replicas)` for one group, or
+`RedisConfig::sharded(shards, routing)` for multiple groups. Shard order affects
+key placement. The existing `RedisService::single`, `noshard`, `sharded`, and
+`*_with_options` constructors remain available.
+
+Pass passwords separately with `RedisServiceOptions::with_password`. The Debug
+representation redacts the password. Authentication and database selection run
+before commands on initial connection and reconnection.
+
+## Configuration providers
+
+Applications can implement `RedisConfigProvider` for asynchronous configuration
+loading:
 
 ```rust,no_run
-use redis::{RedisResult, RedisService, RedisServiceOptions};
+use redis::{RedisConfig, RedisConfigFuture, RedisConfigProvider, RedisService};
 
-async fn connect(endpoint: String, password: Option<String>) -> RedisResult<RedisService> {
-    let options = RedisServiceOptions::default().with_password(password);
-    RedisService::single_with_options(endpoint, options).await
+struct AppConfig {
+    endpoint: String,
 }
+
+impl RedisConfigProvider for AppConfig {
+    fn load(&self) -> RedisConfigFuture<'_> {
+        Box::pin(async move { Ok(RedisConfig::single(&self.endpoint)) })
+    }
+}
+
+# async fn example() -> redis::RedisResult<()> {
+let provider = AppConfig { endpoint: "127.0.0.1:6379".into() };
+let service = RedisService::from_provider(&provider).await?;
+# Ok(())
+# }
 ```
 
-`Some(password)` 对所有主节点和副本启用 `AUTH password`；`None` 不发送 AUTH。
-首次连接和重连均在认证、SELECT 完成后才接收业务命令。endpoint 仍使用
-`host:port[:db]`，密码单独传递；options 的 Debug 输出会隐藏密码。
+Providers can also be passed as `&dyn RedisConfigProvider`. The service loads one
+snapshot, validates it, and does not retain or poll the provider. Load failures
+propagate to the caller. Logical topology stays fixed; hostname IPv4 addresses
+continue to refresh through DNS.
 
-## 命令能力
+## Commands and routing
 
-`Redis` trait 提供 application 当前需要的 Redis 原生命令，包括带 `EX/PX/NX/XX`
-选项的 `SET`、`MGET/DEL/EXPIRE/INCR/APPEND/EVAL/EVALSHA`、list/set/hash/zset、
-`PFADD/PFCOUNT` 和 `PUBLISH`。有限 pipeline 同样支持 application 使用的写命令和
-动态 RESP 返回值；额外命令可通过 `Cmd` 和 `Redis::command` 编码执行。
+The `Redis` trait provides string, hash, list, set, sorted-set, HyperLogLog,
+expiration, scripting, and publish commands. Use `Cmd` and `Redis::command` for
+additional commands. `RedisPipe` supports typed results for a single-shard
+pipeline; multi-shard pipelines are rejected before sending.
 
-这里仅封装 Redis 协议、读写角色和 shard 路由，不包含分布式锁、缓存、限流、
-队列或其他业务语义。
+One physical node owns one persistent multiplexed session. Admission fails fast
+when the in-flight limit is reached. Request timeouts default to 200 ms and can
+be configured separately for master and replica requests.
 
-真实 Redis 集成测试保持 opt-in：
+Hash and distribution variants retain their existing compatibility behavior.
+Changing the configured algorithm, shard order, or shard count can change key
+placement. The library does not provide distributed locks, cache policies, or
+other application-level abstractions.
 
-```bash
+## Validation
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+cargo test --workspace --all-targets --features metrics
+cargo test --doc
+```
+
+Tests normally use local protocol fixtures. Tests against an actual Redis server
+are opt-in:
+
+```sh
 BREEZE_REDIS_TEST_ENDPOINT=127.0.0.1:6379 \
-  cargo test --workspace --all-targets --features integration-tests
+  cargo test --features integration-tests --test integration
 ```
 
-## Mesh 语义
+## Benchmarks
 
-`RedisService::mesh(group, namespace)` 复用共享 `discovery` crate，以 Redis 的
-`GroupNamespace` 坐标规则扫描 `/data1/breeze/socks`。发现只发生一次，不等待
-endpoint 就绪，也不监听注册文件变化；未发现精确坐标时构造直接失败。发现到
-TCP endpoint 后使用 `RedisService::single` 的实现。
+`tools/redis-bench` is a standalone, non-publishable workspace. It accepts either
+`--direct host:port[:db]` or `--shards address,address,...`, constructs a
+`RedisConfig`, and reports throughput, error rate, and latency percentiles.
+Fault injection supports delays, resets, and outages. The tool uses the sibling
+`../memory` crate for allocator statistics; it has no service-discovery dependency.
 
-域名的 IPv4 解析变化由 `RedisService`/`brz-net` 独立持续刷新，这与 mesh 注册
-文件的固定语义互不混淆。
+```sh
+cargo run --release --manifest-path tools/redis-bench/Cargo.toml -- \
+  --direct 127.0.0.1:6379 --concurrency 32 --ops 10000 hget
 
-## Transport
+cargo run --release --manifest-path tools/redis-bench/Cargo.toml -- \
+  --shards 127.0.0.1:6379,127.0.0.1:6380 --ops 10000 hmget
+```
 
-- 每个物理节点一个持久、多路复用的 TCP session；
-- 默认请求超时 200ms，可通过 `RedisServiceOptions` 调整；
-- in-flight 容量耗尽时快速失败，不排队等待；
-- 连接错误或超时会关闭 session，由 session 自行重连；
-- 弹性接收 ring buffer 和全局 request arena 由 `brz-net` 统一提供；
-- replica 使用 quota balancer，逻辑 shard 配置构造后保持不变。
+`bench.sh` starts disposable Docker containers using `redis:7` by default;
+`bench_local.sh` uses local `redis-server` processes. Both support `MODE=direct`
+and `MODE=shards`, with `MATRIX=1` selecting the fault-injection matrix. Run these
+against dedicated benchmark instances because workloads write data.
 
-`tools/redis-bench` 同样只构造 `RedisService`。其 allocator 统计依赖共享的
-`../memory`，Redis 仓库不再内嵌 memory submodule。
+## Releases
+
+The GitHub workflows provide CI and manual publishing. Run **Actions → Publish**
+on `main`, leaving `retry_tag` empty to allocate the next `v0.0.x` version. After
+validation, the workflow pushes the version commit and tag atomically and
+publishes using `CARGO_REGISTRY_TOKEN`. Normal pushes do not publish.
+
+If uploading fails after tagging, rerun with the existing tag in `retry_tag`.
+
+## License
+
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

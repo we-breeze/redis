@@ -1,7 +1,7 @@
 //! Workload generation against a pre-generated key/value pool.
 //!
 //! Every mode builds the same [`redis::RedisService`]; only its construction
-//! source (mesh, one endpoint, or an explicit sharded topology) differs.
+//! source (one endpoint or an explicit sharded topology) differs.
 //!
 //! To keep the per-op allocation count honest (so it reflects the *SDK's*
 //! allocations, not the benchmark's), keys and values are pre-generated once

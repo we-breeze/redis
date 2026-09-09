@@ -454,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_supports_application_native_write_commands() {
+    fn builder_supports_native_write_commands() {
         let mut pipe = RedisPipe::with_capacity(5);
         pipe.incr("counter").unwrap();
         pipe.expire("counter", 60).unwrap();

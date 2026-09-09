@@ -527,7 +527,9 @@ where
         ));
     }
     values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             Ok((
                 M::from_redis_value(&pair[0])?,
