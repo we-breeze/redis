@@ -24,3 +24,26 @@ jobs:
       - run: cargo test --locked --features metrics
       - run: cargo test --locked --no-default-features
       - run: cargo test --locked --release --features metrics
+
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: redis/tools/redis-bench
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: redis
+      - uses: actions/checkout@v7
+        with:
+          repository: we-breeze/memory
+          ref: a709f8563c93e21e999e3801ef99178bba01e8dd
+          path: memory
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: bash -n bench.sh bench_local.sh
