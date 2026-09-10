@@ -1,6 +1,6 @@
 [package]
 name = "brz-redis"
-version = "0.1.0"
+version = "0.0.5"
 edition = "2024"
 description = "Asynchronous Redis client with multiplexed connections and client-side sharding"
 license = "MIT OR Apache-2.0"
