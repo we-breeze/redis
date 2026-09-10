@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "brz-redis"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "arc-swap",
  "brz-metrics",
