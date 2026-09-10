@@ -292,12 +292,12 @@ mod tests {
         let target_addr: std::net::SocketAddr = target.parse().unwrap();
         let proxy = start_proxy(target_addr, injector).await.unwrap();
 
-        let client = redis::RedisService::single(proxy.to_string())
+        let client = brz_redis::RedisService::single(proxy.to_string())
             .await
             .unwrap();
-        use redis::Redis;
+        use brz_redis::Redis;
         client.hset("proxy:it", "f", "v").await.unwrap();
-        let value: Option<redis::RedisBytes> = client.hget("proxy:it", "f").await.unwrap();
+        let value: Option<brz_redis::RedisBytes> = client.hget("proxy:it", "f").await.unwrap();
         assert_eq!(value.as_deref(), Some(b"v".as_slice()));
 
         // Concurrent burst: exercises multi-frame reads through the proxy.
@@ -361,7 +361,7 @@ mod tests {
         // Truncated bulk body is incomplete.
         assert_eq!(parse_frame(&frame[..frame.len() - 3]), None);
         // A realistic 10-arg HSET produced by the SDK encoder.
-        let mut cmd = redis::cmd("HSET");
+        let mut cmd = brz_redis::cmd("HSET");
         cmd.arg(&b"\x00\x00\x00\x00\x00\x00\x00\x0ckkkkkkkkkkkkkkkkkkkkkkkk"[..]);
         for f in ["f1", "f2", "f3", "f4"] {
             cmd.arg(f).arg(b"v");
@@ -369,7 +369,7 @@ mod tests {
         let encoded = cmd.encoded();
         assert_eq!(parse_frame(&encoded), Some(encoded.len()));
         // Binary key bytes containing \r\n must not confuse the parser.
-        let mut cmd = redis::cmd("HGET");
+        let mut cmd = brz_redis::cmd("HGET");
         cmd.arg(&b"k\r\nk"[..]).arg("f");
         let encoded = cmd.encoded();
         assert_eq!(parse_frame(&encoded), Some(encoded.len()));

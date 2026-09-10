@@ -44,6 +44,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
+      - name: Refresh the local SDK version in the benchmark lockfile
+        run: cargo update --package brz-redis
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: bash -n bench.sh bench_local.sh

@@ -9,9 +9,9 @@ service-registry directories or depend on a particular configuration service.
 ## Configuration
 
 ```rust,no_run
-use redis::{Redis, RedisBytes, RedisConfig, RedisService, RedisServiceOptions};
+use brz_redis::{Redis, RedisBytes, RedisConfig, RedisService, RedisServiceOptions};
 
-# async fn example() -> redis::RedisResult<()> {
+# async fn example() -> brz_redis::RedisResult<()> {
 let config = RedisConfig::single("127.0.0.1:6379")
     .with_options(RedisServiceOptions::default());
 let service = RedisService::from_config(config).await?;
@@ -46,7 +46,7 @@ Applications can implement `RedisConfigProvider` for asynchronous configuration
 loading:
 
 ```rust,no_run
-use redis::{RedisConfig, RedisConfigFuture, RedisConfigProvider, RedisService};
+use brz_redis::{RedisConfig, RedisConfigFuture, RedisConfigProvider, RedisService};
 
 struct AppConfig {
     endpoint: String,
@@ -58,7 +58,7 @@ impl RedisConfigProvider for AppConfig {
     }
 }
 
-# async fn example() -> redis::RedisResult<()> {
+# async fn example() -> brz_redis::RedisResult<()> {
 let provider = AppConfig { endpoint: "127.0.0.1:6379".into() };
 let service = RedisService::from_provider(&provider).await?;
 # Ok(())
@@ -137,3 +137,14 @@ If uploading fails after tagging, rerun with the existing tag in `retry_tag`.
 ## License
 
 Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+
+## Crate naming
+
+The package name is `brz-redis`; the Rust library name is `brz_redis`.
+Use `brz_redis::...` in Rust code. This replaces the previous `redis`
+library name. Existing explicit dependency aliases remain supported.
+
+```toml
+[dependencies]
+brz-redis = "0.0.6"
+```

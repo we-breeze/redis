@@ -1,6 +1,6 @@
 //! Workload generation against a pre-generated key/value pool.
 //!
-//! Every mode builds the same [`redis::RedisService`]; only its construction
+//! Every mode builds the same [`brz_redis::RedisService`]; only its construction
 //! source (one endpoint or an explicit sharded topology) differs.
 //!
 //! To keep the per-op allocation count honest (so it reflects the *SDK's*
@@ -12,7 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use redis::{Redis, RedisBytes, RedisService, RedisValues};
+use brz_redis::{Redis, RedisBytes, RedisService, RedisValues};
 
 /// A boxed, `Send` future returned by a workload.
 pub type WorkFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
@@ -176,7 +176,8 @@ impl Workload for HgetPing {
     fn run<'a>(&'a self, client: &'a RedisService, op: u64) -> WorkFuture<'a> {
         let key = self.pool.key(op as usize);
         Box::pin(async move {
-            let result: redis::RedisResult<Option<RedisBytes>> = client.hget(key, FIELDS[0]).await;
+            let result: brz_redis::RedisResult<Option<RedisBytes>> =
+                client.hget(key, FIELDS[0]).await;
             match result {
                 Ok(Some(value)) => {
                     let ok = !self.verify || expected_value_matches(FIELDS[0], key, &value);
@@ -205,11 +206,11 @@ impl Workload for HmgetPing {
     fn run<'a>(&'a self, client: &'a RedisService, op: u64) -> WorkFuture<'a> {
         let key = self.pool.key(op as usize);
         Box::pin(async move {
-            let result: redis::RedisResult<RedisValues<RedisBytes>> =
+            let result: brz_redis::RedisResult<RedisValues<RedisBytes>> =
                 client.hmget(key, FIELDS).await;
             match result {
                 Ok(values) => {
-                    let Ok(values) = values.collect::<redis::RedisResult<Vec<_>>>() else {
+                    let Ok(values) = values.collect::<brz_redis::RedisResult<Vec<_>>>() else {
                         return false;
                     };
                     if !self.verify {

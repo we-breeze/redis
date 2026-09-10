@@ -76,7 +76,7 @@ pub type RedisConfigFuture<'a> =
 /// This trait also supports `&dyn RedisConfigProvider`.
 ///
 /// ```
-/// use redis::{RedisConfig, RedisConfigFuture, RedisConfigProvider};
+/// use brz_redis::{RedisConfig, RedisConfigFuture, RedisConfigProvider};
 ///
 /// struct AppConfig { endpoint: String }
 /// impl RedisConfigProvider for AppConfig {

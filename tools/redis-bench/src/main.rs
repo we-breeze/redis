@@ -2,7 +2,7 @@
 //!
 //! Runs a fixed number of operations across `--concurrency` async workers and
 //! reports throughput plus latency percentiles (p50/p95/p99). It drives the
-//! SDK's unified [`redis::RedisService`] in single-endpoint or sharded
+//! SDK's unified [`brz_redis::RedisService`] in single-endpoint or sharded
 //! construction modes.
 //!
 //! Usage:
@@ -19,12 +19,12 @@ mod stats;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use brz_redis::{
+    Redis, RedisConfig, RedisService, RedisServiceOptions, RedisShardConfig, ShardRouting,
+};
 use clap::Parser;
 use driver::{Workload, WorkloadKind};
 use fault::FaultInjector;
-use redis::{
-    Redis, RedisConfig, RedisService, RedisServiceOptions, RedisShardConfig, ShardRouting,
-};
 use stats::{MemoryWindow, OpBudget, Summary, WorkerStats};
 
 // Install mimalloc (with per-request heap accounting under the `memory-stats`
@@ -603,11 +603,11 @@ async fn verify_seeds(client: &Arc<RedisService>, pool: &Arc<driver::Pool>) -> R
                     break;
                 }
                 let key = pool.key(i);
-                let result: redis::RedisResult<redis::RedisValues<redis::RedisBytes>> =
+                let result: brz_redis::RedisResult<brz_redis::RedisValues<brz_redis::RedisBytes>> =
                     client.hmget(key, driver::FIELDS).await;
                 match result {
                     Ok(values) => {
-                        let values = values.collect::<redis::RedisResult<Vec<_>>>();
+                        let values = values.collect::<brz_redis::RedisResult<Vec<_>>>();
                         let valid = values.as_ref().is_ok_and(|values| {
                             values.len() == driver::FIELDS.len()
                                 && values

@@ -5,9 +5,9 @@ use runtime::runtime_test;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use brz_redis::resp::parser::{ParseResult, parse_reply};
+use brz_redis::{Redis, RedisService, RedisServiceOptions, Value};
 use bytes::{Buf, BytesMut};
-use redis::resp::parser::{ParseResult, parse_reply};
-use redis::{Redis, RedisService, RedisServiceOptions, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;

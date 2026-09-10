@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use redis::{Redis, RedisPipe, RedisService, SetExpiration, SetOptions};
+use brz_redis::{Redis, RedisPipe, RedisService, SetExpiration, SetOptions};
 
 fn endpoint() -> Option<String> {
     std::env::var("BREEZE_REDIS_TEST_ENDPOINT")

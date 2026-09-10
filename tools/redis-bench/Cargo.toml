@@ -18,7 +18,7 @@ default = ["memory-stats"]
 memory-stats = ["brz-mem/heap-stats"]
 
 [dependencies]
-redis = { path = "../..", package = "brz-redis"}
+brz-redis = { path = "../..", package = "brz-redis"}
 brz-mem = { package = "brz-memory", path = "../../../memory", default-features = false }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
