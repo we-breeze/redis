@@ -88,7 +88,7 @@ impl FakeRedis {
                                                         );
                                                     }
                                                 }
-                                                "SET" | "AUTH" | "SELECT" => responses.extend_from_slice(b"+OK\r\n"),
+                                                "SET" | "SETEX" | "AUTH" | "SELECT" => responses.extend_from_slice(b"+OK\r\n"),
                                                 "PING" => responses.extend_from_slice(b"+PONG\r\n"),
                                                 _ => responses.extend_from_slice(b":1\r\n"),
                                             }
@@ -487,6 +487,12 @@ async fn added_native_commands_use_declared_reader_and_writer_roles() {
         .await
         .unwrap();
 
+    Redis::set_ex(&redis, "cached", 300, "value").await.unwrap();
+    assert!(Redis::sismember(&redis, "grey:uids", "42").await.unwrap());
+    assert!(master.saw("SETEX"));
+    assert!(!slave.saw("SETEX"));
+    assert!(slave.saw("SISMEMBER"));
+    assert!(!master.saw("SISMEMBER"));
     assert_eq!(Redis::incr(&redis, "counter").await.unwrap(), 1);
     assert_eq!(
         Redis::pfcount(&redis, ["metric:a", "metric:b"])

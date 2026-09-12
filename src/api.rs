@@ -1,5 +1,7 @@
 //! Application-facing typed Redis contract.
 
+use std::future::Future;
+
 use crate::{
     Cmd, EncodeRedisArg, EncodeRedisArgs, ErrorKind, FromRedisBulk, FromRedisValue, PipeResponse,
     RedisError, RedisPipe, RedisResult, RedisValues, Value, cmd,
@@ -69,8 +71,8 @@ impl SetOptions {
 /// The typed Redis contract consumed by application code.
 ///
 /// Keys, fields, values, and bulk responses remain application-defined types;
-/// the SDK only requires their encoding or decoding traits.
-#[allow(async_fn_in_trait)]
+/// the SDK only requires their encoding or decoding traits. All command futures
+/// are `Send`, including when called through a generic `R: Redis`.
 pub trait Redis: Send + Sync {
     /// Executes one RESP command, routing by its first argument after the
     /// command name when present.
@@ -78,12 +80,14 @@ pub trait Redis: Send + Sync {
     /// [`Cmd::is_readonly`] decides whether the service uses its reader or
     /// writer side. This is the protocol escape hatch used by the typed command
     /// methods; it does not add retry, locking, caching, or queue semantics.
-    async fn command<R>(&self, command: Cmd) -> RedisResult<R>
+    fn command<R>(&self, command: Cmd) -> impl Future<Output = RedisResult<R>> + Send
     where
         R: FromRedisValue + Send,
     {
-        let _ = command;
-        Err(unsupported("arbitrary commands"))
+        async move {
+            let _ = command;
+            Err(unsupported("arbitrary commands"))
+        }
     }
 
     /// Submit a finite ordered pipeline.
@@ -92,36 +96,62 @@ pub trait Redis: Send + Sync {
     /// through [`PipeResponse::take`]. Implementations that cannot guarantee
     /// correct cross-shard admission and failure semantics must reject a
     /// pipeline on a multi-shard topology before sending any command.
-    async fn pipe(&self, pipe: RedisPipe) -> RedisResult<PipeResponse> {
-        let _ = pipe;
-        Err(RedisError::new(
-            ErrorKind::ClientError,
-            "this Redis implementation does not support pipelines",
-        ))
+    fn pipe(&self, pipe: RedisPipe) -> impl Future<Output = RedisResult<PipeResponse>> + Send {
+        async move {
+            let _ = pipe;
+            Err(RedisError::new(
+                ErrorKind::ClientError,
+                "this Redis implementation does not support pipelines",
+            ))
+        }
     }
 
     /// `GET key`; a missing key is `Ok(None)`.
-    async fn get<K, R>(&self, key: K) -> RedisResult<Option<R>>
+    fn get<K, R>(&self, key: K) -> impl Future<Output = RedisResult<Option<R>>> + Send
     where
         K: EncodeRedisArg + Send,
         R: FromRedisBulk + Send;
 
     /// `SET key value`; both arguments are encoded directly into the command.
-    async fn set<K, V>(&self, key: K, value: V) -> RedisResult<()>
+    fn set<K, V>(&self, key: K, value: V) -> impl Future<Output = RedisResult<()>> + Send
     where
         K: EncodeRedisArg + Send,
         V: EncodeRedisArg + Send;
 
+    /// `SETEX key seconds value`; preserves the SETEX wire command.
+    fn set_ex<K, V>(
+        &self,
+        key: K,
+        seconds: u64,
+        value: V,
+    ) -> impl Future<Output = RedisResult<()>> + Send
+    where
+        K: EncodeRedisArg + Send,
+        V: EncodeRedisArg + Send,
+    {
+        async move {
+            let mut command = cmd("SETEX");
+            command
+                .arg_encoded(&key)?
+                .arg_encoded(seconds)?
+                .arg_encoded(value)?;
+            let response: String = self.command(command).await?;
+            status_ok("SETEX", response)
+        }
+    }
+
     /// `PING`; validates that Redis returns `PONG`.
-    async fn ping(&self) -> RedisResult<()> {
-        let response: String = self.command(readonly_command("PING")).await?;
-        if response == "PONG" {
-            Ok(())
-        } else {
-            Err(RedisError::new(
-                ErrorKind::TypeError,
-                format!("expected Redis PONG response, received {response:?}"),
-            ))
+    fn ping(&self) -> impl Future<Output = RedisResult<()>> + Send {
+        async move {
+            let response: String = self.command(readonly_command("PING")).await?;
+            if response == "PONG" {
+                Ok(())
+            } else {
+                Err(RedisError::new(
+                    ErrorKind::TypeError,
+                    format!("expected Redis PONG response, received {response:?}"),
+                ))
+            }
         }
     }
 
@@ -129,7 +159,7 @@ pub trait Redis: Send + Sync {
     ///
     /// The service derives routing from every key. Cross-shard inputs are
     /// fanned out internally and restored to input order.
-    async fn mget<K, R>(&self, keys: K) -> RedisResult<Vec<Option<R>>>
+    fn mget<K, R>(&self, keys: K) -> impl Future<Output = RedisResult<Vec<Option<R>>>> + Send
     where
         K: EncodeRedisArgs + Send,
         R: FromRedisBulk + Send;
@@ -137,325 +167,425 @@ pub trait Redis: Send + Sync {
     /// `SET key value [EX seconds|PX milliseconds] [NX|XX]`.
     ///
     /// Returns `false` when a conditional write is not performed.
-    async fn set_with<K, V>(&self, key: K, value: V, options: SetOptions) -> RedisResult<bool>
+    fn set_with<K, V>(
+        &self,
+        key: K,
+        value: V,
+        options: SetOptions,
+    ) -> impl Future<Output = RedisResult<bool>> + Send
     where
         K: EncodeRedisArg + Send,
         V: EncodeRedisArg + Send,
     {
-        let mut command = cmd("SET");
-        command.arg_encoded(&key)?.arg_encoded(value)?;
-        options.encode(&mut command)?;
-        self.command(command).await
+        async move {
+            let mut command = cmd("SET");
+            command.arg_encoded(&key)?.arg_encoded(value)?;
+            options.encode(&mut command)?;
+            self.command(command).await
+        }
     }
 
     /// `DEL key`.
-    async fn del<K>(&self, key: K) -> RedisResult<i64>
+    fn del<K>(&self, key: K) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArg + Send,
     {
-        integer_key_command(self, "DEL", key).await
+        async move { integer_key_command(self, "DEL", key).await }
     }
 
     /// `DEL key [key ...]`, fanned out transparently across shards.
     ///
     /// Cross-shard deletion is not atomic. If one shard fails, deletions that
     /// already succeeded on other shards are not rolled back.
-    async fn del_many<K>(&self, keys: K) -> RedisResult<i64>
+    fn del_many<K>(&self, keys: K) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArgs + Send;
 
     /// `EXISTS key`.
-    async fn exists<K>(&self, key: K) -> RedisResult<bool>
+    fn exists<K>(&self, key: K) -> impl Future<Output = RedisResult<bool>> + Send
     where
         K: EncodeRedisArg + Send,
     {
-        let mut command = readonly_command("EXISTS");
-        command.arg_encoded(&key)?;
-        self.command(command).await
+        async move {
+            let mut command = readonly_command("EXISTS");
+            command.arg_encoded(&key)?;
+            self.command(command).await
+        }
     }
 
     /// `EXPIRE key seconds`.
-    async fn expire<K>(&self, key: K, seconds: u64) -> RedisResult<bool>
+    fn expire<K>(&self, key: K, seconds: u64) -> impl Future<Output = RedisResult<bool>> + Send
     where
         K: EncodeRedisArg + Send,
     {
-        let mut command = cmd("EXPIRE");
-        command.arg_encoded(&key)?.arg_encoded(seconds)?;
-        self.command(command).await
+        async move {
+            let mut command = cmd("EXPIRE");
+            command.arg_encoded(&key)?.arg_encoded(seconds)?;
+            self.command(command).await
+        }
     }
 
     /// `INCR key`.
-    async fn incr<K>(&self, key: K) -> RedisResult<i64>
+    fn incr<K>(&self, key: K) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArg + Send,
     {
-        integer_key_command(self, "INCR", key).await
+        async move { integer_key_command(self, "INCR", key).await }
     }
 
     /// `APPEND key value`.
-    async fn append<K, V>(&self, key: K, value: V) -> RedisResult<i64>
+    fn append<K, V>(&self, key: K, value: V) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArg + Send,
         V: EncodeRedisArg + Send,
     {
-        let mut command = cmd("APPEND");
-        command.arg_encoded(&key)?.arg_encoded(value)?;
-        self.command(command).await
+        async move {
+            let mut command = cmd("APPEND");
+            command.arg_encoded(&key)?.arg_encoded(value)?;
+            self.command(command).await
+        }
     }
 
     /// `EVAL script numkeys key [key ...] arg [arg ...]`.
-    async fn eval<S, K, A, R>(&self, script: S, keys: K, arguments: A) -> RedisResult<R>
+    fn eval<S, K, A, R>(
+        &self,
+        script: S,
+        keys: K,
+        arguments: A,
+    ) -> impl Future<Output = RedisResult<R>> + Send
     where
         S: EncodeRedisArg + Send,
         K: EncodeRedisArgs + Send,
         A: EncodeRedisArgs + Send,
         R: FromRedisValue + Send,
     {
-        let _ = (script, keys, arguments);
-        Err(unsupported("EVAL"))
+        async move {
+            let _ = (script, keys, arguments);
+            Err(unsupported("EVAL"))
+        }
     }
 
     /// `EVALSHA digest numkeys key [key ...] arg [arg ...]`.
-    async fn evalsha<D, K, A, R>(&self, digest: D, keys: K, arguments: A) -> RedisResult<R>
+    fn evalsha<D, K, A, R>(
+        &self,
+        digest: D,
+        keys: K,
+        arguments: A,
+    ) -> impl Future<Output = RedisResult<R>> + Send
     where
         D: EncodeRedisArg + Send,
         K: EncodeRedisArgs + Send,
         A: EncodeRedisArgs + Send,
         R: FromRedisValue + Send,
     {
-        let _ = (digest, keys, arguments);
-        Err(unsupported("EVALSHA"))
+        async move {
+            let _ = (digest, keys, arguments);
+            Err(unsupported("EVALSHA"))
+        }
     }
 
     /// `RPUSH key value [value ...]`.
-    async fn rpush<K, V>(&self, key: K, values: V) -> RedisResult<i64>
+    fn rpush<K, V>(&self, key: K, values: V) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArg + Send,
         V: EncodeRedisArgs + Send,
     {
-        let mut command = cmd("RPUSH");
-        command.arg_encoded(&key)?;
-        values.encode_args(&mut command)?;
-        self.command(command).await
+        async move {
+            let mut command = cmd("RPUSH");
+            command.arg_encoded(&key)?;
+            values.encode_args(&mut command)?;
+            self.command(command).await
+        }
     }
 
     /// `LPOP key`; a missing key is `Ok(None)`.
-    async fn lpop<K, R>(&self, key: K) -> RedisResult<Option<R>>
+    fn lpop<K, R>(&self, key: K) -> impl Future<Output = RedisResult<Option<R>>> + Send
     where
         K: EncodeRedisArg + Send,
         R: FromRedisValue + Send,
     {
-        let mut command = cmd("LPOP");
-        command.arg_encoded(&key)?;
-        self.command(command).await
+        async move {
+            let mut command = cmd("LPOP");
+            command.arg_encoded(&key)?;
+            self.command(command).await
+        }
     }
 
     /// `LRANGE key start stop`.
-    async fn lrange<K, R>(&self, key: K, start: i64, stop: i64) -> RedisResult<Vec<R>>
+    fn lrange<K, R>(
+        &self,
+        key: K,
+        start: i64,
+        stop: i64,
+    ) -> impl Future<Output = RedisResult<Vec<R>>> + Send
     where
         K: EncodeRedisArg + Send,
         R: FromRedisValue + Send,
     {
-        let mut command = readonly_command("LRANGE");
-        command
-            .arg_encoded(&key)?
-            .arg_encoded(start)?
-            .arg_encoded(stop)?;
-        self.command(command).await
+        async move {
+            let mut command = readonly_command("LRANGE");
+            command
+                .arg_encoded(&key)?
+                .arg_encoded(start)?
+                .arg_encoded(stop)?;
+            self.command(command).await
+        }
     }
 
     /// `LSET key index value`.
-    async fn lset<K, V>(&self, key: K, index: i64, value: V) -> RedisResult<()>
+    fn lset<K, V>(
+        &self,
+        key: K,
+        index: i64,
+        value: V,
+    ) -> impl Future<Output = RedisResult<()>> + Send
     where
         K: EncodeRedisArg + Send,
         V: EncodeRedisArg + Send,
     {
-        let mut command = cmd("LSET");
-        command
-            .arg_encoded(&key)?
-            .arg_encoded(index)?
-            .arg_encoded(value)?;
-        let response: String = self.command(command).await?;
-        status_ok("LSET", response)
+        async move {
+            let mut command = cmd("LSET");
+            command
+                .arg_encoded(&key)?
+                .arg_encoded(index)?
+                .arg_encoded(value)?;
+            let response: String = self.command(command).await?;
+            status_ok("LSET", response)
+        }
     }
 
     /// `SADD key member [member ...]`.
-    async fn sadd<K, M>(&self, key: K, members: M) -> RedisResult<i64>
+    fn sadd<K, M>(&self, key: K, members: M) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArg + Send,
         M: EncodeRedisArgs + Send,
     {
-        integer_key_args_command(self, "SADD", key, members).await
+        async move { integer_key_args_command(self, "SADD", key, members).await }
     }
 
     /// `SREM key member [member ...]`.
-    async fn srem<K, M>(&self, key: K, members: M) -> RedisResult<i64>
+    fn srem<K, M>(&self, key: K, members: M) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArg + Send,
         M: EncodeRedisArgs + Send,
     {
-        integer_key_args_command(self, "SREM", key, members).await
+        async move { integer_key_args_command(self, "SREM", key, members).await }
+    }
+
+    /// `SISMEMBER key member`; returns whether the member belongs to the set.
+    fn sismember<K, M>(&self, key: K, member: M) -> impl Future<Output = RedisResult<bool>> + Send
+    where
+        K: EncodeRedisArg + Send,
+        M: EncodeRedisArg + Send,
+    {
+        async move {
+            let mut command = readonly_command("SISMEMBER");
+            command.arg_encoded(&key)?.arg_encoded(member)?;
+            self.command(command).await
+        }
     }
 
     /// `SMEMBERS key`.
-    async fn smembers<K, R>(&self, key: K) -> RedisResult<Vec<R>>
+    fn smembers<K, R>(&self, key: K) -> impl Future<Output = RedisResult<Vec<R>>> + Send
     where
         K: EncodeRedisArg + Send,
         R: FromRedisValue + Send,
     {
-        array_key_command(self, "SMEMBERS", key).await
+        async move { array_key_command(self, "SMEMBERS", key).await }
     }
 
     /// `HKEYS key`.
-    async fn hkeys<K, R>(&self, key: K) -> RedisResult<Vec<R>>
+    fn hkeys<K, R>(&self, key: K) -> impl Future<Output = RedisResult<Vec<R>>> + Send
     where
         K: EncodeRedisArg + Send,
         R: FromRedisValue + Send,
     {
-        array_key_command(self, "HKEYS", key).await
+        async move { array_key_command(self, "HKEYS", key).await }
     }
 
     /// `HGETALL key`, decoded through [`FromRedisValue`].
-    async fn hgetall<K, R>(&self, key: K) -> RedisResult<R>
+    fn hgetall<K, R>(&self, key: K) -> impl Future<Output = RedisResult<R>> + Send
     where
         K: EncodeRedisArg + Send,
         R: FromRedisValue + Send,
     {
-        value_key_command(self, "HGETALL", key).await
+        async move { value_key_command(self, "HGETALL", key).await }
     }
 
     /// `ZADD key score member`.
-    async fn zadd<K, S, M>(&self, key: K, score: S, member: M) -> RedisResult<i64>
+    fn zadd<K, S, M>(
+        &self,
+        key: K,
+        score: S,
+        member: M,
+    ) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArg + Send,
         S: EncodeRedisArg + Send,
         M: EncodeRedisArg + Send,
     {
-        let mut command = cmd("ZADD");
-        command
-            .arg_encoded(&key)?
-            .arg_encoded(score)?
-            .arg_encoded(member)?;
-        self.command(command).await
+        async move {
+            let mut command = cmd("ZADD");
+            command
+                .arg_encoded(&key)?
+                .arg_encoded(score)?
+                .arg_encoded(member)?;
+            self.command(command).await
+        }
     }
 
     /// `ZREM key member [member ...]`.
-    async fn zrem<K, M>(&self, key: K, members: M) -> RedisResult<i64>
+    fn zrem<K, M>(&self, key: K, members: M) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArg + Send,
         M: EncodeRedisArgs + Send,
     {
-        integer_key_args_command(self, "ZREM", key, members).await
+        async move { integer_key_args_command(self, "ZREM", key, members).await }
     }
 
     /// `ZREMRANGEBYSCORE key min max`.
-    async fn zremrangebyscore<K, Min, Max>(&self, key: K, min: Min, max: Max) -> RedisResult<i64>
+    fn zremrangebyscore<K, Min, Max>(
+        &self,
+        key: K,
+        min: Min,
+        max: Max,
+    ) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArg + Send,
         Min: EncodeRedisArg + Send,
         Max: EncodeRedisArg + Send,
     {
-        let mut command = cmd("ZREMRANGEBYSCORE");
-        command
-            .arg_encoded(&key)?
-            .arg_encoded(min)?
-            .arg_encoded(max)?;
-        self.command(command).await
+        async move {
+            let mut command = cmd("ZREMRANGEBYSCORE");
+            command
+                .arg_encoded(&key)?
+                .arg_encoded(min)?
+                .arg_encoded(max)?;
+            self.command(command).await
+        }
     }
 
     /// `ZREVRANGE key start stop`.
-    async fn zrevrange<K, R>(&self, key: K, start: i64, stop: i64) -> RedisResult<Vec<R>>
-    where
-        K: EncodeRedisArg + Send,
-        R: FromRedisValue + Send,
-    {
-        let mut command = readonly_command("ZREVRANGE");
-        command
-            .arg_encoded(&key)?
-            .arg_encoded(start)?
-            .arg_encoded(stop)?;
-        self.command(command).await
-    }
-
-    /// `ZREVRANGE key start stop WITHSCORES` as `(member, score)` pairs.
-    async fn zrevrange_with_scores<K, M, S>(
+    fn zrevrange<K, R>(
         &self,
         key: K,
         start: i64,
         stop: i64,
-    ) -> RedisResult<Vec<(M, S)>>
+    ) -> impl Future<Output = RedisResult<Vec<R>>> + Send
+    where
+        K: EncodeRedisArg + Send,
+        R: FromRedisValue + Send,
+    {
+        async move {
+            let mut command = readonly_command("ZREVRANGE");
+            command
+                .arg_encoded(&key)?
+                .arg_encoded(start)?
+                .arg_encoded(stop)?;
+            self.command(command).await
+        }
+    }
+
+    /// `ZREVRANGE key start stop WITHSCORES` as `(member, score)` pairs.
+    fn zrevrange_with_scores<K, M, S>(
+        &self,
+        key: K,
+        start: i64,
+        stop: i64,
+    ) -> impl Future<Output = RedisResult<Vec<(M, S)>>> + Send
     where
         K: EncodeRedisArg + Send,
         M: FromRedisValue + Send,
         S: FromRedisValue + Send,
     {
-        let mut command = readonly_command("ZREVRANGE");
-        command
-            .arg_encoded(&key)?
-            .arg_encoded(start)?
-            .arg_encoded(stop)?
-            .arg_encoded("WITHSCORES")?;
-        let response: Value = self.command(command).await?;
-        alternating_pairs(&response)
+        async move {
+            let mut command = readonly_command("ZREVRANGE");
+            command
+                .arg_encoded(&key)?
+                .arg_encoded(start)?
+                .arg_encoded(stop)?
+                .arg_encoded("WITHSCORES")?;
+            let response: Value = self.command(command).await?;
+            alternating_pairs(&response)
+        }
     }
 
     /// `PFADD key element [element ...]`.
-    async fn pfadd<K, E>(&self, key: K, elements: E) -> RedisResult<bool>
+    fn pfadd<K, E>(&self, key: K, elements: E) -> impl Future<Output = RedisResult<bool>> + Send
     where
         K: EncodeRedisArg + Send,
         E: EncodeRedisArgs + Send,
     {
-        let mut command = cmd("PFADD");
-        command.arg_encoded(&key)?;
-        elements.encode_args(&mut command)?;
-        self.command(command).await
+        async move {
+            let mut command = cmd("PFADD");
+            command.arg_encoded(&key)?;
+            elements.encode_args(&mut command)?;
+            self.command(command).await
+        }
     }
 
     /// `PFCOUNT key [key ...]`.
     ///
     /// Multiple keys must resolve to one shard because Redis computes the
     /// cardinality of their union; per-shard counts cannot be added safely.
-    async fn pfcount<K>(&self, keys: K) -> RedisResult<i64>
+    fn pfcount<K>(&self, keys: K) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArgs + Send;
 
     /// `PUBLISH channel message`.
-    async fn publish<C, M>(&self, channel: C, message: M) -> RedisResult<i64>
+    fn publish<C, M>(&self, channel: C, message: M) -> impl Future<Output = RedisResult<i64>> + Send
     where
         C: EncodeRedisArg + Send,
         M: EncodeRedisArg + Send,
     {
-        let mut command = cmd("PUBLISH");
-        command.arg_encoded(&channel)?.arg_encoded(message)?;
-        self.command(command).await
+        async move {
+            let mut command = cmd("PUBLISH");
+            command.arg_encoded(&channel)?.arg_encoded(message)?;
+            self.command(command).await
+        }
     }
 
     /// `HGET key field`; a missing key or field is `Ok(None)`.
-    async fn hget<K, F, R>(&self, key: K, field: F) -> RedisResult<Option<R>>
+    fn hget<K, F, R>(
+        &self,
+        key: K,
+        field: F,
+    ) -> impl Future<Output = RedisResult<Option<R>>> + Send
     where
         K: EncodeRedisArg + Send,
         F: EncodeRedisArg + Send,
         R: FromRedisBulk + Send;
 
     /// `HSET key field value`; returns the number of newly added fields.
-    async fn hset<K, F, V>(&self, key: K, field: F, value: V) -> RedisResult<i64>
+    fn hset<K, F, V>(
+        &self,
+        key: K,
+        field: F,
+        value: V,
+    ) -> impl Future<Output = RedisResult<i64>> + Send
     where
         K: EncodeRedisArg + Send,
         F: EncodeRedisArg + Send,
         V: EncodeRedisArg + Send,
     {
-        let _ = (key, field, value);
-        Err(RedisError::new(
-            ErrorKind::ClientError,
-            "this Redis implementation does not support HSET",
-        ))
+        async move {
+            let _ = (key, field, value);
+            Err(RedisError::new(
+                ErrorKind::ClientError,
+                "this Redis implementation does not support HSET",
+            ))
+        }
     }
 
     /// `HMGET key field [field ...]` in input order.
     ///
     /// Missing fields remain `None`, so the returned iterator has the same
     /// length and ordering as `fields` when Redis returns a valid response.
-    async fn hmget<K, F, R>(&self, key: K, fields: F) -> RedisResult<RedisValues<R>>
+    fn hmget<K, F, R>(
+        &self,
+        key: K,
+        fields: F,
+    ) -> impl Future<Output = RedisResult<RedisValues<R>>> + Send
     where
         K: EncodeRedisArg + Send,
         F: EncodeRedisArgs + Send,
@@ -566,3 +696,6 @@ where
     arguments.encode_args(&mut command)?;
     service.command(command).await
 }
+
+#[cfg(test)]
+mod tests;
