@@ -74,7 +74,9 @@ continue to refresh through DNS.
 
 The `Redis` trait provides string, hash, list, set, sorted-set, HyperLogLog,
 expiration, scripting, and publish commands. Use `Cmd` and `Redis::command` for
-additional commands. `RedisPipe` supports typed results for a single-shard
+additional commands. Typed `set_ex` sends `SETEX key seconds value`, and
+`sismember` sends a read-only `SISMEMBER key member`. Command futures are `Send`
+for generic `R: Redis` consumers. `RedisPipe` supports typed results for a single-shard
 pipeline; multi-shard pipelines are rejected before sending.
 
 One physical node owns one persistent multiplexed session. Admission fails fast
