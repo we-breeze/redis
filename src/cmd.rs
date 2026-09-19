@@ -51,6 +51,27 @@ pub fn cmd(name: &str) -> Cmd {
 }
 
 impl Cmd {
+    #[cfg(feature = "slow-log")]
+    pub(crate) fn slow_log_detail(&self) -> String {
+        const MAX_DETAIL_BYTES: usize = 2 * 1024;
+
+        let mut bytes = Vec::with_capacity(self.buf.len().min(MAX_DETAIL_BYTES));
+        for index in 0..self.arg_count() {
+            if !bytes.is_empty() && bytes.len() < MAX_DETAIL_BYTES {
+                bytes.push(b' ');
+            }
+            let argument = self
+                .arg_at(index)
+                .expect("command argument index is within arg_count");
+            let remaining = MAX_DETAIL_BYTES.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&argument[..argument.len().min(remaining)]);
+            if bytes.len() == MAX_DETAIL_BYTES {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     /// An empty command with no name yet.
     pub fn new() -> Self {
         Cmd {
@@ -222,5 +243,14 @@ mod tests {
         let mut c = cmd("DEL");
         c.arg(vec!["a", "b", "c"]);
         assert_eq!(c.arg_count(), 4);
+    }
+
+    #[cfg(feature = "slow-log")]
+    #[test]
+    fn slow_log_detail_is_capped() {
+        let mut command = cmd("SET");
+        command.arg("key").arg(vec![b'x'; 4_096]);
+        assert!(command.slow_log_detail().len() <= 2 * 1024);
+        assert!(command.slow_log_detail().starts_with("SET key "));
     }
 }

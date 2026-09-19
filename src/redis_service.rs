@@ -434,7 +434,13 @@ impl RedisService {
         Ok(service)
     }
 
-    async fn execute<H, F>(&self, key: &H, readonly: bool, build: F) -> RedisResult<RedisResponse>
+    async fn execute<H, F>(
+        &self,
+        key: &H,
+        readonly: bool,
+        detail: impl Into<std::borrow::Cow<'static, str>>,
+        build: F,
+    ) -> RedisResult<RedisResponse>
     where
         H: EncodeRedisArg + ?Sized,
         F: FnMut(&EphemeralBytesArena) -> RedisRequest,
@@ -450,13 +456,21 @@ impl RedisService {
             topology.shards.get(key.as_ref()).map_err(map_net_error)?
         };
 
-        self.execute_on_shard(shard, readonly, build).await
+        #[cfg(feature = "slow-log")]
+        let observation = crate::slow_log::Observation::new(readonly, detail);
+        #[cfg(not(feature = "slow-log"))]
+        let _ = detail;
+        let result = self.execute_on_shard(shard, readonly, build).await;
+        #[cfg(feature = "slow-log")]
+        observation.finish(result.is_ok());
+        result
     }
 
     async fn execute_for_keys<K, F>(
         &self,
         keys: &K,
         readonly: bool,
+        detail: impl Into<std::borrow::Cow<'static, str>>,
         build: F,
     ) -> RedisResult<RedisResponse>
     where
@@ -473,7 +487,14 @@ impl RedisService {
                 ));
             }
         };
-        self.execute_on_shard(shard, readonly, build).await
+        #[cfg(feature = "slow-log")]
+        let observation = crate::slow_log::Observation::new(readonly, detail);
+        #[cfg(not(feature = "slow-log"))]
+        let _ = detail;
+        let result = self.execute_on_shard(shard, readonly, build).await;
+        #[cfg(feature = "slow-log")]
+        observation.finish(result.is_ok());
+        result
     }
 
     async fn execute_on_shard<F>(
@@ -532,7 +553,7 @@ impl RedisService {
         A: EncodeRedisArgs + ?Sized,
     {
         let response = if keys.num_args() == 0 {
-            self.execute(&"", false, |arena| {
+            self.execute(&"", false, command, |arena| {
                 RedisRequest::encode(
                     arena,
                     &ScriptArgs {
@@ -546,7 +567,7 @@ impl RedisService {
             })
             .await?
         } else {
-            self.execute_for_keys(keys, false, |arena| {
+            self.execute_for_keys(keys, false, command, |arena| {
                 RedisRequest::encode(
                     arena,
                     &ScriptArgs {
@@ -701,8 +722,12 @@ impl Redis for RedisService {
         }
         let readonly = command.is_readonly();
         let key = command.arg_at(1).unwrap_or_default();
+        #[cfg(feature = "slow-log")]
+        let detail = command.slow_log_detail();
+        #[cfg(not(feature = "slow-log"))]
+        let detail = "";
         let value = self
-            .execute(key, readonly, |arena| {
+            .execute(key, readonly, detail, |arena| {
                 RedisRequest::encode(arena, &command, RedisResponseKind::Value)
             })
             .await?
@@ -719,7 +744,7 @@ impl Redis for RedisService {
         K: EncodeRedisArg + Send,
         R: FromRedisBulk + Send,
     {
-        self.execute(&key, true, |arena| {
+        self.execute(&key, true, "GET", |arena| {
             RedisRequest::encode(arena, &("GET", &key), RedisResponseKind::Bulk)
         })
         .await?
@@ -733,7 +758,7 @@ impl Redis for RedisService {
         K: EncodeRedisArg + Send,
         V: EncodeRedisArg + Send,
     {
-        self.execute(&key, false, |arena| {
+        self.execute(&key, false, "SET", |arena| {
             RedisRequest::encode(arena, &("SET", &key, &value), RedisResponseKind::Unit)
         })
         .await?
@@ -745,80 +770,96 @@ impl Redis for RedisService {
         K: EncodeRedisArgs + Send,
         R: FromRedisBulk + Send,
     {
-        let expected = keys.num_args();
-        let topology = self.inner.topology.load_full();
-        match classify_keys(&topology.shards, &keys)? {
-            KeyRoute::Single(shard) => {
-                let values = self
-                    .execute_on_shard(shard, true, |arena| {
-                        RedisRequest::encode(
-                            arena,
-                            &KeyListArgs::new("MGET", &keys),
-                            RedisResponseKind::MultiBulk { expected },
-                        )
-                    })
-                    .await?
-                    .into_multi_bulk::<R>()?;
-                values.collect()
-            }
-            KeyRoute::Multiple => {
-                let groups = group_keys(&topology.shards, "MGET", &keys)?;
-                let responses = try_join_all(groups.iter().map(|group| {
-                    self.execute_on_shard(group.target, true, |arena| {
-                        RedisRequest::encode(
-                            arena,
-                            &group.command,
-                            RedisResponseKind::MultiBulk {
-                                expected: group.positions.len(),
-                            },
-                        )
-                    })
-                }))
-                .await?;
-                let mut output = Vec::with_capacity(expected);
-                output.resize_with(expected, || None);
-                for (group, response) in groups.iter().zip(responses) {
-                    let values = response.into_multi_bulk::<R>()?;
-                    for (&position, value) in group.positions.iter().zip(values) {
-                        output[position] = value?;
-                    }
+        #[cfg(feature = "slow-log")]
+        let observation = crate::slow_log::Observation::new(true, "MGET");
+        let result = async {
+            let expected = keys.num_args();
+            let topology = self.inner.topology.load_full();
+            match classify_keys(&topology.shards, &keys)? {
+                KeyRoute::Single(shard) => {
+                    let values = self
+                        .execute_on_shard(shard, true, |arena| {
+                            RedisRequest::encode(
+                                arena,
+                                &KeyListArgs::new("MGET", &keys),
+                                RedisResponseKind::MultiBulk { expected },
+                            )
+                        })
+                        .await?
+                        .into_multi_bulk::<R>()?;
+                    values.collect()
                 }
-                Ok(output)
+                KeyRoute::Multiple => {
+                    let groups = group_keys(&topology.shards, "MGET", &keys)?;
+                    let responses = try_join_all(groups.iter().map(|group| {
+                        self.execute_on_shard(group.target, true, |arena| {
+                            RedisRequest::encode(
+                                arena,
+                                &group.command,
+                                RedisResponseKind::MultiBulk {
+                                    expected: group.positions.len(),
+                                },
+                            )
+                        })
+                    }))
+                    .await?;
+                    let mut output = Vec::with_capacity(expected);
+                    output.resize_with(expected, || None);
+                    for (group, response) in groups.iter().zip(responses) {
+                        let values = response.into_multi_bulk::<R>()?;
+                        for (&position, value) in group.positions.iter().zip(values) {
+                            output[position] = value?;
+                        }
+                    }
+                    Ok(output)
+                }
             }
         }
+        .await;
+        #[cfg(feature = "slow-log")]
+        observation.finish(result.is_ok());
+        result
     }
 
     async fn del_many<K>(&self, keys: K) -> RedisResult<i64>
     where
         K: EncodeRedisArgs + Send,
     {
-        let topology = self.inner.topology.load_full();
-        match classify_keys(&topology.shards, &keys)? {
-            KeyRoute::Single(shard) => self
-                .execute_on_shard(shard, false, |arena| {
-                    RedisRequest::encode(
-                        arena,
-                        &KeyListArgs::new("DEL", &keys),
-                        RedisResponseKind::Integer,
-                    )
-                })
-                .await?
-                .into_integer(),
-            KeyRoute::Multiple => {
-                let groups = group_keys(&topology.shards, "DEL", &keys)?;
-                let responses = try_join_all(groups.iter().map(|group| {
-                    self.execute_on_shard(group.target, false, |arena| {
-                        RedisRequest::encode(arena, &group.command, RedisResponseKind::Integer)
+        #[cfg(feature = "slow-log")]
+        let observation = crate::slow_log::Observation::new(false, "DEL");
+        let result = async {
+            let topology = self.inner.topology.load_full();
+            match classify_keys(&topology.shards, &keys)? {
+                KeyRoute::Single(shard) => self
+                    .execute_on_shard(shard, false, |arena| {
+                        RedisRequest::encode(
+                            arena,
+                            &KeyListArgs::new("DEL", &keys),
+                            RedisResponseKind::Integer,
+                        )
                     })
-                }))
-                .await?;
-                responses.into_iter().try_fold(0_i64, |total, response| {
-                    total.checked_add(response.into_integer()?).ok_or_else(|| {
-                        RedisError::new(ErrorKind::TypeError, "Redis DEL result overflowed i64")
+                    .await?
+                    .into_integer(),
+                KeyRoute::Multiple => {
+                    let groups = group_keys(&topology.shards, "DEL", &keys)?;
+                    let responses = try_join_all(groups.iter().map(|group| {
+                        self.execute_on_shard(group.target, false, |arena| {
+                            RedisRequest::encode(arena, &group.command, RedisResponseKind::Integer)
+                        })
+                    }))
+                    .await?;
+                    responses.into_iter().try_fold(0_i64, |total, response| {
+                        total.checked_add(response.into_integer()?).ok_or_else(|| {
+                            RedisError::new(ErrorKind::TypeError, "Redis DEL result overflowed i64")
+                        })
                     })
-                })
+                }
             }
         }
+        .await;
+        #[cfg(feature = "slow-log")]
+        observation.finish(result.is_ok());
+        result
     }
 
     async fn eval<S, K, A, R>(&self, script: S, keys: K, arguments: A) -> RedisResult<R>
@@ -851,7 +892,7 @@ impl Redis for RedisService {
     where
         K: EncodeRedisArgs + Send,
     {
-        self.execute_for_keys(&keys, true, |arena| {
+        self.execute_for_keys(&keys, true, "PFCOUNT", |arena| {
             RedisRequest::encode(
                 arena,
                 &KeyListArgs::new("PFCOUNT", &keys),
@@ -868,7 +909,7 @@ impl Redis for RedisService {
         F: EncodeRedisArg + Send,
         R: FromRedisBulk + Send,
     {
-        self.execute(&key, true, |arena| {
+        self.execute(&key, true, "HGET", |arena| {
             RedisRequest::encode(arena, &("HGET", &key, &field), RedisResponseKind::Bulk)
         })
         .await?
@@ -883,7 +924,7 @@ impl Redis for RedisService {
         F: EncodeRedisArg + Send,
         V: EncodeRedisArg + Send,
     {
-        self.execute(&key, false, |arena| {
+        self.execute(&key, false, "HSET", |arena| {
             RedisRequest::encode(
                 arena,
                 &("HSET", &key, &field, &value),
@@ -901,7 +942,7 @@ impl Redis for RedisService {
         R: FromRedisBulk + Send,
     {
         let expected = fields.num_args();
-        self.execute(&key, true, |arena| {
+        self.execute(&key, true, "HMGET", |arena| {
             RedisRequest::encode(
                 arena,
                 &HmgetArgs {
