@@ -83,6 +83,13 @@ One physical node owns one persistent multiplexed session. Admission fails fast
 when the in-flight limit is reached. Request timeouts default to 200 ms and can
 be configured separately for master and replica requests.
 
+Enable `slow-log` to emit read or write attempts taking at least 200 ms to
+`breeze.slow`. Generic commands include their command and arguments, capped at
+2 KiB; native commands include their operation name. Keys and values can contain
+credentials or user data, so use an appropriate log-retention policy. The
+positional fields are component, read/write role, elapsed time, success, and
+command detail; command detail is always the final field.
+
 Hash and distribution variants retain their existing compatibility behavior.
 Changing the configured algorithm, shard order, or shard count can change key
 placement. The library does not provide distributed locks, cache policies, or

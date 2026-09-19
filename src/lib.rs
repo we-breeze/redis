@@ -28,6 +28,8 @@ mod redis_service;
 pub mod resp;
 mod service_pipe;
 mod sharding;
+#[cfg(feature = "slow-log")]
+mod slow_log;
 pub mod to_args;
 pub mod types;
 

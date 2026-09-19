@@ -20,7 +20,7 @@ log = "0.4"
 enum_dispatch = "0.3"
 brz-net = { package = "brz-net",   version = "0.0.2"}
 arc-swap = "1"
-brz-metrics = { package = "brz-metrics", optional = true, version = "=0.0.5" }
+brz-metrics = { package = "brz-metrics", path = "/data0/icy/workspace/we-breeze/metrics", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -33,6 +33,7 @@ default = []
 metrics = ["dep:brz-metrics"]
 # Integration tests that require a live redis-server are gated behind this.
 integration-tests = []
+slow-log = []
 
 # Deployment-specific benchmark tooling has its own workspace.
 [workspace]
