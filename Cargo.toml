@@ -18,9 +18,9 @@ rand = "0.8"
 memchr = "2"
 log = "0.4"
 enum_dispatch = "0.3"
-brz-net = { package = "brz-net",   version = "0.0.2"}
+brz-net = { package = "brz-net",   version = "0.0.5"}
 arc-swap = "1"
-brz-metrics = { package = "brz-metrics", version = "=0.0.7", optional = true }
+brz-metrics = { package = "brz-metrics", version = "=0.0.8", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
