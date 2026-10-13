@@ -1,4 +1,4 @@
-//! Feature-gated ProfileUtil-compatible metrics for direct Redis attempts.
+//! Feature-gated cumulative metrics for direct Redis attempts.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -6,13 +6,13 @@ use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use brz_metrics::Metric;
+use brz_metrics::{MetricType, ResourceMetric, TimingMetric};
 
 /// One configured logical `host:port` metric shared by all of its resolved
 /// physical replicas.
 pub(crate) struct EndpointProfileMetric {
     name: Box<str>,
-    metric: OnceLock<Metric>,
+    metric: OnceLock<TimingMetric>,
 }
 
 impl EndpointProfileMetric {
@@ -33,7 +33,9 @@ impl EndpointProfileMetric {
     #[inline]
     pub(crate) fn attempt_started_at(&self, started: Instant) -> ProfileAttempt {
         ProfileAttempt {
-            metric: *self.metric.get_or_init(|| Metric::redis(&self.name)),
+            metric: *self.metric.get_or_init(|| {
+                TimingMetric::new(MetricType::Redis(ResourceMetric::Req), &self.name)
+            }),
             started,
             finished: false,
         }
@@ -43,7 +45,9 @@ impl EndpointProfileMetric {
         if count == 0 {
             return;
         }
-        let metric = *self.metric.get_or_init(|| Metric::redis(&self.name));
+        let metric = *self
+            .metric
+            .get_or_init(|| TimingMetric::new(MetricType::Redis(ResourceMetric::Req), &self.name));
         let elapsed = started.elapsed();
         for _ in 0..count {
             metric.record(elapsed, false);
@@ -57,7 +61,7 @@ impl EndpointProfileMetric {
 /// a failure, matching the replica quota guard's conservative cancellation
 /// semantics.
 pub(crate) struct ProfileAttempt {
-    metric: Metric,
+    metric: TimingMetric,
     started: Instant,
     finished: bool,
 }
@@ -116,6 +120,42 @@ where
                 Poll::Ready(result)
             }
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[cfg(feature = "metrics")]
+pub(crate) struct ConnectionObserver {
+    metric: brz_metrics::ConnMetric,
+    active: std::sync::Mutex<Option<brz_metrics::ConnectionGuard>>,
+}
+
+#[cfg(feature = "metrics")]
+impl ConnectionObserver {
+    pub(crate) fn new(port: u16) -> Self {
+        Self {
+            metric: brz_metrics::ConnMetric::new(
+                brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn),
+                &port.to_string(),
+            ),
+            active: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl brz_net::NodeConnectionObserver for ConnectionObserver {
+    fn on_connection_state_change(&self, connected: bool) {
+        let mut active = self
+            .active
+            .lock()
+            .expect("connection metrics mutex poisoned");
+        if connected {
+            if active.is_none() {
+                *active = Some(self.metric.connection());
+            }
+        } else {
+            active.take();
         }
     }
 }

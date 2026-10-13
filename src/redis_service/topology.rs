@@ -173,16 +173,24 @@ pub(super) async fn build_replicas(
             let node = if let Some(node) = previous.and_then(|topology| topology.nodes.get(&key)) {
                 node.clone()
             } else {
-                Node::new(
+                let protocol = RedisProtocol::new(resolved.config.auth.clone(), resolved.config.db);
+                let node_options = NodeOptions {
+                    request_timeout,
+                    connect_timeout: options.connect_timeout,
+                    ..NodeOptions::default()
+                };
+                #[cfg(feature = "metrics")]
+                let node = Node::new_observed(
                     address,
-                    RedisProtocol::new(resolved.config.auth.clone(), resolved.config.db),
-                    NodeOptions {
-                        request_timeout,
-                        connect_timeout: options.connect_timeout,
-                        ..NodeOptions::default()
-                    },
-                )
-                .map_err(map_net_error)?
+                    protocol,
+                    node_options,
+                    Arc::new(crate::profile_metrics::ConnectionObserver::new(
+                        address.port(),
+                    )),
+                );
+                #[cfg(not(feature = "metrics"))]
+                let node = Node::new(address, protocol, node_options);
+                node.map_err(map_net_error)?
             };
             node_cache.insert(key, node.clone());
             #[cfg(feature = "metrics")]

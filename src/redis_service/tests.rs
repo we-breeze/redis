@@ -459,6 +459,23 @@ async fn single_uses_independent_read_and_write_connections() {
     assert!(server.saw("SET"));
 
     assert_eq!(server.accepted(), 2);
+    #[cfg(feature = "metrics")]
+    {
+        let port = server.endpoint.rsplit_once(':').unwrap().1;
+        let conn = brz_metrics::ConnMetric::new(
+            brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn), port);
+        assert_eq!(conn.current(), 2);
+        assert_eq!(conn.total(), 2);
+        let clone = redis.clone();
+        drop(redis);
+        assert_eq!(conn.current(), 2);
+        drop(clone);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while conn.current() != 0 { tokio::task::yield_now().await; }
+        }).await.expect("connection counts drop when the SDK is released");
+        assert_eq!(conn.total(), 2);
+    }
+
 }
 }
 
@@ -919,6 +936,15 @@ async fn response_timeout_retries_master_then_reconnects_the_slave() {
             Err(error) => panic!("unexpected retry failure: {error}"),
         }
     }
+    #[cfg(feature = "metrics")]
+    {
+        let port = slave.endpoint.rsplit_once(':').unwrap().1;
+        let conn = brz_metrics::ConnMetric::new(
+            brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn), port);
+        assert_eq!(conn.current(), 1);
+        assert_eq!(conn.total(), 2, "a successful reconnect increments CPS's source counter");
+    }
+
 }
 }
 
