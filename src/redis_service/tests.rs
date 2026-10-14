@@ -461,9 +461,8 @@ async fn single_uses_independent_read_and_write_connections() {
     assert_eq!(server.accepted(), 2);
     #[cfg(feature = "metrics")]
     {
-        let port = server.endpoint.rsplit_once(':').unwrap().1;
         let conn = brz_metrics::ConnMetric::new(
-            brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn), port);
+            brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn), &server.endpoint);
         assert_eq!(conn.current(), 2);
         assert_eq!(conn.total(), 2);
         let clone = redis.clone();
@@ -476,6 +475,56 @@ async fn single_uses_independent_read_and_write_connections() {
         assert_eq!(conn.total(), 2);
     }
 
+}
+}
+
+#[cfg(feature = "metrics")]
+runtime_test! {
+async fn connection_metrics_keep_logical_hosts_separate_on_one_physical_endpoint() {
+    use brz_metrics::{ConnMetric, MetricType, PrometheusReader, ResourceMetric};
+    use std::io::Read;
+    use super::{ResolvedEndpoint, RedisEndpointConfig};
+
+    let server = FakeRedis::start("logical-hosts").await;
+    let base = RedisService::single(server.endpoint.clone()).await.unwrap();
+    let previous = base.inner.topology.load_full();
+    let address: std::net::SocketAddr = server.endpoint.parse().unwrap();
+    let configs = ["cache-a.example", "cache-b.example"].map(|host| ResolvedEndpoint {
+        config: RedisEndpointConfig {
+            host: host.to_owned(),
+            port: address.port(),
+            db: 0,
+            auth: None,
+        },
+        addresses: Arc::from([address]),
+    });
+    let options = RedisServiceOptions::default();
+    let (replicas, nodes) = super::topology::build_replicas(
+        &configs, options.master_timeout, &options, Some(&previous),
+    ).await.unwrap();
+    assert_eq!(nodes.len(), 2, "logical resources keep distinct observers");
+    let metrics = configs.each_ref().map(|resolved| {
+        ConnMetric::new(MetricType::Redis(ResourceMetric::Conn), &resolved.config.profile_name())
+    });
+    let mut output = String::new();
+    PrometheusReader::new().read_to_string(&mut output).unwrap();
+    for (resolved, metric) in configs.iter().zip(metrics) {
+        assert_eq!(metric.current(), 1);
+        assert_eq!(metric.total(), 1);
+        let name = resolved.config.profile_name();
+        assert!(output.contains(&format!("brz_conn{{type=\"REDIS\",name=\"{name}\"}} 1\n")));
+        assert!(output.contains(&format!("brz_conn_total{{type=\"REDIS\",name=\"{name}\"}} 1\n")));
+    }
+    drop(nodes);
+    drop(replicas);
+    drop(previous);
+    drop(base);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while metrics.iter().any(|metric| metric.current() != 0) {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("logical connection gauges decrease on close");
+    assert!(metrics.iter().all(|metric| metric.total() == 1));
 }
 }
 
@@ -938,9 +987,8 @@ async fn response_timeout_retries_master_then_reconnects_the_slave() {
     }
     #[cfg(feature = "metrics")]
     {
-        let port = slave.endpoint.rsplit_once(':').unwrap().1;
         let conn = brz_metrics::ConnMetric::new(
-            brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn), port);
+            brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn), &slave.endpoint);
         assert_eq!(conn.current(), 1);
         assert_eq!(conn.total(), 2, "a successful reconnect increments CPS's source counter");
     }

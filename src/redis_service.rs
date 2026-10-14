@@ -274,6 +274,8 @@ struct NodeKey {
     db: i64,
     auth: Option<String>,
     request_timeout: Duration,
+    #[cfg(feature = "metrics")]
+    metric_name: Arc<str>,
 }
 
 impl Hash for NodeKey {
@@ -282,6 +284,8 @@ impl Hash for NodeKey {
         self.db.hash(state);
         self.auth.hash(state);
         self.request_timeout.hash(state);
+        #[cfg(feature = "metrics")]
+        self.metric_name.hash(state);
     }
 }
 

@@ -98,9 +98,10 @@ other application-level abstractions.
 ## Metrics
 
 Enable `metrics` to export cumulative request counts and durations through
-`brz-metrics`. Physical connections are aggregated by port across hosts:
-`brz_conn{type="REDIS",name="6379"}` is the current count, and
-`brz_conn_total{type="REDIS",name="6379"}` counts successful establishments,
+`brz-metrics`. Connections use the configured logical `host:port`, matching
+request metrics even when a hostname resolves to multiple physical replicas:
+`brz_conn{type="REDIS",name="cache.example.com:6379"}` is the current count, and
+`brz_conn_total{type="REDIS",name="cache.example.com:6379"}` counts successful establishments,
 including reconnects. Reusing a connection or cloning the SDK adds no count.
 Prometheus computes CPS with `rate(brz_conn_total{type="REDIS"}[1m])`.
 The current count decreases when a connection closes or its driver is dropped;

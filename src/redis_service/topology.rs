@@ -159,13 +159,17 @@ pub(super) async fn build_replicas(
     let mut nodes = Vec::new();
     for resolved in configs {
         #[cfg(feature = "metrics")]
-        let profile_metric = Arc::new(EndpointProfileMetric::new(resolved.config.profile_name()));
+        let metric_name: Arc<str> = Arc::from(resolved.config.profile_name());
+        #[cfg(feature = "metrics")]
+        let profile_metric = Arc::new(EndpointProfileMetric::new(metric_name.to_string()));
         for &address in resolved.addresses.iter() {
             let key = NodeKey {
                 endpoint: address,
                 db: resolved.config.db,
                 auth: resolved.config.auth.clone(),
                 request_timeout,
+                #[cfg(feature = "metrics")]
+                metric_name: Arc::clone(&metric_name),
             };
             if !endpoints.insert(key.clone()) {
                 continue;
@@ -185,7 +189,7 @@ pub(super) async fn build_replicas(
                     protocol,
                     node_options,
                     Arc::new(crate::profile_metrics::ConnectionObserver::new(
-                        address.port(),
+                        &metric_name,
                     )),
                 );
                 #[cfg(not(feature = "metrics"))]

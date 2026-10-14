@@ -132,11 +132,11 @@ pub(crate) struct ConnectionObserver {
 
 #[cfg(feature = "metrics")]
 impl ConnectionObserver {
-    pub(crate) fn new(port: u16) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         Self {
             metric: brz_metrics::ConnMetric::new(
                 brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn),
-                &port.to_string(),
+                name,
             ),
             active: std::sync::Mutex::new(None),
         }
