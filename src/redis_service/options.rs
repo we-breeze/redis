@@ -4,6 +4,7 @@ use std::time::Duration;
 /// Transport settings used while building every shard.
 #[derive(Clone)]
 pub struct RedisServiceOptions {
+    pub(super) resource_name: Option<std::sync::Arc<str>>,
     pub(super) password: Option<String>,
     pub(super) master_timeout: Duration,
     pub(super) slave_timeout: Duration,
@@ -15,6 +16,7 @@ pub struct RedisServiceOptions {
 impl Default for RedisServiceOptions {
     fn default() -> Self {
         Self {
+            resource_name: None,
             password: None,
             master_timeout: Duration::from_millis(200),
             slave_timeout: Duration::from_millis(200),
@@ -26,6 +28,13 @@ impl Default for RedisServiceOptions {
 }
 
 impl RedisServiceOptions {
+    /// Names this business resource; defaults to the configured endpoint.
+    #[must_use]
+    pub fn with_resource_name(mut self, name: impl Into<std::sync::Arc<str>>) -> Self {
+        self.resource_name = Some(name.into());
+        self
+    }
+
     /// Sets password authentication for every master and replica connection.
     /// `None` disables AUTH; `Some` is sent unchanged, including an empty password.
     /// Authentication is repeated whenever a connection is established.
@@ -84,6 +93,7 @@ impl std::fmt::Debug for RedisServiceOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedisServiceOptions")
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("resource_name", &self.resource_name)
             .field("master_timeout", &self.master_timeout)
             .field("slave_timeout", &self.slave_timeout)
             .field("connect_timeout", &self.connect_timeout)

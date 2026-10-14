@@ -82,22 +82,28 @@ type RedisNodeResponseFuture = ResponseFuture<RedisNodeResult>;
 #[derive(Clone)]
 pub(crate) struct RedisReplica {
     node: Node<RedisProtocol>,
+    readonly: bool,
     #[cfg(feature = "metrics")]
-    profile_metric: Arc<EndpointProfileMetric>,
+    profile_metric: EndpointProfileMetric,
 }
 
 impl RedisReplica {
     #[cfg(feature = "metrics")]
-    fn new(node: Node<RedisProtocol>, profile_metric: Arc<EndpointProfileMetric>) -> Self {
+    fn new(
+        node: Node<RedisProtocol>,
+        profile_metric: EndpointProfileMetric,
+        readonly: bool,
+    ) -> Self {
         Self {
             node,
             profile_metric,
+            readonly,
         }
     }
 
     #[cfg(not(feature = "metrics"))]
-    fn new(node: Node<RedisProtocol>) -> Self {
-        Self { node }
+    fn new(node: Node<RedisProtocol>, readonly: bool) -> Self {
+        Self { node, readonly }
     }
 
     fn is_connected(&self) -> bool {
@@ -118,7 +124,7 @@ impl SessionReplica for RedisReplica {
     fn request(&self, request: Self::Request) -> Result<Self::Future, SessionError<Self::Error>> {
         #[cfg(feature = "metrics")]
         {
-            let attempt = self.profile_metric.attempt();
+            let attempt = self.profile_metric.attempt(self.readonly);
             let response = self.node.request(request)?;
             Ok(attempt.wrap(response))
         }
@@ -134,7 +140,7 @@ impl SessionReplica for RedisReplica {
     {
         #[cfg(feature = "metrics")]
         {
-            let attempt = self.profile_metric.attempt();
+            let attempt = self.profile_metric.attempt(self.readonly);
             let response = self.node.request_with(build)?;
             Ok(attempt.wrap(response))
         }
@@ -150,22 +156,14 @@ impl SessionReplica for RedisReplica {
     ) -> Result<Vec<Self::Future>, SessionError<Self::Error>> {
         #[cfg(feature = "metrics")]
         {
-            let count = requests.len();
-            let started = std::time::Instant::now();
-            let responses = match self.node.request_batch(requests) {
-                Ok(responses) => responses,
-                Err(error) => {
-                    self.profile_metric.record_batch_failure(count, started);
-                    return Err(error);
-                }
-            };
+            let mut requests = requests;
+            for request in &mut requests {
+                request.profile_attempt = Some(self.profile_metric.attempt(request.readonly));
+            }
+            let responses = self.node.request_batch(requests)?;
             Ok(responses
                 .into_iter()
-                .map(|response| {
-                    self.profile_metric
-                        .attempt_started_at(started)
-                        .wrap(response)
-                })
+                .map(ProfiledResponseFuture::unobserved)
                 .collect())
         }
         #[cfg(not(feature = "metrics"))]
@@ -180,6 +178,7 @@ pub(crate) type RedisReplicaResponseFuture = ReplicaSetResponseFuture<RedisRepli
 struct RedisShard {
     // A hostname may resolve to more than one equivalent IPv4 address.
     master: ReplicaSet<RedisReplica>,
+    master_read: ReplicaSet<RedisReplica>,
     slaves: ReplicaSet<RedisReplica>,
 }
 
@@ -275,7 +274,7 @@ struct NodeKey {
     auth: Option<String>,
     request_timeout: Duration,
     #[cfg(feature = "metrics")]
-    metric_name: Arc<str>,
+    metric_labels: brz_metrics::ResourceLabels,
 }
 
 impl Hash for NodeKey {
@@ -285,7 +284,7 @@ impl Hash for NodeKey {
         self.auth.hash(state);
         self.request_timeout.hash(state);
         #[cfg(feature = "metrics")]
-        self.metric_name.hash(state);
+        self.metric_labels.hash(state);
     }
 }
 
@@ -523,7 +522,7 @@ impl RedisService {
                 // When there is only one slave, the one
                 // bounded read retry falls back to the master replica group.
                 match shard
-                    .master
+                    .master_read
                     .request_with(|| build(&self.inner.request_arena))
                 {
                     Ok(response) => response.await,

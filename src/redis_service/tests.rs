@@ -232,13 +232,7 @@ async fn metrics_feature_records_the_configured_authority_without_db_suffix() {
         Some(b"metric-value".as_slice())
     );
 
-    let mut snapshot = None;
-    brz_metrics::visit(|name, metric_type, candidate| {
-        if name == server.endpoint && metric_type == "REDIS" {
-            snapshot = Some(candidate);
-        }
-    });
-    let snapshot = snapshot.expect("the configured endpoint must be registered");
+    let snapshot = resource_timing(&server.endpoint, brz_metrics::MetricAccess::Read).snapshot();
     assert_eq!(
         (snapshot.total, snapshot.success, snapshot.failure),
         (1, 1, 0)
@@ -461,18 +455,20 @@ async fn single_uses_independent_read_and_write_connections() {
     assert_eq!(server.accepted(), 2);
     #[cfg(feature = "metrics")]
     {
-        let conn = brz_metrics::ConnMetric::new(
-            brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn), &server.endpoint);
-        assert_eq!(conn.current(), 2);
-        assert_eq!(conn.total(), 2);
+        let labels = brz_metrics::ResourceLabels::new(server.endpoint.clone(), server.endpoint.clone());
+        let conn = brz_metrics::ConnMetric::new_resource(brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn), &labels.clone().with_role(brz_metrics::ConnectionRole::Read));
+        let write = brz_metrics::ConnMetric::new_resource(brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn), &labels.with_role(brz_metrics::ConnectionRole::Write));
+        assert_eq!((write.current(), write.total()), (1, 1));
+        assert_eq!(conn.current(), 1);
+        assert_eq!(conn.total(), 1);
         let clone = redis.clone();
         drop(redis);
-        assert_eq!(conn.current(), 2);
+        assert_eq!(conn.current(), 1);
         drop(clone);
         tokio::time::timeout(Duration::from_secs(2), async {
             while conn.current() != 0 { tokio::task::yield_now().await; }
         }).await.expect("connection counts drop when the SDK is released");
-        assert_eq!(conn.total(), 2);
+        assert_eq!(conn.total(), 1);
     }
 
 }
@@ -499,12 +495,12 @@ async fn connection_metrics_keep_logical_hosts_separate_on_one_physical_endpoint
         addresses: Arc::from([address]),
     });
     let options = RedisServiceOptions::default();
-    let (replicas, nodes) = super::topology::build_replicas(
-        &configs, options.master_timeout, &options, Some(&previous),
+    let (replicas, nodes, read_replicas) = super::topology::build_replicas(
+        &configs, options.master_timeout, &options, Some(&previous), false,
     ).await.unwrap();
     assert_eq!(nodes.len(), 2, "logical resources keep distinct observers");
     let metrics = configs.each_ref().map(|resolved| {
-        ConnMetric::new(MetricType::Redis(ResourceMetric::Conn), &resolved.config.profile_name())
+        ConnMetric::new_resource(MetricType::Redis(ResourceMetric::Conn), &brz_metrics::ResourceLabels::new(resolved.config.profile_name(), resolved.config.profile_name()).with_role(brz_metrics::ConnectionRole::Write))
     });
     let mut output = String::new();
     PrometheusReader::new().read_to_string(&mut output).unwrap();
@@ -512,11 +508,12 @@ async fn connection_metrics_keep_logical_hosts_separate_on_one_physical_endpoint
         assert_eq!(metric.current(), 1);
         assert_eq!(metric.total(), 1);
         let name = resolved.config.profile_name();
-        assert!(output.contains(&format!("brz_conn{{type=\"REDIS\",name=\"{name}\"}} 1\n")));
-        assert!(output.contains(&format!("brz_conn_total{{type=\"REDIS\",name=\"{name}\"}} 1\n")));
+        assert!(output.contains(&format!("brz_conn{{type=\"REDIS\",name=\"{name}\",endpoint=\"{name}\",role=\"write\"}} 1\n")));
+        assert!(output.contains(&format!("brz_conn_total{{type=\"REDIS\",name=\"{name}\",endpoint=\"{name}\",role=\"write\"}} 1\n")));
     }
     drop(nodes);
     drop(replicas);
+    drop(read_replicas);
     drop(previous);
     drop(base);
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -937,18 +934,9 @@ async fn response_timeout_retries_master_then_reconnects_the_slave() {
 
     #[cfg(feature = "metrics")]
     {
-        let mut slave_metric = None;
-        let mut master_metric = None;
-        brz_metrics::visit(|name, metric_type, candidate| {
-            if name == slave.endpoint && metric_type == "REDIS" {
-                slave_metric = Some(candidate);
-            }
-            if name == master.endpoint && metric_type == "REDIS" {
-                master_metric = Some(candidate);
-            }
-        });
-        let slave_metric = slave_metric.expect("failed slave attempt must be recorded");
-        let master_metric = master_metric.expect("master fallback must be recorded");
+        let slave_metric = resource_timing(&slave.endpoint, brz_metrics::MetricAccess::Read).snapshot();
+        let master_metric = resource_timing(&master.endpoint, brz_metrics::MetricAccess::Read).snapshot();
+        assert_eq!(resource_timing(&master.endpoint, brz_metrics::MetricAccess::Write).snapshot().total, 0, "fallback stays a read");
         assert_eq!(
             (
                 slave_metric.total,
@@ -987,8 +975,9 @@ async fn response_timeout_retries_master_then_reconnects_the_slave() {
     }
     #[cfg(feature = "metrics")]
     {
-        let conn = brz_metrics::ConnMetric::new(
-            brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn), &slave.endpoint);
+        let conn = brz_metrics::ConnMetric::new_resource(
+            brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn),
+            &brz_metrics::ResourceLabels::new(slave.endpoint.clone(), slave.endpoint.clone()).with_role(brz_metrics::ConnectionRole::Read));
         assert_eq!(conn.current(), 1);
         assert_eq!(conn.total(), 2, "a successful reconnect increments CPS's source counter");
     }
@@ -1009,4 +998,37 @@ fn java_crc32(bytes: &[u8]) -> u32 {
         }
     }
     crc ^ u32::MAX
+}
+
+#[cfg(feature = "metrics")]
+fn resource_timing(endpoint: &str, access: brz_metrics::MetricAccess) -> brz_metrics::TimingMetric {
+    brz_metrics::TimingMetric::new_resource(
+        brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Req),
+        &brz_metrics::ResourceLabels::new(endpoint, endpoint).with_access(access),
+    )
+}
+
+#[cfg(feature = "metrics")]
+runtime_test! {
+async fn named_resources_and_mixed_pipeline_preserve_each_operation() {
+    use brz_metrics::{MetricAccess, MetricType, ResourceLabels, ResourceMetric, TimingMetric};
+    let server = FakeRedis::start("pipeline").await;
+    let redis = RedisService::single_with_options(server.endpoint.clone(),
+        RedisServiceOptions::default().with_resource_name("mixed_pipeline")).await.unwrap();
+    let labels = ResourceLabels::new("mixed_pipeline", server.endpoint.clone());
+    let kind = MetricType::Redis(ResourceMetric::Req);
+    let read = TimingMetric::new_resource(kind, &labels.clone().with_access(MetricAccess::Read));
+    let write = TimingMetric::new_resource(kind, &labels.with_access(MetricAccess::Write));
+    assert_eq!((read.snapshot().total, write.snapshot().total), (0, 0));
+    let mut pipe = RedisPipe::with_capacity(3);
+    pipe.get("key").unwrap();
+    pipe.set("key", "value").unwrap();
+    pipe.get("key").unwrap();
+    let mut responses = redis.pipe(pipe).await.unwrap();
+    let _: Option<RedisBytes> = responses.take().await.unwrap();
+    let _: () = responses.take().await.unwrap();
+    let _: Option<RedisBytes> = responses.take().await.unwrap();
+    assert_eq!((read.snapshot().total, write.snapshot().total), (2, 1));
+    assert_eq!(resource_timing(&server.endpoint, MetricAccess::Read).snapshot().total, 0);
+}
 }

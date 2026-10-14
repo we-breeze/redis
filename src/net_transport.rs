@@ -87,6 +87,10 @@ fn unexpected_reply(expected: &str, actual: &RedisResponse) -> RedisError {
 pub(crate) struct RedisRequest {
     frame: RedisResult<EphemeralBytes>,
     response: RedisResponseKind,
+    #[cfg(feature = "metrics")]
+    pub(crate) readonly: bool,
+    #[cfg(feature = "metrics")]
+    pub(crate) profile_attempt: Option<crate::profile_metrics::ProfileAttempt>,
 }
 
 impl RedisRequest {
@@ -99,8 +103,26 @@ impl RedisRequest {
         A: EncodeRedisArgs + ?Sized,
     {
         Self {
+            #[cfg(feature = "metrics")]
+            readonly: false,
+            #[cfg(feature = "metrics")]
+            profile_attempt: None,
             frame: encode_frame(arena, arguments),
             response,
+        }
+    }
+
+    pub(crate) fn with_readonly(self, readonly: bool) -> Self {
+        #[cfg(feature = "metrics")]
+        {
+            let mut request = self;
+            request.readonly = readonly;
+            request
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            let _ = readonly;
+            self
         }
     }
 
@@ -192,11 +214,17 @@ fn write_usize(value: usize, destination: &mut EphemeralBytesMut) {
     destination.extend_from_slice(buffer.format(value).as_bytes());
 }
 
+struct PendingResponse {
+    kind: RedisResponseKind,
+    #[cfg(feature = "metrics")]
+    attempt: Option<crate::profile_metrics::ProfileAttempt>,
+}
+
 pub(crate) struct RedisProtocol {
     auth: Option<String>,
     db: i64,
     handshake_replies: usize,
-    responses: VecDeque<RedisResponseKind>,
+    responses: VecDeque<PendingResponse>,
 }
 
 impl RedisProtocol {
@@ -210,7 +238,7 @@ impl RedisProtocol {
     }
 
     fn decode_response(&mut self, source: &mut RxBuffer) -> RedisResult<Option<RedisResponse>> {
-        let Some(expected) = self.responses.front().copied() else {
+        let Some(expected) = self.responses.front().map(|pending| pending.kind) else {
             if source.is_empty() {
                 return Ok(None);
             }
@@ -227,8 +255,19 @@ impl RedisProtocol {
                 Ok(None)
             }
             Scanned::Complete { layout, consumed } => {
-                self.responses.pop_front();
-                Ok(Some(materialize(source.take(consumed), layout)?))
+                let pending = self.responses.pop_front().expect("pending response");
+                let response = materialize(source.take(consumed), layout);
+                #[cfg(feature = "metrics")]
+                if let Some(mut attempt) = pending.attempt {
+                    attempt.finish(
+                        response.as_ref().is_ok_and(|response| {
+                            !matches!(response, RedisResponse::ServerError(_))
+                        }),
+                    );
+                }
+                #[cfg(not(feature = "metrics"))]
+                let _ = pending;
+                Ok(Some(response?))
             }
         }
     }
@@ -293,7 +332,11 @@ impl SessionProtocol for RedisProtocol {
         _request_id: RequestToken,
     ) -> RedisResult<EphemeralBytes> {
         let frame = request.frame?;
-        self.responses.push_back(request.response);
+        self.responses.push_back(PendingResponse {
+            kind: request.response,
+            #[cfg(feature = "metrics")]
+            attempt: request.profile_attempt,
+        });
         Ok(frame)
     }
 

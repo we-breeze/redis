@@ -131,14 +131,22 @@ pub(super) async fn build_resolved_shard(
             options.master_timeout,
             options,
             previous,
+            false,
         ),
-        build_replicas(&shard.slaves, options.slave_timeout, options, previous),
+        build_replicas(
+            &shard.slaves,
+            options.slave_timeout,
+            options,
+            previous,
+            true
+        ),
     )?;
     let mut nodes = master.1;
     nodes.extend(slaves.1);
     Ok((
         RedisShard {
             master: master.0,
+            master_read: master.2,
             slaves: slaves.0,
         },
         nodes,
@@ -150,9 +158,11 @@ pub(super) async fn build_replicas(
     request_timeout: Duration,
     options: &RedisServiceOptions,
     previous: Option<&RedisTopology>,
+    readonly: bool,
 ) -> RedisResult<(
     ReplicaSet<RedisReplica>,
     HashMap<NodeKey, Node<RedisProtocol>>,
+    ReplicaSet<RedisReplica>,
 )> {
     let mut endpoints = HashSet::new();
     let mut node_cache = HashMap::new();
@@ -161,7 +171,21 @@ pub(super) async fn build_replicas(
         #[cfg(feature = "metrics")]
         let metric_name: Arc<str> = Arc::from(resolved.config.profile_name());
         #[cfg(feature = "metrics")]
-        let profile_metric = Arc::new(EndpointProfileMetric::new(metric_name.to_string()));
+        let labels = brz_metrics::ResourceLabels::new(
+            options
+                .resource_name
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&metric_name)),
+            metric_name,
+        );
+        #[cfg(feature = "metrics")]
+        let connection_labels = labels.clone().with_role(if readonly {
+            brz_metrics::ConnectionRole::Read
+        } else {
+            brz_metrics::ConnectionRole::Write
+        });
+        #[cfg(feature = "metrics")]
+        let profile_metric = EndpointProfileMetric::new(&labels);
         for &address in resolved.addresses.iter() {
             let key = NodeKey {
                 endpoint: address,
@@ -169,7 +193,7 @@ pub(super) async fn build_replicas(
                 auth: resolved.config.auth.clone(),
                 request_timeout,
                 #[cfg(feature = "metrics")]
-                metric_name: Arc::clone(&metric_name),
+                metric_labels: connection_labels.clone(),
             };
             if !endpoints.insert(key.clone()) {
                 continue;
@@ -189,7 +213,7 @@ pub(super) async fn build_replicas(
                     protocol,
                     node_options,
                     Arc::new(crate::profile_metrics::ConnectionObserver::new(
-                        &metric_name,
+                        &connection_labels,
                     )),
                 );
                 #[cfg(not(feature = "metrics"))]
@@ -198,16 +222,24 @@ pub(super) async fn build_replicas(
             };
             node_cache.insert(key, node.clone());
             #[cfg(feature = "metrics")]
-            nodes.push(RedisReplica::new(node, Arc::clone(&profile_metric)));
+            nodes.push(RedisReplica::new(node, profile_metric, readonly));
             #[cfg(not(feature = "metrics"))]
-            nodes.push(RedisReplica::new(node));
+            nodes.push(RedisReplica::new(node, readonly));
         }
     }
 
     wait_until_connected(&nodes, options.connect_timeout).await?;
+    let read_replicas = ReplicaSet::with_options(
+        nodes.iter().cloned().map(|mut replica| {
+            replica.readonly = true;
+            replica
+        }),
+        options.replica_balance,
+    )
+    .map_err(map_net_error)?;
     let replicas =
         ReplicaSet::with_options(nodes, options.replica_balance).map_err(map_net_error)?;
-    Ok((replicas, node_cache))
+    Ok((replicas, node_cache, read_replicas))
 }
 
 pub(super) async fn wait_until_connected(

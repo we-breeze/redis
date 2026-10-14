@@ -294,7 +294,10 @@ impl RedisPipe {
     pub(crate) fn into_requests(self, arena: &EphemeralBytesArena) -> Vec<RedisRequest> {
         self.commands
             .into_iter()
-            .map(|entry| RedisRequest::encode(arena, &entry.command, entry.response))
+            .map(|entry| {
+                RedisRequest::encode(arena, &entry.command, entry.response)
+                    .with_readonly(entry.command.is_readonly())
+            })
             .collect()
     }
 }

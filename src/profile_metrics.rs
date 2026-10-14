@@ -2,55 +2,37 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use brz_metrics::{MetricType, ResourceMetric, TimingMetric};
+use brz_metrics::{MetricAccess, MetricType, ResourceLabels, ResourceMetric, TimingMetric};
 
 /// One configured logical `host:port` metric shared by all of its resolved
 /// physical replicas.
+#[derive(Clone, Copy)]
 pub(crate) struct EndpointProfileMetric {
-    name: Box<str>,
-    metric: OnceLock<TimingMetric>,
+    read: TimingMetric,
+    write: TimingMetric,
 }
 
 impl EndpointProfileMetric {
-    pub(crate) fn new(name: String) -> Self {
+    pub(crate) fn new(labels: &ResourceLabels) -> Self {
+        let kind = MetricType::Redis(ResourceMetric::Req);
         Self {
-            name: name.into_boxed_str(),
-            metric: OnceLock::new(),
+            read: TimingMetric::new_resource(kind, &labels.clone().with_access(MetricAccess::Read)),
+            write: TimingMetric::new_resource(
+                kind,
+                &labels.clone().with_access(MetricAccess::Write),
+            ),
         }
     }
 
-    /// Creates one physical attempt. Registration remains lazy so an endpoint
-    /// that is configured but never selected does not create a profile row.
     #[inline]
-    pub(crate) fn attempt(&self) -> ProfileAttempt {
-        self.attempt_started_at(Instant::now())
-    }
-
-    #[inline]
-    pub(crate) fn attempt_started_at(&self, started: Instant) -> ProfileAttempt {
+    pub(crate) fn attempt(&self, readonly: bool) -> ProfileAttempt {
         ProfileAttempt {
-            metric: *self.metric.get_or_init(|| {
-                TimingMetric::new(MetricType::Redis(ResourceMetric::Req), &self.name)
-            }),
-            started,
+            metric: if readonly { self.read } else { self.write },
+            started: Instant::now(),
             finished: false,
-        }
-    }
-
-    pub(crate) fn record_batch_failure(&self, count: usize, started: Instant) {
-        if count == 0 {
-            return;
-        }
-        let metric = *self
-            .metric
-            .get_or_init(|| TimingMetric::new(MetricType::Redis(ResourceMetric::Req), &self.name));
-        let elapsed = started.elapsed();
-        for _ in 0..count {
-            metric.record(elapsed, false);
         }
     }
 }
@@ -71,12 +53,12 @@ impl ProfileAttempt {
     pub(crate) fn wrap<F>(self, response: F) -> ProfiledResponseFuture<F> {
         ProfiledResponseFuture {
             response,
-            attempt: self,
+            attempt: Some(self),
         }
     }
 
     #[inline]
-    fn finish(&mut self, success: bool) {
+    pub(crate) fn finish(&mut self, success: bool) {
         self.metric.record(self.started.elapsed(), success);
         self.finished = true;
     }
@@ -90,19 +72,35 @@ impl Drop for ProfileAttempt {
     }
 }
 
+impl<F> ProfiledResponseFuture<F> {
+    pub(crate) fn unobserved(response: F) -> Self {
+        Self {
+            response,
+            attempt: None,
+        }
+    }
+}
+
 pub(crate) struct ProfiledResponseFuture<F> {
     response: F,
-    attempt: ProfileAttempt,
+    attempt: Option<ProfileAttempt>,
 }
 
 trait CompletionResult {
     fn succeeded(&self) -> bool;
 }
 
-impl<T, E> CompletionResult for Result<T, E> {
+impl CompletionResult
+    for Result<crate::net_transport::RedisResponse, brz_net::SessionError<crate::RedisError>>
+{
     #[inline]
     fn succeeded(&self) -> bool {
-        self.is_ok()
+        self.as_ref().is_ok_and(|response| {
+            !matches!(
+                response,
+                crate::net_transport::RedisResponse::ServerError(_)
+            )
+        })
     }
 }
 
@@ -116,7 +114,9 @@ where
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.response).poll(context) {
             Poll::Ready(result) => {
-                self.attempt.finish(result.succeeded());
+                if let Some(attempt) = &mut self.attempt {
+                    attempt.finish(result.succeeded());
+                }
                 Poll::Ready(result)
             }
             Poll::Pending => Poll::Pending,
@@ -132,11 +132,11 @@ pub(crate) struct ConnectionObserver {
 
 #[cfg(feature = "metrics")]
 impl ConnectionObserver {
-    pub(crate) fn new(name: &str) -> Self {
+    pub(crate) fn new(labels: &ResourceLabels) -> Self {
         Self {
-            metric: brz_metrics::ConnMetric::new(
+            metric: brz_metrics::ConnMetric::new_resource(
                 brz_metrics::MetricType::Redis(brz_metrics::ResourceMetric::Conn),
-                name,
+                labels,
             ),
             active: std::sync::Mutex::new(None),
         }
@@ -167,18 +167,14 @@ mod tests {
     #[test]
     fn logical_endpoint_attempts_share_one_registered_metric() {
         let name = format!("profile-metric-test-{}", std::process::id());
-        let endpoint = EndpointProfileMetric::new(name.clone());
+        let endpoint =
+            EndpointProfileMetric::new(&ResourceLabels::new(name.clone(), "localhost:6379"));
 
-        endpoint.attempt().finish(true);
-        endpoint.attempt().finish(false);
+        endpoint.attempt(true).finish(true);
+        endpoint.attempt(true).finish(false);
 
-        let mut snapshot = None;
-        brz_metrics::visit(|candidate_name, metric_type, candidate| {
-            if candidate_name == name && metric_type == "REDIS" {
-                snapshot = Some(candidate);
-            }
-        });
-        let snapshot = snapshot.expect("attempts must lazily register the endpoint metric");
+        let snapshot = endpoint.read.snapshot();
+        assert_eq!(endpoint.write.snapshot().total, 0);
         assert_eq!(
             (snapshot.total, snapshot.success, snapshot.failure),
             (2, 1, 1)

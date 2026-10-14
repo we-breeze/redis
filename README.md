@@ -97,15 +97,23 @@ other application-level abstractions.
 
 ## Metrics
 
-Enable `metrics` to export cumulative request counts and durations through
-`brz-metrics`. Connections use the configured logical `host:port`, matching
-request metrics even when a hostname resolves to multiple physical replicas:
-`brz_conn{type="REDIS",name="cache.example.com:6379"}` is the current count, and
-`brz_conn_total{type="REDIS",name="cache.example.com:6379"}` counts successful establishments,
-including reconnects. Reusing a connection or cloning the SDK adds no count.
-Prometheus computes CPS with `rate(brz_conn_total{type="REDIS"}[1m])`.
-The current count decreases when a connection closes or its driver is dropped;
-scrapes never reset either metric.
+Enable `metrics` for cumulative physical-access counts, failures, slow requests,
+and duration sums through `brz-metrics`. Configure a business resource name with
+`RedisServiceOptions::default().with_resource_name("backend")`.
+The default name is the configured `host:port`. Labels separate `type="REDIS"`,
+`name`, `endpoint`, and request `access="read"` / `"write"`.
+Redis preserves the configured DNS hostname. A read retry on the master remains a read; mixed pipelines classify each command.
+
+Connection metrics use `role="read"`
+or `role="write"` for the independent master connection.
+`brz_conn` is the current connection count; `brz_conn_total` counts successful
+establishments including reconnects. SDK clones and connection reuse do not
+increment the total. Compute CPS with `rate(brz_conn_total{type="REDIS"}[1m])`.
+
+Registration happens during construction/topology rebuild. Request metric
+updates use cached Copy handles, clocks and atomics; they allocate no label strings
+and perform no registry lookup, including the first request. Total request counts
+are obtained by summing access labels rather than recording a second aggregate.
 
 ## Validation
 
@@ -167,5 +175,5 @@ library name. Existing explicit dependency aliases remain supported.
 
 ```toml
 [dependencies]
-brz-redis = "0.0.14"
+brz-redis = "0.0.15"
 ```
