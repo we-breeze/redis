@@ -175,5 +175,5 @@ library name. Existing explicit dependency aliases remain supported.
 
 ```toml
 [dependencies]
-brz-redis = "0.0.15"
+brz-redis = "0.0.16"
 ```
