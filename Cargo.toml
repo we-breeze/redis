@@ -1,6 +1,6 @@
 [package]
 name = "brz-redis"
-version = "0.0.16"
+version = "0.0.17"
 edition = "2024"
 description = "Asynchronous Redis client with multiplexed connections and client-side sharding"
 license = "MIT OR Apache-2.0"
@@ -20,7 +20,7 @@ log = "0.4"
 enum_dispatch = "0.3"
 brz-net = { package = "brz-net",   version = "0.0.7"}
 arc-swap = "1"
-brz-metrics = { package = "brz-metrics", version = "=0.0.12", optional = true }
+brz-metrics = { package = "brz-metrics", version = "=0.0.13", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
