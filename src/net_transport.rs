@@ -129,6 +129,10 @@ impl RedisRequest {
     pub(crate) fn shared_arena() -> EphemeralBytesArena {
         global_request_arena().clone()
     }
+
+    pub(crate) fn into_frame(self) -> RedisResult<EphemeralBytes> {
+        self.frame
+    }
 }
 
 struct MeasureArgs {
@@ -687,6 +691,23 @@ fn materialize(frame: RxFrame, layout: ResponseLayout) -> RedisResult<RedisRespo
             }
         }
     })
+}
+
+/// Decode one unsolicited RESP value using the same bounded scanner as commands.
+pub(crate) fn decode_unsolicited_value(source: &mut RxBuffer) -> RedisResult<Option<Value>> {
+    match scan_response(source, RedisResponseKind::Value)? {
+        Scanned::Incomplete { reserve } => {
+            if reserve > 0 {
+                source
+                    .reserve(reserve)
+                    .map_err(|error| protocol_detail("Redis response is too large", error))?;
+            }
+            Ok(None)
+        }
+        Scanned::Complete { layout, consumed } => materialize(source.take(consumed), layout)?
+            .into_value()
+            .map(Some),
+    }
 }
 
 fn protocol_error(message: &'static str) -> RedisError {

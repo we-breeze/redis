@@ -28,6 +28,7 @@ use crate::{
 };
 use crate::{RedisConfig, RedisConfigProvider};
 
+mod subscriptions;
 mod topology;
 use topology::{build_dns_sources, build_topology, map_net_error, validate_options};
 

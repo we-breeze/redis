@@ -24,6 +24,7 @@ mod multi_key;
 mod net_transport;
 #[cfg(feature = "metrics")]
 mod profile_metrics;
+mod pubsub;
 mod redis_service;
 pub mod resp;
 mod service_pipe;
@@ -43,6 +44,7 @@ pub use cmd::{Cmd, cmd};
 pub use config::{RedisConfig, RedisConfigFuture, RedisConfigProvider, RedisShardConfig};
 pub use error::{ErrorKind, RedisError, RedisResult};
 pub use from_value::FromRedisValue;
+pub use pubsub::{RedisMessage, RedisSubscription};
 pub use redis_service::{RedisService, RedisServiceOptions, ShardRouting};
 pub use service_pipe::{FromPipeResponse, MAX_PIPELINE_COMMANDS, PipeResponse, RedisPipe, pipe};
 pub use to_args::{Bytes, RedisWrite, ToRedisArgs, ToSingleRedisArg};

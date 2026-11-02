@@ -18,7 +18,7 @@ rand = "0.8"
 memchr = "2"
 log = "0.4"
 enum_dispatch = "0.3"
-brz-net = { package = "brz-net",   version = "0.0.7"}
+brz-net = { package = "brz-net", version = "0.0.8"}
 arc-swap = "1"
 brz-metrics = { package = "brz-metrics", version = "=0.0.13", optional = true }
 

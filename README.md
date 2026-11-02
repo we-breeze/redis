@@ -95,6 +95,43 @@ Changing the configured algorithm, shard order, or shard count can change key
 placement. The library does not provide distributed locks, cache policies, or
 other application-level abstractions.
 
+## Channel subscriptions
+
+`RedisService::subscribe` opens a dedicated `brz-net` session to the same master
+shard used by `publish` for that channel. It reuses the service password,
+database and connection settings; ordinary commands keep their existing
+multiplexed sessions. The method returns after validating the matching
+`SUBSCRIBE` acknowledgement, retaining any publication received with that ACK.
+
+```rust,no_run
+use brz_redis::RedisService;
+
+# async fn example() -> brz_redis::RedisResult<()> {
+let service = RedisService::single("127.0.0.1:6379").await?;
+let mut subscription = service.subscribe("callback:events").await?;
+if let Some(message) = subscription.next_message().await? {
+    let _channel: &[u8] = &message.channel;
+    let _payload: &[u8] = &message.payload;
+    // Decode application messages here; both fields preserve arbitrary bytes.
+}
+subscription.close().await?;
+# Ok(())
+# }
+```
+
+`next_message` has no command timeout and is cancellation safe. Applications can
+wrap it in `tokio::time::timeout` for idle polling without losing a partial frame
+or sending another command. A subscription buffers at most 256 messages. Queue
+overflow, unexpected EOF and protocol failures terminate the session; already
+queued messages remain ordered, followed by one error and then `None`. It never
+transparently reconnects across potentially missed publications.
+
+`close` waits for the physical connection to close without sending a Redis
+command. Dropping the subscription also initiates closure. Use the separate
+`unsubscribe` method when an explicit `UNSUBSCRIBE` and its zero-count ACK are
+required. Both close methods are idempotent. This API currently subscribes to
+one ordinary channel; pattern and sharded Pub/Sub subscriptions are not exposed.
+
 ## Metrics
 
 Enable `metrics` for cumulative physical-access counts, failures, slow requests,
